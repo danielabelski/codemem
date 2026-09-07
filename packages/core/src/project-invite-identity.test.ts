@@ -9,6 +9,8 @@ import {
 import {
 	friendlyDeviceName,
 	isHumanPresentationName,
+	normalizeDeviceDisplayName,
+	normalizeDeviceNameHint,
 	normalizeHumanPresentationName,
 	normalizeIdentityDisplayName,
 	normalizeProjectInviteSummaries,
@@ -25,8 +27,11 @@ describe("project invite identity", () => {
 			}),
 		).toBe("Codemem laptop");
 		expect(friendlyDeviceName({ osName: "host-name.local", coordinatorName: "Remote" })).toBe(
-			"host name",
+			"host-name",
 		);
+		expect(
+			friendlyDeviceName({ osName: "emm-five.home.example.com", coordinatorName: "Remote" }),
+		).toBe("emm-five.home.example.com");
 		expect(friendlyDeviceName({ coordinatorName: "Remote" })).toBe("Remote");
 		expect(friendlyDeviceName({ fallbackSeed: "abcd-1234" })).toBe("Codemem device abcd12");
 		expect(friendlyDeviceName({ osName: "e67fda8c4b44", fallbackSeed: "e67fda8c4b44" })).toBe(
@@ -83,12 +88,38 @@ describe("project invite identity", () => {
 		},
 	);
 
+	it("keeps DNS hostnames scoped to device validation", () => {
+		expect(isHumanPresentationName("emm-five.home.example.com")).toBe(true);
+		expect(normalizeDeviceDisplayName("emm-five.home.example.com", "device_display_name")).toBe(
+			"emm-five.home.example.com",
+		);
+	});
+
 	it("normalizes human actor and device presentation names", () => {
 		expect(normalizeHumanPresentationName("  Brian   Example  ", "recipient_display_name")).toBe(
 			"Brian Example",
 		);
 		expect(normalizeHumanPresentationName("Brian's MacBook", "device_display_name")).toBe(
 			"Brian's MacBook",
+		);
+		expect(normalizeHumanPresentationName("jane.doe", "recipient_display_name")).toBe("jane.doe");
+	});
+
+	it("accepts DNS hostnames as device presentation names", () => {
+		expect(normalizeDeviceDisplayName("emm-five.home.example.com", "device_display_name")).toBe(
+			"emm-five.home.example.com",
+		);
+		expect(() => normalizeDeviceDisplayName("device_abc123def", "device_display_name")).toThrow(
+			"device_display_name_invalid",
+		);
+	});
+
+	it("rejects machine IDs after stripping the .local suffix", () => {
+		expect(() => normalizeDeviceNameHint("a1b2c3d4e5f6.local")).toThrow(
+			"device_display_name_invalid",
+		);
+		expect(friendlyDeviceName({ osName: "a1b2c3d4e5f6.local", fallbackSeed: "abcd-1234" })).toBe(
+			"Codemem device abcd12",
 		);
 	});
 

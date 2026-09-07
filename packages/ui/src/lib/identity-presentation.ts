@@ -4,6 +4,8 @@ const MACHINE_PREFIX_LABEL = /^(?:actor|device|identity|local):\S+$/iu;
 const MACHINE_SLUG_LABEL = /^(?:actor|device|identity)[_-][a-z0-9][a-z0-9._:-]{4,}$/iu;
 const PENDING_PERSON_LABEL = /^pending[_-]\S+$/iu;
 const HEX_HOSTNAME_LABEL = /^[a-f0-9]{12,64}$/iu;
+const HOSTNAME_LABEL =
+	/^(?=.{1,253}$)(?:(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.){2,}[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?|[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.local)$/iu;
 
 export const MACHINE_PRESENTATION_LABEL_FIXTURES = [
 	"123e4567-e89b-12d3-a456-426614174000",
@@ -23,6 +25,7 @@ export function isMachinePresentationLabel(value: string): boolean {
 		MACHINE_SLUG_LABEL,
 		PENDING_PERSON_LABEL,
 		HEX_HOSTNAME_LABEL,
+		HOSTNAME_LABEL,
 	].some((pattern) => pattern.test(value));
 }
 
