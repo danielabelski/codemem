@@ -838,6 +838,7 @@ const isValidLedgerFailureHttpPayload = (payload) =>
   && (
     payload.errorCode === "retrieval_ledger_write_failed"
     || payload.errorCode === "retrieval_ledger_delivery_write_failed"
+    || payload.errorCode === "automatic_recall_write_failed"
   )
   && typeof payload.reason === "string";
 
@@ -929,9 +930,10 @@ const isViewerPolicyOrAuthFailurePayload = (payload) => {
   ].includes(code);
 };
 
-const viewerFailureClassification = (cause, disposition) => ({
+const viewerFailureClassification = (cause, disposition, kind = null) => ({
   cause,
   disposition,
+  kind,
   retryable: disposition !== "terminal",
 });
 
@@ -968,6 +970,7 @@ const classifyViewerHttpFailure = ({
         kind: "viewer_contract_unsupported",
         compatibleProfile,
       }),
+      "viewer_contract_unsupported",
     );
   }
   if (operation === "prompt-pack-ledger" && isValidLedgerFailureHttpPayload(body)) {
@@ -1439,6 +1442,7 @@ const applyInjectedContextToMessages = async ({
     const injected = await buildInjectedContext(query, {
       sessionID,
       requestKey: latestMessageId || fallbackEntryMessageId(latestUser.entry, latestUser.index),
+      fallbackTurn: sessionID && latestMessageId ? null : latestUser.index,
       surface: "message",
       tokenBudget: fullBudget,
       retainedItems: retainedMemoryFingerprints(messages, sessionCache),
@@ -1455,7 +1459,7 @@ const applyInjectedContextToMessages = async ({
     if (latestUser.entry.parts?.some(isCodememContextPart)) {
       duplicates = injected?.duplicates || 0;
       if (injected?.attemptId) {
-        confirmDelivery?.(injected.attemptId, "unknown");
+        confirmDelivery?.(injected.attemptId, "unknown", injected.evaluation);
       }
       report("replay", 0, duplicates);
       return true;
@@ -1478,7 +1482,7 @@ const applyInjectedContextToMessages = async ({
           );
         } catch (error) {
           if (injected.attemptId) {
-            confirmDelivery?.(injected.attemptId, "failed");
+            confirmDelivery?.(injected.attemptId, "failed", injected.evaluation);
           }
           report("delivery_failed", 0, duplicates);
           throw error;
@@ -1486,7 +1490,7 @@ const applyInjectedContextToMessages = async ({
         newlyDelivered = estimateTokens(injected.text);
         reason = "delivered";
         if (injected.attemptId) {
-          confirmDelivery?.(injected.attemptId, "handed_off");
+          confirmDelivery?.(injected.attemptId, "handed_off", injected.evaluation);
         }
         if (canReplay) {
           sessionCache.set(latestMessageId, {
@@ -1508,10 +1512,10 @@ const applyInjectedContextToMessages = async ({
       }
     } else if (injected?.skipReason) {
       // The retrieval already has an attempt. Withheld output is not a second retrieval.
-      if (injected.attemptId) confirmDelivery?.(injected.attemptId, "unknown");
+      if (injected.attemptId) confirmDelivery?.(injected.attemptId, "unknown", injected.evaluation);
     } else if (injected?.text) {
       reason = "budget_rejected";
-      if (injected.attemptId) confirmDelivery?.(injected.attemptId, "failed");
+      if (injected.attemptId) confirmDelivery?.(injected.attemptId, "failed", injected.evaluation);
     }
   }
   report(reason, newlyDelivered, duplicates);
@@ -3135,7 +3139,7 @@ export const CodememPlugin = async ({
     request_id: identity.requestId,
   });
 
-  const runPromptPackLedger = async (payload) => {
+  const runPromptPackLedger = async (payload, { viewerOnly = false } = {}) => {
     const viewerPayload = {
       ...payload,
       db_path: promptPackDbPath,
@@ -3156,12 +3160,12 @@ export const CodememPlugin = async ({
       };
     }
 
-    const { cause, retryable } = httpResult.classification;
+    const { cause, kind, retryable } = httpResult.classification;
     await logLine(
       `inject.ledger.http_error cause=${JSON.stringify(redactLog(cause, 200))} retryable=${retryable}`
     );
-    if (!retryable) {
-      return { exitCode: 1, stdout: "", stderr: cause, transport: "viewer" };
+    if (!retryable || viewerOnly) {
+      return { exitCode: 1, stdout: "", stderr: cause, transport: "viewer", failureKind: kind };
     }
 
     try {
@@ -3232,12 +3236,28 @@ export const CodememPlugin = async ({
     return { attemptId: identity.attemptId, ready };
   };
 
-  const confirmPromptPackDelivery = (attemptId, deliveryStatus = "handed_off") => {
+  const confirmPromptPackDelivery = (attemptId, deliveryStatus = "handed_off", evaluation) => {
+    const delivery = {
+      action: "delivery", attempt_id: attemptId, delivery_status: deliveryStatus,
+    };
     void runPromptPackLedger({
-      action: "delivery",
-      attempt_id: attemptId,
-      delivery_status: deliveryStatus,
-    });
+      ...delivery,
+      ...evaluation,
+    }).then((result) => {
+      // Retry additive fields only after the transport identifies that exact compatibility case.
+      if (
+        evaluation
+        && result?.transport === "viewer"
+        && result.failureKind === "viewer_contract_unsupported"
+      ) {
+        return runPromptPackLedger(delivery, { viewerOnly: true });
+      }
+      // Older CLI fallbacks can reject optional fields. Preserve the original receipt;
+      // never retry a Viewer policy/auth rejection through a different transport.
+      if (evaluation && result?.transport === "cli" && result.exitCode !== 0) {
+        return runPromptPackLedger(delivery);
+      }
+    }).catch(() => {});
   };
 
   const showToast = async (message, variant = "warning") => {
@@ -3561,12 +3581,40 @@ export const CodememPlugin = async ({
     }
   };
 
+  let fallbackEvaluationSessionId = nextEventId();
   const buildInjectedContext = async (query, context = {}) => {
     const requestPackBudget = reserveContextPrefixBudget(context.tokenBudget ?? injectTokenBudget);
     const queryHash = hashPromptPackQuery(query);
     const sessionID = context.sessionID || activeSessionID || "unknown";
     const surface = context.surface || injectSurface;
-    const requestKey = context.requestKey || "unknown";
+    let requestKey = context.requestKey || "unknown";
+    if (context.fallbackTurn != null) {
+      requestKey = JSON.stringify([requestKey, fallbackEvaluationSessionId, promptCounter, context.fallbackTurn]);
+    }
+    const evaluationFields = (
+      beforeText,
+      afterText,
+      candidateItems,
+      duplicatesOmitted,
+      packMetadata,
+      artifactFingerprint,
+    ) => ({
+      evaluation_key: injectionDigest(JSON.stringify([
+        sessionID,
+        requestKey,
+        surface,
+        queryHash,
+        artifactFingerprint,
+      ])),
+      automatic_recall: {
+        v: 1, candidateItems, duplicatesOmitted,
+        beforeTokens: beforeText ? estimateTokens(wrapInjectedContext(beforeText)) : 0,
+        afterTokens: afterText ? estimateTokens(wrapInjectedContext(afterText)) : 0,
+        missingRetainedMetadata: context.retainedMetadata?.missingRetainedMetadata === true,
+        invalidRetainedMetadata: context.retainedMetadata?.invalidRetainedMetadata === true,
+        packMetadata,
+      },
+    });
     const attemptKey = JSON.stringify([
       sessionID,
       requestKey,
@@ -3654,7 +3702,7 @@ export const CodememPlugin = async ({
     };
     let { packArgs, result } = await runPack();
     let { packText, conflictPackText, metrics, itemCount, ledgerConflict } = parsePackOutput(result);
-    let artifactFingerprint = packText
+    let artifactFingerprint = packText || itemCount === 0
       ? promptPackArtifactFingerprint(result.stdout, packText)
       : "";
     let injectedIdentity = identity;
@@ -3688,7 +3736,7 @@ export const CodememPlugin = async ({
       ({ packArgs, result } = await runPack());
       // Repair-conflict bytes are never preferred over the original preserved pack.
       ({ packText, metrics, itemCount, ledgerConflict } = parsePackOutput(result));
-      artifactFingerprint = packText
+      artifactFingerprint = packText || itemCount === 0
         ? promptPackArtifactFingerprint(result.stdout, packText)
         : "";
       const repairFailed = ledgerConflict
@@ -3773,7 +3821,7 @@ export const CodememPlugin = async ({
         );
         ({ packArgs, result } = await runPack());
         ({ packText, metrics, itemCount, ledgerConflict } = parsePackOutput(result));
-        artifactFingerprint = packText
+        artifactFingerprint = packText || itemCount === 0
           ? promptPackArtifactFingerprint(result.stdout, packText)
           : "";
 
@@ -3873,6 +3921,10 @@ export const CodememPlugin = async ({
     }
     if (!packText) {
       if (itemCount === 0) {
+        if (surface === "message") {
+          void runPromptPackLedger({ action: "recall", attempt_id: identity.attemptId,
+            ...evaluationFields("", "", 0, 0, "valid", artifactFingerprint) }).catch(() => {});
+        }
         advancePromptPackRetryIdentity(attemptKey);
       }
       if (debug) {
@@ -3909,6 +3961,16 @@ export const CodememPlugin = async ({
       ? filterRetainedPack(result.stdout, packText, context.retainedItems)
       : { text: packText, items: [], duplicates: 0 };
     const text = filtered.text ? wrapInjectedContext(filtered.text) : "";
+    const evaluation = surface === "message"
+      ? evaluationFields(
+          packText,
+          filtered.text,
+          itemCount,
+          filtered.duplicates,
+          filtered.packMetadata,
+          artifactFingerprint,
+        )
+      : undefined;
     const recall = filtered.items.length
       ? { v: 1, digest: injectionDigest(text), items: filtered.items, workingContext: context.workingContext }
       : undefined;
@@ -3921,6 +3983,7 @@ export const CodememPlugin = async ({
         text,
         recall,
         duplicates: filtered.duplicates,
+        evaluation,
         skipReason,
         metrics,
         attemptId: injectedIdentity?.attemptId || null,
@@ -3933,6 +3996,7 @@ export const CodememPlugin = async ({
       text,
       recall,
       duplicates: filtered.duplicates,
+      evaluation,
       skipReason,
       attemptId: injectedIdentity?.attemptId || null,
       requestId: injectedIdentity?.requestId || null,
@@ -4457,6 +4521,7 @@ export const CodememPlugin = async ({
         activeSessionID = sessionID || null;
         sessionStartedAt = new Date().toISOString();
         promptCounter = 0;
+        fallbackEvaluationSessionId = nextEventId();
         skippedAttemptCounter = 0;
         disabledInjectionRecorded.delete("message:unknown");
         disabledInjectionRecorded.delete("system:unknown");

@@ -193,14 +193,15 @@ New automatic message blocks omit unchanged memories already retained using rend
 
 Exact continuation prompts can skip new injection when working context and retrieved facts are unchanged. Retrieval still checks for changed facts; explicit recall and substantive short prompts are not classified as continuations.
 
-With local plugin logging enabled, `inject.recall` records new/retained token estimates, duplicate counts, and bounded reason codes without content or identifiers. These measurements describe hook delivery, not provider usage or answer quality.
+With local plugin logging enabled, `inject.recall` records new/retained token estimates, duplicate counts, and bounded reason codes without content or identifiers. These measurements describe hook delivery, not provider usage or answer quality. Empty packs inject no headings; their artifact identity still distinguishes changed evaluations in Health. Rejected recall measurements do not trigger CLI fallback or mark a healthy Viewer unavailable.
+
+Health's collapsed **Automatic recall (advanced)** panel shows durable local duplicate hit rates, estimated injection tokens avoided, and metadata gaps. It summarizes at most the newest 1,000 eligible OpenCode retrieval attempts from the last 30 days, filtered to currently visible selected memories. Only recorded fresh evaluations enter the hit-rate denominator; old clients and failed recording mean unknown coverage, not zero savings. When host IDs are missing, evaluation identity uses local turn information rather than prompt text alone and resets at each reported session creation. See [measurement definitions and limits](docs/opencode-retained-recall.md#local-measurements).
 
 The profile response advertises a closed compatibility range from
 `min_supported_protocol_version` through `protocol_version`. OpenCode accepts
 overlapping ranges, including legacy single-version profiles. Database/runtime
 identity mismatch falls back locally once without reading or retrying that Viewer.
-Validated request, policy, authorization, and `viewer_contract_unsupported`
-failures after a compatible handshake fail closed without a CLI child.
+Validated request, policy, and authorization failures after a compatible handshake fail closed without a CLI child. A delivery receipt rejected specifically as `viewer_contract_unsupported` retries once against the same Viewer without optional measurement fields; other contract failures remain terminal.
 
 **Memories** are typed — `bugfix`, `feature`, `refactor`, `change`, `discovery`, `decision`, `exploration` — with structured fields like `facts`, `concepts`, `files_read`, and `files_modified` that improve retrieval relevance. Low-signal events are filtered at multiple layers before persistence.
 
