@@ -1023,6 +1023,7 @@ const buildPackHttpBody = ({
   dbPath,
   identityTarget,
   attempt,
+  automaticContext,
 }) => ({
   context: query,
   limit: injectLimit !== null && Number.isFinite(injectLimit) && injectLimit > 0
@@ -1043,6 +1044,7 @@ const buildPackHttpBody = ({
     .map((value) => String(value || "").trim())
     .filter((value) => value && value.length <= MAX_WORKING_SET_PATH_CHARS),
   attempt,
+  ...(automaticContext !== undefined ? { automatic_context: automaticContext } : {}),
 });
 
 const canonicalJson = (value) => {
@@ -3585,7 +3587,11 @@ export const CodememPlugin = async ({
   const buildInjectedContext = async (query, context = {}) => {
     const requestPackBudget = reserveContextPrefixBudget(context.tokenBudget ?? injectTokenBudget);
     const queryHash = hashPromptPackQuery(query);
-    const sessionID = context.sessionID || activeSessionID || "unknown";
+    // Requester eligibility comes only from the transform's own session identity.
+    // activeSessionID tracks the latest event stream, which can belong to another
+    // overlapping session; inferring from it would authorize the wrong summaries.
+    const requesterHostSessionID = context.sessionID || null;
+    const sessionID = requesterHostSessionID || "unknown";
     const surface = context.surface || injectSurface;
     let requestKey = context.requestKey || "unknown";
     if (context.fallbackTurn != null) {
@@ -3635,7 +3641,7 @@ export const CodememPlugin = async ({
     let identity = resolveIdentity();
     let metadata = attemptMetadata(
       identity,
-      context.sessionID || activeSessionID || null,
+      requesterHostSessionID,
     );
     if (requestPackBudget === null) {
       return {
@@ -3667,6 +3673,9 @@ export const CodememPlugin = async ({
           dbPath: promptPackDbPath,
           identityTarget: promptPackIdentityTarget,
           attempt: metadata,
+          automaticContext: requesterHostSessionID
+            ? { source: "opencode", host_session_id: requesterHostSessionID }
+            : null,
         }),
         validate: isValidPackHttpPayload,
       });
@@ -3693,10 +3702,11 @@ export const CodememPlugin = async ({
         };
       }
 
-      let result = await runCli(packArgs, { stdinText: JSON.stringify(metadata) });
+      const result = await runCli(packArgs, { stdinText: JSON.stringify(metadata) });
       if (rejectsInternalLedgerFlag(result)) {
-        packArgs = packArgs.filter((arg) => arg !== "--internal-ledger");
-        result = await runCli(packArgs);
+        // An older CLI cannot enforce requester-session continuity. Do not retry
+        // through its generic pack path, which may inject an unrelated summary.
+        await logLine("inject.pack.cli_legacy_unsafe_fallback_blocked");
       }
       return { packArgs, result: { ...result, transport: "cli" } };
     };
@@ -3729,10 +3739,7 @@ export const CodememPlugin = async ({
       advancePromptPackRetryIdentity(attemptKey);
       retryCount = promptPackRetryCounts.get(attemptKey) || 0;
       identity = resolveIdentity();
-      metadata = attemptMetadata(
-        identity,
-        context.sessionID || activeSessionID || null,
-      );
+      metadata = attemptMetadata(identity, requesterHostSessionID);
       ({ packArgs, result } = await runPack());
       // Repair-conflict bytes are never preferred over the original preserved pack.
       ({ packText, metrics, itemCount, ledgerConflict } = parsePackOutput(result));
@@ -3815,10 +3822,7 @@ export const CodememPlugin = async ({
         advancePromptPackRetryIdentity(attemptKey);
         retryCount = promptPackRetryCounts.get(attemptKey) || 0;
         identity = resolveIdentity();
-        metadata = attemptMetadata(
-          identity,
-          context.sessionID || activeSessionID || null,
-        );
+        metadata = attemptMetadata(identity, requesterHostSessionID);
         ({ packArgs, result } = await runPack());
         ({ packText, metrics, itemCount, ledgerConflict } = parsePackOutput(result));
         artifactFingerprint = packText || itemCount === 0

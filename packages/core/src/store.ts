@@ -61,9 +61,11 @@ import {
 	type ScanDetection,
 	SecretScanner,
 } from "./secret-scanner.js";
+import { summaryContinuityFilter } from "./summary-memory.js";
 import { fingerprintPublicKey } from "./sync-fingerprint.js";
 import { recordReplicationOp } from "./sync-replication.js";
 import type {
+	AutomaticContext,
 	ExplainResponse,
 	MemoryFilters,
 	MemoryItem,
@@ -1099,11 +1101,18 @@ export class MemoryStore {
 	 * Return recent active memories, newest first.
 	 * Supports optional filters via buildFilterClauses.
 	 */
-	recent(limit = 10, filters?: MemoryFilters | null, offset = 0): MemoryItemResponse[] {
+	recent(
+		limit = 10,
+		filters?: MemoryFilters | null,
+		offset = 0,
+		summarySessionId?: number | null,
+	): MemoryItemResponse[] {
 		const baseClauses = ["memory_items.active = 1"];
 		const filterResult = buildFilterClausesWithContext(filters, this.scopeVisibleFilterContext());
-		const allClauses = [...baseClauses, ...filterResult.clauses];
-		const whereSql = buildWhereSql(allClauses, filterResult.params);
+		// Automatic continuity applies inside the query so LIMIT counts eligible rows only.
+		const continuity = summaryContinuityFilter(summarySessionId);
+		const allClauses = [...baseClauses, ...filterResult.clauses, ...continuity.clauses];
+		const whereSql = buildWhereSql(allClauses, [...filterResult.params, ...continuity.params]);
 
 		// Note: joinSessions is set by the project filter (not yet ported).
 		// Once project filtering lands, it will trigger the sessions JOIN.
@@ -1131,6 +1140,7 @@ export class MemoryStore {
 		limit = 10,
 		filters?: MemoryFilters | null,
 		offset = 0,
+		summarySessionId?: number | null,
 	): MemoryItemResponse[] {
 		const kindsList = kinds.filter((k) => k.length > 0);
 		if (kindsList.length === 0) return [];
@@ -1138,8 +1148,9 @@ export class MemoryStore {
 		const kindPlaceholders = kindsList.map(() => "?").join(", ");
 		const baseClauses = ["memory_items.active = 1", `memory_items.kind IN (${kindPlaceholders})`];
 		const filterResult = buildFilterClausesWithContext(filters, this.scopeVisibleFilterContext());
-		const allClauses = [...baseClauses, ...filterResult.clauses];
-		const params = [...kindsList, ...filterResult.params];
+		const continuity = summaryContinuityFilter(summarySessionId);
+		const allClauses = [...baseClauses, ...filterResult.clauses, ...continuity.clauses];
+		const params = [...kindsList, ...filterResult.params, ...continuity.params];
 		const whereSql = buildWhereSql(allClauses, params);
 
 		const fromSql = filterResult.joinSessions
@@ -1602,8 +1613,9 @@ export class MemoryStore {
 		depthBefore = 3,
 		depthAfter = 3,
 		filters?: MemoryFilters | null,
+		summarySessionId?: number | null,
 	): TimelineItemResponse[] {
-		return timelineFn(this, query, memoryId, depthBefore, depthAfter, filters);
+		return timelineFn(this, query, memoryId, depthBefore, depthAfter, filters, summarySessionId);
 	}
 
 	// explain
@@ -1637,8 +1649,18 @@ export class MemoryStore {
 		limit?: number,
 		tokenBudget?: number | null,
 		filters?: MemoryFilters,
+		automaticContext?: AutomaticContext | null,
 	): PackResponse {
-		return buildMemoryPack(this, context, limit, tokenBudget ?? null, filters);
+		return buildMemoryPack(
+			this,
+			context,
+			limit,
+			tokenBudget ?? null,
+			filters,
+			undefined,
+			undefined,
+			automaticContext,
+		);
 	}
 
 	buildMemoryPackTrace(
@@ -1646,8 +1668,18 @@ export class MemoryStore {
 		limit?: number,
 		tokenBudget?: number | null,
 		filters?: MemoryFilters,
+		automaticContext?: AutomaticContext | null,
 	): PackTrace {
-		return buildMemoryPackTrace(this, context, limit, tokenBudget ?? null, filters);
+		return buildMemoryPackTrace(
+			this,
+			context,
+			limit,
+			tokenBudget ?? null,
+			filters,
+			undefined,
+			undefined,
+			automaticContext,
+		);
 	}
 
 	buildMemoryPackWithTrace(
@@ -1656,6 +1688,7 @@ export class MemoryStore {
 		tokenBudget?: number | null,
 		filters?: MemoryFilters,
 		renderOptions?: PackRenderOptions,
+		automaticContext?: AutomaticContext | null,
 	): PackArtifacts {
 		return buildMemoryPackWithTrace(
 			this,
@@ -1665,6 +1698,7 @@ export class MemoryStore {
 			filters,
 			undefined,
 			renderOptions,
+			automaticContext,
 		);
 	}
 
@@ -1681,8 +1715,17 @@ export class MemoryStore {
 		tokenBudget?: number | null,
 		filters?: MemoryFilters,
 		renderOptions?: PackRenderOptions,
+		automaticContext?: AutomaticContext | null,
 	): Promise<PackResponse> {
-		return buildMemoryPackAsync(this, context, limit, tokenBudget ?? null, filters, renderOptions);
+		return buildMemoryPackAsync(
+			this,
+			context,
+			limit,
+			tokenBudget ?? null,
+			filters,
+			renderOptions,
+			automaticContext,
+		);
 	}
 
 	async buildMemoryPackWithTraceAsync(
@@ -1691,6 +1734,7 @@ export class MemoryStore {
 		tokenBudget?: number | null,
 		filters?: MemoryFilters,
 		renderOptions?: PackRenderOptions,
+		automaticContext?: AutomaticContext | null,
 	): Promise<PackArtifacts> {
 		return buildMemoryPackWithTraceAsync(
 			this,
@@ -1699,6 +1743,7 @@ export class MemoryStore {
 			tokenBudget ?? null,
 			filters,
 			renderOptions,
+			automaticContext,
 		);
 	}
 
@@ -1708,6 +1753,7 @@ export class MemoryStore {
 		tokenBudget?: number | null,
 		filters?: MemoryFilters,
 		renderOptions?: PackRenderOptions,
+		automaticContext?: AutomaticContext | null,
 	): Promise<PackTrace> {
 		return buildMemoryPackTraceAsync(
 			this,
@@ -1716,6 +1762,7 @@ export class MemoryStore {
 			tokenBudget ?? null,
 			filters,
 			renderOptions,
+			automaticContext,
 		);
 	}
 

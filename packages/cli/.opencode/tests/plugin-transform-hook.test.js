@@ -781,6 +781,63 @@ describe("OpenCode transform-time injection", () => {
 		expect(spawnMock.mock.calls.filter(isPackOrLedgerSpawn)).toEqual([]);
 	});
 
+	test("does not authorize the unknown ledger sentinel when host session identity is missing", async () => {
+		process.env.CODEMEM_VIEWER = "1";
+		process.env.CODEMEM_VIEWER_AUTO = "0";
+		process.env.CODEMEM_RAW_EVENTS = "0";
+		const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (url) => {
+			if (String(url).endsWith("/api/prompt-pack-profile")) return viewerProfileResponse();
+			if (String(url).endsWith("/api/pack")) return jsonResponse(200, packResponse());
+			return jsonResponse(200, { ok: true });
+		});
+		const { CodememPlugin } = await import("../plugins/codemem.js");
+		const hooks = await CodememPlugin({
+			project: { name: "greenroom" },
+			client: { app: { log: vi.fn().mockResolvedValue(undefined) }, tui: {} },
+			directory: "/tmp/greenroom",
+			worktree: "/tmp/greenroom",
+		});
+		const output = messageOutput({ messageId: "user-missing-session", sessionID: null });
+
+		await hooks["experimental.chat.messages.transform"]({}, output);
+		await vi.waitFor(() => expect(fetchPostCalls(fetchMock)).toHaveLength(2));
+
+		const packBody = fetchBody(fetchMock, 0);
+		expect(packBody).toHaveProperty("automatic_context", null);
+		expect(packBody.attempt).not.toHaveProperty("source_session_id");
+	});
+
+	test("does not infer a missing requester from the most recent active session event", async () => {
+		process.env.CODEMEM_VIEWER = "1";
+		process.env.CODEMEM_VIEWER_AUTO = "0";
+		process.env.CODEMEM_RAW_EVENTS = "0";
+		const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (url) => {
+			if (String(url).endsWith("/api/prompt-pack-profile")) return viewerProfileResponse();
+			if (String(url).endsWith("/api/pack")) return jsonResponse(200, packResponse());
+			return jsonResponse(200, { ok: true });
+		});
+		const { CodememPlugin } = await import("../plugins/codemem.js");
+		const hooks = await CodememPlugin({
+			project: { name: "greenroom" },
+			client: { app: { log: vi.fn().mockResolvedValue(undefined) }, tui: {} },
+			directory: "/tmp/greenroom",
+			worktree: "/tmp/greenroom",
+		});
+		// An overlapping session's event stream must not become another transform's requester.
+		await hooks.event({
+			event: { type: "session.created", properties: { sessionID: "sess-other-active" } },
+		});
+		const output = messageOutput({ messageId: "user-missing-session-after-event", sessionID: null });
+
+		await hooks["experimental.chat.messages.transform"]({}, output);
+		await vi.waitFor(() => expect(fetchPostCalls(fetchMock)).toHaveLength(2));
+
+		const packBody = fetchBody(fetchMock, 0);
+		expect(packBody).toHaveProperty("automatic_context", null);
+		expect(packBody.attempt).not.toHaveProperty("source_session_id");
+		expect(JSON.stringify(packBody)).not.toContain("sess-other-active");
+	});
+
 	test("keeps an explicit reserved token budget equal across Viewer and CLI fallback", async () => {
 		// Arrange
 		process.env.CODEMEM_VIEWER = "1";
@@ -872,7 +929,7 @@ describe("OpenCode transform-time injection", () => {
 		expect(output.messages[0].parts).toHaveLength(1);
 	});
 
-	test("retries pack without --internal-ledger when an older backend rejects the flag", async () => {
+	test("does not use an older backend's unsafe generic pack fallback", async () => {
 		const packArgs = [];
 		spawnMock.mockImplementation((_command, args) => {
 			if (Array.isArray(args) && args.includes("pack")) {
@@ -911,10 +968,9 @@ describe("OpenCode transform-time injection", () => {
 
 		await hooks["experimental.chat.messages.transform"]({}, output);
 
-		expect(packArgs).toHaveLength(2);
+		expect(packArgs).toHaveLength(1);
 		expect(packArgs[0]).toContain("--internal-ledger");
-		expect(packArgs[1]).not.toContain("--internal-ledger");
-		expect(output.messages[0].parts.at(-1).text).toContain("Legacy backend context");
+		expect(output.messages[0].parts).toHaveLength(1);
 	});
 
 	test.each([
@@ -963,6 +1019,49 @@ describe("OpenCode transform-time injection", () => {
 			expect(receipt).toMatchObject({ action: "recall", automatic_recall: { candidateItems: 0, beforeTokens: 0, afterTokens: 0 } });
 		}
 		expect(output.messages[0].parts).toHaveLength(1);
+	});
+
+	test("keeps CLI repair retries fail-closed when the transform has no session identity", async () => {
+		process.env.CODEMEM_VIEWER = "1";
+		process.env.CODEMEM_VIEWER_AUTO = "0";
+		process.env.CODEMEM_RAW_EVENTS = "0";
+		let packCalls = 0;
+		const packStdin = [];
+		const response = () => ({
+			pack_text: "## Summary\n\n## Observations",
+			metrics: { total_items: 0, pack_tokens: 7 },
+			ledger_artifact_fingerprint: "c".repeat(64),
+			// First CLI pack reports a ledger conflict so the plugin rebuilds metadata and retries.
+			ledger_outcome: ++packCalls === 1
+				? { ok: false, errorCode: "retrieval_ledger_write_failed", reason: "idempotency_conflict" }
+				: undefined,
+		});
+		vi.spyOn(globalThis, "fetch").mockImplementation(async (url) => {
+			if (String(url).endsWith("/api/prompt-pack-profile")) return viewerProfileResponse();
+			if (String(url).endsWith("/api/pack")) return jsonResponse(503, { error: "unavailable" });
+			return jsonResponse(200, { ok: true });
+		});
+		spawnMock.mockImplementation((_command, args) => {
+			const proc = makeProcess({ stdout: args.includes("pack") ? JSON.stringify(response()) : "{}" });
+			if (args.includes("pack")) proc.stdin.write = vi.fn((value) => packStdin.push(JSON.parse(String(value))));
+			return proc;
+		});
+		const { CodememPlugin } = await import("../plugins/codemem.js");
+		const hooks = await CodememPlugin({ project: { name: "fixture" }, client: { app: { log: vi.fn() }, tui: {} }, directory: "/tmp/fixture", worktree: "/tmp/fixture" });
+		await hooks.event({
+			event: { type: "session.created", properties: { sessionID: "sess-other-active" } },
+		});
+		const output = messageOutput({ messageId: "repair-missing-session", sessionID: null, text: "repair query" });
+
+		await hooks["experimental.chat.messages.transform"]({}, output);
+
+		expect(packCalls).toBeGreaterThanOrEqual(2);
+		expect(packStdin.length).toBe(packCalls);
+		for (const payload of packStdin) {
+			expect(payload).not.toHaveProperty("source_session_id");
+			expect(payload).not.toHaveProperty("stream_id");
+			expect(JSON.stringify(payload)).not.toContain("sess-other-active");
+		}
 	});
 
 	test("suppresses real zero-result packs without advancing delivery", async () => {
