@@ -587,3 +587,47 @@ describe("GET /api/diagnostics/events capture backlog", () => {
 		);
 	});
 });
+
+describe("sync failure diagnostics copy", () => {
+	it("explains sync failure categories in plain language without exposing the error", async () => {
+		const store = createStore();
+		const errors = [
+			"all addresses failed | http://host.internal:7337: The operation was aborted due to timeout",
+			"all addresses failed | http://host.internal:7337: fetch failed (network)",
+			"peer status failed (401: unauthorized)",
+			"opaque private failure",
+			"all addresses failed | http://authbox.local:7337: fetch failed",
+			"peer protocol mismatch (expected 2, got 1)",
+			"scoped sync incomplete: auth-team=bootstrap apply failed; oss=scoped incremental failed: The operation was aborted due to timeout",
+			"scoped sync incomplete: auth-team=bootstrap apply failed",
+		];
+		errors.forEach((error, index) => {
+			insertSyncAttempt(store, {
+				at: `2026-09-07T1${index}:00:00.000Z`,
+				error,
+				id: index + 1,
+				ok: false,
+			});
+		});
+		const app = diagnosticsRoutes(() => store);
+
+		const response = await app.request("/api/diagnostics/events");
+		const text = await response.text();
+		const messages = (JSON.parse(text) as DiagnosticsResponse).items.map((item) => item.message);
+
+		expect(messages).toEqual([
+			"A sync attempt failed before all work completed.",
+			"A sync attempt failed before all work completed.",
+			"Sync stopped because two devices run incompatible Codemem versions.",
+			"Sync could not reach a paired device, or the device did not respond in time.",
+			"A sync attempt failed before all work completed.",
+			"Sync stopped because the pairing or identity check between two devices failed.",
+			"Sync could not reach a paired device, or the device did not respond in time.",
+			"Sync could not reach a paired device, or the device did not respond in time.",
+		]);
+		expect(text).not.toContain("host.internal");
+		expect(text).not.toContain("authbox");
+		expect(text).not.toContain("auth-team");
+		expect(text).not.toContain("private-device");
+	});
+});

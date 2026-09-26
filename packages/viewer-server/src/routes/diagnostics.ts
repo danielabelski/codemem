@@ -1,5 +1,9 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from "node:crypto";
-import type { MemoryStore } from "@codemem/core";
+import {
+	classifyRecordedSyncFailure,
+	type MemoryStore,
+	type RecordedSyncFailureCategory,
+} from "@codemem/core";
 import { Hono } from "hono";
 
 const DEFAULT_LIMIT = 50;
@@ -152,14 +156,8 @@ function syncSelect(options: EventOptions): string | null {
 		${SYNC_OCCURRED_AT_SQL} AS occurred_at,
 		CASE WHEN ok <> 0 THEN 'succeeded' ELSE 'failed' END AS status,
 		ops_in AS metric_a, ops_out AS metric_b,
-		CASE
-			WHEN lower(error) LIKE '%auth%' OR lower(error) LIKE '%unauthorized%' THEN 'authentication'
-			WHEN lower(error) LIKE '%timeout%' OR lower(error) LIKE '%timed out%' THEN 'timeout'
-			WHEN lower(error) LIKE '%version%' OR lower(error) LIKE '%capability%' THEN 'compatibility'
-			WHEN lower(error) LIKE '%connect%' OR lower(error) LIKE '%network%'
-				OR lower(error) LIKE '%dns%' THEN 'connectivity'
-			ELSE 'unspecified'
-		END AS category
+		-- Raw error text; syncEvent classifies it server-side and never returns it.
+		error AS category
 		FROM sync_attempts ${where}
 		ORDER BY ${SYNC_OCCURRED_AT_SQL} DESC, id DESC
 		LIMIT @sourceLimit`;
@@ -304,11 +302,20 @@ function loadSourceRows(store: MemoryStore, options: EventOptions): DiagnosticSo
 		.all(params) as DiagnosticSourceRow[];
 }
 
+// Wording stays neutral about which device caused the failure: the same
+// category can start on either side of the connection.
+const SYNC_FAILURE_MESSAGES: Partial<Record<RecordedSyncFailureCategory, string>> = {
+	connectivity: "Sync could not reach a paired device, or the device did not respond in time.",
+	trust: "Sync stopped because the pairing or identity check between two devices failed.",
+	scope: "Sync stopped because two devices disagree about access to a shared Space.",
+	compatibility: "Sync stopped because two devices run incompatible Codemem versions.",
+};
+
 function syncEvent(row: DiagnosticSourceRow, includeTechnical: boolean): OrderedDiagnosticEvent {
 	const succeeded = row.status === "succeeded";
 	const opsIn = Number(row.metric_a ?? 0);
 	const opsOut = Number(row.metric_b ?? 0);
-	const category = row.category ?? "unspecified";
+	const category = succeeded ? "other" : classifyRecordedSyncFailure(row.category);
 	return {
 		id: opaqueId("sync-attempt", row.source_id),
 		orderKey: row.order_key,
@@ -318,7 +325,7 @@ function syncEvent(row: DiagnosticSourceRow, includeTechnical: boolean): Ordered
 		code: succeeded ? "sync_attempt_succeeded" : "sync_attempt_failed",
 		message: succeeded
 			? "A sync attempt completed."
-			: "A sync attempt failed before all work completed.",
+			: (SYNC_FAILURE_MESSAGES[category] ?? "A sync attempt failed before all work completed."),
 		recovery: succeeded
 			? undefined
 			: { label: "Open advanced sync diagnostics", href: "#advanced/sync/diagnostics" },
