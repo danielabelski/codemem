@@ -15,6 +15,7 @@ import {
 	completeMaintenanceJob,
 	failMaintenanceJob,
 	getMaintenanceJob,
+	isTransientSqliteBusy,
 	startMaintenanceJob,
 	updateMaintenanceJob,
 } from "./maintenance-jobs.js";
@@ -166,9 +167,7 @@ export async function runRefBackfillPass(
 		"INSERT OR IGNORE INTO memory_concept_refs (memory_id, concept) VALUES (?, ?)",
 	);
 
-	// Insert refs per-row (not per-batch) to keep write transactions short
-	// and avoid blocking the viewer's read connections on large databases.
-	const insertOneRow = db.transaction((row: BackfillRow) => {
+	const insertRowRefs = (row: BackfillRow) => {
 		const filesRead = safeJsonArray(row.files_read);
 		const filesModified = safeJsonArray(row.files_modified);
 		const concepts = safeJsonArray(row.concepts);
@@ -189,17 +188,37 @@ export async function runRefBackfillPass(
 				if (normalized) insertConceptRef.run(row.id, normalized);
 			}
 		}
+	};
+
+	// Insert refs per-row (not per-batch) to keep write transactions short
+	// and avoid blocking the viewer's read connections on large databases.
+	// Each row commits together with its progress and cursor, so a busy
+	// error mid-batch never leaves committed rows uncounted, and the
+	// coordinator, which polls pending work independently, can never observe
+	// finished work while the job row still says running.
+	const processRow = db.transaction((row: BackfillRow, index: number) => {
+		insertRowRefs(row);
+		const isLastRow = index === rows.length - 1;
+		return recordBatchProgress(db, {
+			processedAfter: processedBefore + index + 1,
+			progressTotal,
+			newCursor: row.id,
+			exhausted: isLastRow && (rows.length < batchSize || !hasPendingRefBackfill(db)),
+		});
 	});
-	for (const row of rows) {
-		insertOneRow(row);
+	let hasMoreWork = true;
+	for (const [index, row] of rows.entries()) {
+		hasMoreWork = processRow(row, index);
 	}
+	return hasMoreWork;
+}
 
-	const processedAfter = processedBefore + rows.length;
-	const exhausted = rows.length < batchSize;
-	// rows.length > 0 guaranteed by early return above
-	const newCursor = (rows[rows.length - 1] as BackfillRow).id;
-
-	if (exhausted) {
+function recordBatchProgress(
+	db: SqliteDatabase,
+	batch: { processedAfter: number; progressTotal: number; newCursor: number; exhausted: boolean },
+): boolean {
+	const { processedAfter, progressTotal, newCursor } = batch;
+	if (batch.exhausted) {
 		const finalProgressTotal = Number(
 			getExistingMetadata(db).total_backfillable ?? progressTotal ?? processedAfter,
 		);
@@ -288,6 +307,10 @@ export class RefBackfillRunner {
 				this.active = false;
 			}
 		} catch (error) {
+			if (isTransientSqliteBusy(error)) {
+				console.warn("Ref backfill runner deferred because the database is busy", error);
+				return;
+			}
 			if (db) {
 				failMaintenanceJob(
 					db,
