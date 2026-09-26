@@ -6,6 +6,7 @@ import {
 	failMaintenanceJob,
 	getMaintenanceJob,
 	startMaintenanceJob,
+	type UpdateMaintenanceJobInput,
 	updateMaintenanceJob,
 } from "./maintenance-jobs.js";
 
@@ -19,6 +20,7 @@ type DedupKeyBackfillMetadata = {
 	checked_rows?: number;
 	last_batch_updated?: number;
 	last_cursor_id?: number;
+	last_cursor_created_at?: string | null;
 };
 
 export interface DedupKeyBackfillRunnerOptions {
@@ -43,6 +45,69 @@ function getExistingMetadata(db: SqliteDatabase): DedupKeyBackfillMetadata {
 		{}) as DedupKeyBackfillMetadata;
 }
 
+function resumeCursor(
+	startingFresh: boolean,
+	metadata: DedupKeyBackfillMetadata,
+): { afterId: number; afterCreatedAt: string | null } {
+	if (startingFresh) return { afterId: 0, afterCreatedAt: null };
+	return {
+		afterId: Number(metadata.last_cursor_id ?? 0),
+		afterCreatedAt: metadata.last_cursor_created_at ?? null,
+	};
+}
+
+function cursorMetadata(
+	id: number,
+	createdAt: string | null,
+): Pick<DedupKeyBackfillMetadata, "last_cursor_id" | "last_cursor_created_at"> {
+	return { last_cursor_id: id, last_cursor_created_at: createdAt };
+}
+
+// Sync can insert a row whose created_at sorts behind the cursor while a run is
+// in progress. Rewind to the start instead of completing so the same run keys
+// it; the coordinator stops watching once the job reports completed. The
+// check and the status write share one write transaction so another process
+// cannot insert a row between them.
+function completeOrRewind(
+	db: SqliteDatabase,
+	completion: Omit<UpdateMaintenanceJobInput, "status">,
+): boolean {
+	return db
+		.transaction(() => {
+			const remaining = planMemoryDedupKeys(db, { updateLimit: 1 }).backfillable;
+			if (remaining > 0) {
+				rewindForLateRows(db, completion, remaining);
+				return true;
+			}
+			completeMaintenanceJob(db, DEDUP_KEY_BACKFILL_JOB, completion);
+			return false;
+		})
+		.immediate();
+}
+
+// Grow the total by the late rows so progress never reads "5 of 4".
+function rewindForLateRows(
+	db: SqliteDatabase,
+	completion: Omit<UpdateMaintenanceJobInput, "status">,
+	remaining: number,
+): void {
+	const metadata = (completion.metadata ?? {}) as DedupKeyBackfillMetadata;
+	const processed = Number(metadata.processed_updates ?? 0);
+	const total = processed + remaining;
+	updateMaintenanceJob(db, DEDUP_KEY_BACKFILL_JOB, {
+		message: "Rescanning for memories added during the dedup-key backfill",
+		progressCurrent: processed,
+		progressTotal: total,
+		metadata: {
+			...metadata,
+			total_backfillable: total,
+			remaining_backfillable: remaining,
+			skipped_rows: 0,
+			...cursorMetadata(0, null),
+		},
+	});
+}
+
 export async function runDedupKeyBackfillPass(
 	db: SqliteDatabase,
 	options: { batchSize?: number } = {},
@@ -57,17 +122,13 @@ export async function runDedupKeyBackfillPass(
 	// `backfillable > 0` predicate keeps re-triggering the coordinator.
 	const startingFresh =
 		!existingJob || existingJob.status === "completed" || existingJob.status === "failed";
-	const lastCursorId = startingFresh ? 0 : Number(existingMetadata.last_cursor_id ?? 0);
-	const plan = planMemoryDedupKeys(db, {
-		rowLimit: batchSize,
-		updateLimit: batchSize,
-		afterId: lastCursorId,
-	});
+	const cursor = resumeCursor(startingFresh, existingMetadata);
+	const plan = planMemoryDedupKeys(db, { rowLimit: batchSize, updateLimit: batchSize, ...cursor });
 
 	if (plan.checked <= 0) {
 		if (existingJob && existingJob.status !== "completed") {
 			const processedUpdates = Number(existingMetadata.processed_updates ?? 0);
-			completeMaintenanceJob(db, DEDUP_KEY_BACKFILL_JOB, {
+			return completeOrRewind(db, {
 				message:
 					Number(existingMetadata.skipped_rows ?? 0) > 0
 						? `No backfillable dedup keys remaining (${Number(existingMetadata.skipped_rows ?? 0)} skipped)`
@@ -79,7 +140,7 @@ export async function runDedupKeyBackfillPass(
 					remaining_backfillable: 0,
 					checked_rows: 0,
 					last_batch_updated: 0,
-					last_cursor_id: lastCursorId,
+					...cursorMetadata(cursor.afterId, cursor.afterCreatedAt),
 				},
 			});
 		}
@@ -110,7 +171,7 @@ export async function runDedupKeyBackfillPass(
 				skipped_rows: 0,
 				checked_rows: plan.checked,
 				last_batch_updated: 0,
-				last_cursor_id: 0,
+				...cursorMetadata(0, null),
 			},
 		});
 		progressTotal = initialTotal;
@@ -122,7 +183,7 @@ export async function runDedupKeyBackfillPass(
 		const finalProgressTotal = Number(
 			getExistingMetadata(db).total_backfillable ?? progressTotal ?? processedAfter,
 		);
-		completeMaintenanceJob(db, DEDUP_KEY_BACKFILL_JOB, {
+		return completeOrRewind(db, {
 			message:
 				cumulativeSkipped > 0
 					? `Dedup-key backfill complete (${cumulativeSkipped} skipped)`
@@ -136,10 +197,9 @@ export async function runDedupKeyBackfillPass(
 				skipped_rows: cumulativeSkipped,
 				checked_rows: plan.checked,
 				last_batch_updated: plan.updates.length,
-				last_cursor_id: plan.lastScannedId,
+				...cursorMetadata(plan.lastScannedId, plan.lastScannedCreatedAt),
 			},
 		});
-		return false;
 	}
 
 	updateMaintenanceJob(db, DEDUP_KEY_BACKFILL_JOB, {
@@ -153,7 +213,7 @@ export async function runDedupKeyBackfillPass(
 			skipped_rows: cumulativeSkipped,
 			checked_rows: plan.checked,
 			last_batch_updated: plan.updates.length,
-			last_cursor_id: plan.lastScannedId,
+			...cursorMetadata(plan.lastScannedId, plan.lastScannedCreatedAt),
 		},
 	});
 	return true;
