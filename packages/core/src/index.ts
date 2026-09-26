@@ -1262,6 +1262,7 @@ export {
 export {
 	classifyRecordedSyncFailure,
 	type RecordedSyncFailureCategory,
+	refineStoredSyncConnectivity,
 } from "./sync-failure-classification.js";
 export type { RequestJsonOptions } from "./sync-http-client.js";
 export { buildBaseUrl, requestJson } from "./sync-http-client.js";
@@ -1278,7 +1279,12 @@ export {
 	storePrivateKeyKeychain,
 	validateExistingKeypair,
 } from "./sync-identity.js";
-export type { SyncFailureCategory, SyncPassOptions, SyncResult } from "./sync-pass.js";
+export type {
+	SyncAttemptFailureCategory,
+	SyncFailureCategory,
+	SyncPassOptions,
+	SyncResult,
+} from "./sync-pass.js";
 export {
 	consecutiveConnectivityFailures,
 	cursorAdvances,

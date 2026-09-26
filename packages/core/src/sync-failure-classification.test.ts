@@ -1,5 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { classifyRecordedSyncFailure } from "./sync-failure-classification.js";
+import {
+	classifyRecordedSyncFailure,
+	refineStoredSyncConnectivity,
+} from "./sync-failure-classification.js";
 
 describe("classifyRecordedSyncFailure", () => {
 	it.each([
@@ -51,5 +54,32 @@ describe("classifyRecordedSyncFailure", () => {
 		classifyRecordedSyncFailure(`a://${"a://".repeat(50_000)}`);
 		classifyRecordedSyncFailure("a".repeat(200_000));
 		expect(performance.now() - started).toBeLessThan(500);
+	});
+});
+
+describe("refineStoredSyncConnectivity", () => {
+	it.each([
+		[undefined, "connectivity"],
+		["", "connectivity"],
+		["socket hang up", "connectivity"],
+		["fetch failed", "connectivity"],
+		["peer ops fetch failed (503: sync_auth_store_busy)", "connectivity"],
+		["peer status failed (400)", "other"],
+		["peer ops fetch failed (500) http://network-box.local:7337", "other"],
+		["handshake rejected by http://timeout-lab.local:7337", "other"],
+		[
+			"all addresses failed | http://a.local:7337: peer status failed (400) || http://b.local:7337: connection refused",
+			"connectivity",
+		],
+		[
+			"all addresses failed | http://a.local:7337: peer status failed (400) || http://network-b.local:7337: peer status failed (500)",
+			"other",
+		],
+		[
+			"all addresses failed | http://a.local:7337: peer status failed (400) || http://b.local:7337: The operation was aborted due to timeout",
+			"connectivity",
+		],
+	] as const)("classifies %j as %s", (error, category) => {
+		expect(refineStoredSyncConnectivity(error)).toBe(category);
 	});
 });
