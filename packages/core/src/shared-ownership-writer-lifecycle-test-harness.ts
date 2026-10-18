@@ -122,13 +122,8 @@ async function transition(f: RevocationFixture, action: Transition) {
 		expect(
 			await f.store.renameDevice(f.input.groupId, f.input.deviceId, "Renamed owner label"),
 		).toBe(true);
-		for (const table of [
-			"coordinator_auth_sessions",
-			"coordinator_auth_session_receipts",
-			"coordinator_auth_link_attempts",
-			"coordinator_auth_link_audit_log",
-		])
-			await f.exec(`DELETE FROM ${table}`);
+		// Session data may disappear; receipts, genesis attempts and audits remain history.
+		await f.exec("DELETE FROM coordinator_auth_sessions");
 	}
 }
 function eligible(target: Target, action: Transition, evidence: Evidence) {
@@ -421,6 +416,10 @@ function registerSeparateAuthorityCleanup(test: Test) {
 				"coordinator_identity_group_grants",
 				"coordinator_auth_controller_attestations",
 				"coordinator_auth_account_links",
+				"coordinator_auth_link_attempts",
+				"coordinator_auth_link_audit_log",
+				"coordinator_auth_session_receipts",
+				"coordinator_auth_browser_transactions",
 				"coordinator_join_requests",
 				"coordinator_bootstrap_grants",
 			];
@@ -433,13 +432,8 @@ function registerSeparateAuthorityCleanup(test: Test) {
 			])
 				expect((await f.rows(table)).length).toBeGreaterThan(0);
 			await transition(f, "history cleanup");
-			for (const table of [
-				"coordinator_auth_sessions",
-				"coordinator_auth_session_receipts",
-				"coordinator_auth_link_attempts",
-				"coordinator_auth_link_audit_log",
-			])
-				expect(await f.rows(table)).toEqual([]);
+			expect(await f.rows("coordinator_auth_sessions")).toEqual([]);
+			expect(await Promise.all(preservedTables.map(f.rows))).toEqual(preserved);
 			await f.reopen?.();
 			const before = await lifecycleSnapshot(f);
 			// Act: matching Identity labels and retained authorities still are not owner proof.
