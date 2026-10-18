@@ -46,6 +46,22 @@ async function unavailable(status = 403) {
 	const page = await renderAuthBrowserNotice("auth_unavailable");
 	return new Response(page.body, { status, headers: page.headers });
 }
+async function failConsumedChange(
+	context: Context,
+	proof: AuthLinkChangeBrowserProof,
+	status = 403,
+): Promise<Response> {
+	const failed = await context.store.failAuthLinkChangeAttempt(
+		{
+			attemptId: proof.attemptId,
+			requester: { kind: "browser", browserTransactionHash: proof.browserTransactionHash },
+			reason: "provider_failure",
+		},
+		context.settings.store,
+	);
+	if (failed.kind === "rejected" || failed.status.state !== "failed") return unavailable(503);
+	return unavailable(status);
+}
 async function releaseCompletion(context: Context, proof: AuthLinkChangeBrowserProof) {
 	const bytes = globalThis.crypto.getRandomValues(new Uint8Array(32));
 	const completionSecret = encodeCoordinatorAuthProof32(bytes);
@@ -138,17 +154,17 @@ async function callback(context: Context, request: Request) {
 	);
 	if (!proof) return unavailable();
 	const oidc = await createCoordinatorOidcClient(context.settings.oidc, context.oidcOptions);
-	if (!oidc.ok) return unavailable(503);
+	if (!oidc.ok) return failConsumedChange(context, proof, 503);
 	const verified = await oidc.client.verifyCallback({
 		callbackUrl: snapshot.url,
 		material: { state, nonce: proof.nonce, pkceVerifier: proof.pkceVerifier },
 	});
-	if (!verified.ok) return unavailable();
+	if (!verified.ok) return failConsumedChange(context, proof);
 	const recorded = await context.store.recordAuthLinkChangeOidcVerified(
 		{ ...proof, account: verified.account, profile: verified.profile },
 		context.settings.store,
 	);
-	if (recorded.kind !== "applied") return unavailable();
+	if (recorded.kind !== "applied") return failConsumedChange(context, proof);
 	if (proof.intent === "refresh") return releaseCompletion(context, proof);
 	const csrfToken = await issueBrowserCsrfToken(
 		context.csrfKey,

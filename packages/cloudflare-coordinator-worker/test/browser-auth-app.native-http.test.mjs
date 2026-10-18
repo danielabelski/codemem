@@ -14,6 +14,9 @@ const runtimeRequire = createRequire(require.resolve("wrangler/package.json"));
 const { Miniflare, convertV4MiniflareOptions } = runtimeRequire("miniflare");
 const { build } = runtimeRequire("esbuild");
 const ORIGIN = "https://app.example.test";
+// The management adapter composes its own link-start SDK client. These are the
+// four discovery-owning boundaries in createCoordinatorBrowserAuth, in order.
+const DISCOVERY_CLIENTS = Object.freeze(["signin-start", "link-start", "link-change-start", "callback"]);
 test("Worker fresh auth snapshot exactly matches current definitions and fences old binaries", async (t) => {
 	// Arrange: actual checked-in root and independent current fresh definitions.
 	const coreRequire = createRequire(new URL("../../core/package.json", import.meta.url));
@@ -70,6 +73,7 @@ test("legacy D1 refuses optional auth before discovery and recovers after the ex
 // Test-only HTTP URL rewrite exercises Worker request contexts, not browser HTTPS/Secure cookies.
 async function harness(t, { coldRequests = 1, legacyAuth = false } = {}) {
 	let discoveries = 0;
+	const discoveryLog = [];
 	const waiting = [];
 	const metadata = JSON.stringify({
 		issuer: "https://accounts.google.com",
@@ -81,7 +85,8 @@ async function harness(t, { coldRequests = 1, legacyAuth = false } = {}) {
 		id_token_signing_alg_values_supported: ["RS256"],
 		token_endpoint_auth_methods_supported: ["client_secret_post"],
 	});
-	const provider = createServer((_request, response) => {
+	const provider = createServer((request, response) => {
+		discoveryLog.push({ method: request.method, path: request.url });
 		discoveries++;
 		const reply = () => {
 			response.writeHead(200, { "content-type": "application/json" });
@@ -168,7 +173,7 @@ export default { async fetch(request, env) {
 		const response = await fetch(new URL(path, base), { ...init, redirect: "manual" });
 		return { status: response.status, headers: response.headers, body: await response.text() };
 	};
-	return { request, db, discoveries: () => discoveries };
+	return { request, db, discoveries: () => discoveries, discoveryLog: () => [...discoveryLog] };
 }
 function fields(page) {
 	return Object.fromEntries(
@@ -237,16 +242,20 @@ test("actual SDK cold requests own discovery I/O; warm HTTP requests reuse compo
 	const discoveries = f.discoveries();
 	const started = await f.request("/auth/sign-in", post(cold[0]));
 	const warm = await f.request("/auth/sign-in");
+	const management = await f.request("/auth/link-change/start");
 	const badCsrf = await f.request("/auth/sign-in", post(warm, { csrf: fields(cold[0]).csrf }));
 	// Assert: no shared pending promise or I/O ownership error; GET A/POST B accepts the MAC.
 	assert.deepEqual(
 		cold.map((r) => r.status),
 		Array(10).fill(200),
 	);
-	assert.equal(discoveries, 30);
+	assert.equal(discoveries, cold.length * DISCOVERY_CLIENTS.length);
+	assert.deepEqual(f.discoveryLog(), cold.flatMap(() => DISCOVERY_CLIENTS.map(() => ({ method: "GET", path: "/discovery" }))));
 	assert.equal(started.status, 200, started.body);
 	assert.match(started.body, /https:\/\/accounts\.google\.com\/authorize/);
 	assert.equal(warm.status, 200);
+	assert.equal(management.status, 400);
+	assert.deepEqual(management.headers.getSetCookie(), []);
 	assert.equal(badCsrf.status, 403);
 	assert.equal(f.discoveries(), discoveries);
 	assert.equal(await transactionCount(f), 1);
@@ -267,12 +276,15 @@ test("mounted warm HTTP quota survives new requests and a different D1 reference
 	const other = await f.request("/auth/sign-in", post(otherPage, { client: "::1" }));
 	const mismatch = await f.request("/test-only/different-db");
 	const after = await f.request("/auth/sign-in");
+	const management = await f.request("/auth/link-change/start");
 	// Assert: quota belongs to the composition, not each Hono request app, and mismatch grants nothing.
 	assert.deepEqual(statuses, [...Array(20).fill(200), 429]);
 	assert.equal(other.status, 200);
 	assert.equal(mismatch.status, 503);
 	assert.equal(mismatch.headers.get("cache-control"), "no-store");
 	assert.equal(after.status, 200);
-	assert.equal(f.discoveries(), 3);
+	assert.equal(management.status, 400);
+	assert.equal(f.discoveries(), DISCOVERY_CLIENTS.length);
+	assert.deepEqual(f.discoveryLog(), DISCOVERY_CLIENTS.map(() => ({ method: "GET", path: "/discovery" })));
 	assert.equal(await transactionCount(f), 21);
 });

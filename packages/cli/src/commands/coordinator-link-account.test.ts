@@ -61,7 +61,7 @@ beforeEach(() => {
 	mocks.readCoordinatorAccountLinkStatus.mockImplementation(async (options) => ({
 		kind: "status",
 		status: {
-			version: 2,
+			version: 3,
 			coordinatorId: "coordinator-a",
 			groupId: options.groupId,
 			deviceId: "device-a",
@@ -69,7 +69,8 @@ beforeEach(() => {
 			identityId: options.identityId,
 			state: "unlinked",
 			authority: "device_claim",
-			account: null,
+			profile: { state: "unavailable" },
+			actions: { connect: true, disconnect: false, refresh: false },
 		},
 	}));
 	mocks.linkCoordinatorAccount.mockResolvedValue({
@@ -282,7 +283,7 @@ function arrangeLinkReadiness(mode: string): void {
 	mocks.readCoordinatorAccountLinkStatus.mockResolvedValue({
 		kind: "status",
 		status: {
-			version: 2,
+			version: 3,
 			coordinatorId: "coordinator-a",
 			groupId: "group-a",
 			deviceId: "device-a",
@@ -290,7 +291,8 @@ function arrangeLinkReadiness(mode: string): void {
 			state: mode === "other Identity" ? "unlinked" : mode,
 			identityId: mode === "review_required" ? null : "identity-a",
 			authority: "device_claim",
-			account: null,
+			profile: { state: "unavailable" },
+			actions: { connect: false, disconnect: mode === "linked", refresh: mode === "linked" },
 			...(mode === "review_required" ? { authority: null } : {}),
 			...(mode === "other Identity" ? { identityId: "other-identity" } : {}),
 		},

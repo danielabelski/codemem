@@ -1,0 +1,52 @@
+import { env } from "cloudflare:workers";
+import { expect, it } from "vitest";
+import { D1CoordinatorStore } from "../../core/src/d1-coordinator-store.js";
+import { createCoordinatorBrowserLinkCompletionHandlers } from "../../core/src/coordinator-browser-link-completion.js";
+import { issueBrowserCookie } from "../../core/src/coordinator-browser-credential.js";
+import { importBrowserCsrfKey } from "../../core/src/coordinator-browser-csrf.js";
+import { createInMemoryRequestRateLimiter } from "../../core/src/request-rate-limit.js";
+import { config, input, NOW, seedEnrollmentSql } from "./device-claim-eligibility-fixture.js";
+
+// Real native D1 browser-resolution/HTTP-handler regression. Provider claims are
+// trusted synthetic metadata here, not live Google or HTTP-signature certification.
+it("resolves a finalized nullable device claim through browser GET and bound completion without creating owner or grant evidence",async () => {
+	const db = env.COORDINATOR_DB;
+	await db.batch(seedEnrollmentSql.split(";").map(sql => sql.trim()).filter(Boolean).map(sql => db.prepare(sql)));
+	const store = new D1CoordinatorStore(db,{ authClock:() => NOW });
+	await store.assertAuthSchemaReady();
+	const cfg = { ...config,redirectUri:"https://coordinator.example.test/auth/callback" };
+	const cookie = await issueBrowserCookie("transaction");
+	const start = { ...input,authority:{ kind:"device_claim" as const,identityId:input.identityId },expectedIdentityId:input.identityId,attemptId:"browser-completion",runtimeVerifierHash:"b".repeat(64),browserStartHash:"c".repeat(64),loopbackRedirect:"http://127.0.0.1:4567/codemem/auth/complete" };
+	expect(await store.createAuthLinkAttempt(start,cfg)).toMatchObject({ kind:"created" });
+	const material = { stateHash:"d".repeat(64),binderHash:cookie.cookieHash,nonce:"n".repeat(43),pkceVerifier:"p".repeat(43) };
+	expect(await store.startAuthBrowserTransaction({ ...material,purpose:"link",attemptId:start.attemptId,browserStartHash:start.browserStartHash },cfg)).toMatchObject({ kind:"started" });
+	const consumed = await store.consumeAuthBrowserTransaction(material,cfg);
+	if (consumed.kind !== "consumed") throw new Error("Missing bound browser proof");
+	const proof = { attemptId:start.attemptId,browserTransactionHash:consumed.browserTransactionHash };
+	expect(await store.recordAuthLinkOidcVerified({ ...proof,account:{ issuer:cfg.issuer,subject:"synthetic-device-account" },profile:{ displayName:"Native ownerless link" } },cfg)).toMatchObject({ kind:"applied" });
+	expect(await store.confirmAuthLinkAttempt({ ...proof,completionSecretHash:"e".repeat(64) },cfg)).toMatchObject({ kind:"applied" });
+	expect(await store.finalizeAuthLinkAttempt({ ...input,...input.signer,purpose:"coordinator-account-link-v1",coordinatorId:cfg.coordinatorId,attemptId:start.attemptId,runtimeVerifierHash:start.runtimeVerifierHash,completionSecretHash:"e".repeat(64) },cfg)).toMatchObject({ kind:"applied" });
+	const tables = ["coordinator_auth_link_attempts","coordinator_auth_device_claims","coordinator_auth_account_links","coordinator_auth_link_audit_log","enrolled_devices","coordinator_identity_group_grants","coordinator_device_ownership_bindings"];
+	const snapshot = () => Promise.all(tables.map(async table => (await db.prepare(`SELECT * FROM ${table}`).all()).results));
+	const before = await snapshot();
+	expect(await store.resolveAuthLinkBrowserTransaction({ attemptId:start.attemptId,binderHash:cookie.cookieHash },cfg)).toEqual({ browserTransactionHash:consumed.browserTransactionHash });
+	expect(await store.getAuthLinkAttemptStatus(start.attemptId,{ kind:"browser",browserTransactionHash:consumed.browserTransactionHash },cfg)).toMatchObject({ state:"finalized" });
+	expect(await store.resolveAuthLinkBrowserTransaction({ attemptId:start.attemptId,binderHash:"f".repeat(64) },cfg)).toBeNull();
+	expect(await store.resolveAuthLinkBrowserTransaction({ attemptId:start.attemptId,binderHash:cookie.cookieHash },{ ...cfg,revision:"f".repeat(64) })).toBeNull();
+	const completion = createCoordinatorBrowserLinkCompletionHandlers({ config:cfg,store,csrfKey:await importBrowserCsrfKey(new Uint8Array(32).fill(19)),limiter:createInMemoryRequestRateLimiter() });
+	if (!completion.ok) throw new Error("Missing completion handler");
+	const origin = new URL(cfg.redirectUri).origin;
+	const header = cookie.setCookie.split(";")[0] ?? "";
+	const page = await completion.handlers.page(new Request(`${origin}/auth/link/complete?attempt_id=${start.attemptId}`,{ headers:{ Cookie:header } }));
+	expect(page.response.status).toBe(200);expect(page.response.headers.getSetCookie()).toEqual([]);
+	const csrf = /name="csrf" value="([^"]+)"/.exec(await page.response.text())?.[1];
+	if (!csrf) throw new Error("Missing bound completion form");
+	expect(await snapshot()).toEqual(before);
+	const completed = await completion.handlers.complete(new Request(`${origin}/auth/link/complete`,{ method:"POST",headers:{ Origin:origin,Cookie:header,"Content-Type":"application/x-www-form-urlencoded" },body:new URLSearchParams({ csrf,attempt_id:start.attemptId }) }),"native-browser");
+	expect(completed.outcome).toBe("session_issued");expect(completed.response.status).toBe(303);
+	const status = await store.accountManagement.readAccountManagementStatus(input.signer,cfg,{ identityId:input.identityId });
+	expect(status).toMatchObject({ version:3,state:"linked",identityId:input.identityId,authority:"device_claim",actions:{ connect:false,disconnect:false,refresh:false } });
+	expect((await db.prepare("SELECT identity_id FROM enrolled_devices WHERE device_id = ?").bind(input.signer.deviceId).first())).toEqual({ identity_id:null });
+	for (const table of ["coordinator_auth_controller_attestations","coordinator_device_ownership_bindings","coordinator_owner_enrollment_audit_log"]) expect((await db.prepare(`SELECT * FROM ${table}`).all()).results).toEqual([]);
+	expect((await db.prepare("SELECT * FROM coordinator_identity_group_grants WHERE identity_id = ?").bind(input.identityId).all()).results).toEqual([]);
+});

@@ -13,8 +13,8 @@ import { join } from "node:path";
 import Database from "better-sqlite3";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { readAccountLinkDevice } from "./coordinator-account-link-signer.js";
-import type { CoordinatorAccountLinkStatus } from "./coordinator-account-link-status.js";
 import { readCoordinatorAccountLinkStatus as read } from "./coordinator-account-link-status-client.js";
+import type { CoordinatorAccountLinkStatusV3 } from "./coordinator-account-management-status.js";
 import * as localEvidence from "./coordinator-device-local.js";
 import { verifySignature } from "./sync-auth.js";
 import { fingerprintPublicKey } from "./sync-fingerprint.js";
@@ -76,10 +76,10 @@ afterEach(() => {
 });
 
 function status(
-	overrides: Partial<CoordinatorAccountLinkStatus> = {},
-): CoordinatorAccountLinkStatus {
+	overrides: Partial<CoordinatorAccountLinkStatusV3> = {},
+): CoordinatorAccountLinkStatusV3 {
 	return {
-		version: 2,
+		version: 3,
 		coordinatorId: "coordinator-a",
 		groupId: options?.groupId ?? "group-a",
 		deviceId: "device-a",
@@ -87,9 +87,10 @@ function status(
 		identityId: "identity-a",
 		authority: "controller_attestation",
 		state: "linked",
-		account: {},
+		profile: { state: "verified", verifiedAtMs: 1 },
+		actions: { connect: false, disconnect: false, refresh: false },
 		...overrides,
-	} as CoordinatorAccountLinkStatus;
+	};
 }
 function snapshot() {
 	const files = (base: string): unknown[] =>
@@ -113,8 +114,8 @@ it.each([
 	{ displayName: "Test Person" },
 	{ displayName: "Test Person", pictureUrl: "https://lh3.googleusercontent.com/a/photo" },
 ])("accepts optional trusted profile photo %j", async (account) => {
-	// Arrange: older coordinators may omit the photo field entirely.
-	const dto = status({ account });
+	// Arrange: V3 verified metadata may omit the optional photo.
+	const dto = status({ profile: { state: "verified", verifiedAtMs: 1, ...account } });
 	transport.mockResolvedValue(Response.json(dto));
 	// Act
 	const result = await read(options);
@@ -132,7 +133,9 @@ it.each([
 	{ pictureUrl: "https://lh3.googleusercontent.com/a/photo", subject: "unexpected" },
 ])("rejects unsafe photos and unknown account keys %j", async (account) => {
 	// Arrange: adding an optional field must not relax the strict account contract.
-	transport.mockResolvedValue(Response.json(status({ account })));
+	transport.mockResolvedValue(
+		Response.json({ ...status(), profile: { state: "verified", verifiedAtMs: 1, ...account } }),
+	);
 	// Act
 	const result = await read(options);
 	// Assert
@@ -154,6 +157,7 @@ it.each([
 	["unlinked", "identity-a", null],
 	["revoked", "identity-a", null],
 	["linked", "identity-a", {}],
+	["linked", "identity-a", null],
 	["linked", "identity-a", { email: "person@example.test" }],
 	["linked", "identity-a", { displayName: "Test Person" }],
 ] as const)(
@@ -161,7 +165,16 @@ it.each([
 	async (state, identityId, account) => {
 		// Arrange: a minimal persisted device, not an initialized MemoryStore.
 		const authority = identityId === null ? null : "controller_attestation";
-		const dto = status({ state, identityId, authority, account });
+		const dto = status({
+			state,
+			identityId,
+			authority,
+			profile:
+				account === null
+					? { state: "unavailable" }
+					: { state: "verified", verifiedAtMs: 1, ...account },
+			actions: { connect: state === "unlinked", disconnect: false, refresh: false },
+		});
 		transport.mockResolvedValue(Response.json(dto));
 		const before = snapshot();
 		const readers: Database.Database[] = [];
@@ -188,8 +201,17 @@ it.each(["device_claim", "controller_attestation"] as const)(
 	"accepts %s eligibility and a different linked Identity only with masked metadata",
 	async (authority) => {
 		// Arrange: eligibility belongs to the requested Identity; a prior link need not.
-		const eligible = status({ state: "unlinked", authority, account: null });
-		const linked = status({ identityId: "other-identity", authority, account: null });
+		const eligible = status({
+			state: "unlinked",
+			authority,
+			profile: { state: "unavailable" },
+			actions: { connect: true, disconnect: false, refresh: false },
+		});
+		const linked = status({
+			identityId: "other-identity",
+			authority,
+			profile: { state: "unavailable" },
+		});
 		transport
 			.mockResolvedValueOnce(Response.json(eligible))
 			.mockResolvedValueOnce(Response.json(linked));
@@ -452,10 +474,27 @@ it("reports the fixed schema-upgrade refusal without reading an upstream error b
 
 const invalid = [
 	{ version: 1 },
+	{ version: 2 },
+	{ profile: undefined },
+	{ actions: undefined },
+	{ profile: { state: "verified", verifiedAtMs: -1 } },
+	{ profile: { state: "verified", verifiedAtMs: 1.5 } },
+	{ profile: { state: "unavailable", email: "private response marker" } },
+	{ actions: { connect: true, disconnect: false, refresh: false } },
+	{ actions: { connect: false, disconnect: false } },
+	{ actions: { connect: false, disconnect: false, refresh: false, admin: true } },
 	{ authority: undefined },
 	{ authority: "admin" },
-	{ state: "unlinked", identityId: "other-identity", account: null },
-	{ identityId: "other-identity", account: { email: "private response marker" } },
+	{
+		state: "unlinked",
+		identityId: "other-identity",
+		profile: { state: "unavailable" },
+		actions: { connect: true, disconnect: false, refresh: false },
+	},
+	{
+		identityId: "other-identity",
+		profile: { state: "verified", verifiedAtMs: 1, email: "private response marker" },
+	},
 	{ coordinatorId: "" },
 	{ coordinatorId: "bad\ncoordinator" },
 	{ deviceId: "other-device" },
@@ -464,11 +503,11 @@ const invalid = [
 	{ identityId: "" },
 	{ identityId: 42 },
 	{ state: "unknown" },
-	{ state: "review_required", identityId: "identity-a", account: null },
-	{ state: "conflict", identityId: null, account: {} },
-	{ state: "unlinked", identityId: null, account: null },
-	{ state: "revoked", account: {} },
-	{ state: "review_required", identityId: null, account: null },
+	{ state: "review_required", identityId: "identity-a", profile: { state: "unavailable" } },
+	{ state: "conflict", identityId: null, profile: { state: "verified", verifiedAtMs: 1 } },
+	{ state: "unlinked", identityId: null, profile: { state: "unavailable" } },
+	{ state: "revoked", profile: { state: "verified", verifiedAtMs: 1 } },
+	{ state: "review_required", identityId: null, profile: { state: "unavailable" } },
 	{ privateKey: "private response marker" },
 	{ subject: "private response marker" },
 	...[
@@ -483,7 +522,12 @@ const invalid = [
 		{ displayName: "a".repeat(257) },
 		{ email: "" },
 		{ displayName: "   " },
-	].map((account) => ({ account })),
+	].map((profile) => ({
+		profile:
+			typeof profile === "object" && !Array.isArray(profile)
+				? { state: "verified", verifiedAtMs: 1, ...profile }
+				: profile,
+	})),
 ];
 it.each(invalid)("rejects malformed/private response patch %j", async (patch) => {
 	// Arrange
@@ -493,6 +537,22 @@ it.each(invalid)("rejects malformed/private response patch %j", async (patch) =>
 	// Assert: tuple mismatches cannot expose another device's account.
 	expect(result).toMatchObject({ kind: "unavailable", code: "invalid_response" });
 	expect(JSON.stringify(result)).not.toMatch(/private response marker|identity-a|other-device/);
+});
+
+it("rejects a legacy V2 account reply without retrying or exposing its profile", async () => {
+	// Arrange: a genuine old shape has account and lacks both V3 required fields.
+	const { profile: _profile, actions: _actions, ...pins } = status();
+	transport.mockResolvedValue(
+		Response.json({ ...pins, version: 2, account: { email: "private response marker" } }),
+	);
+	const before = snapshot();
+	// Act
+	const result = await read(options);
+	// Assert: reject incompatibility; never retry with a V2 fallback or mutate local state.
+	expect(result).toEqual({ kind: "unavailable", code: "invalid_response" });
+	expect(transport).toHaveBeenCalledTimes(1);
+	expect(JSON.stringify(result)).not.toContain("private response marker");
+	expect(snapshot()).toEqual(before);
 });
 
 it.each(["null", "[]", "{}", '{"version":', "not JSON"])(
@@ -528,7 +588,14 @@ it("refuses more than 16 KiB while streaming and cancels its reader", async () =
 });
 it("accepts fragmented UTF-8 and maximum-length public account labels", async () => {
 	// Arrange: split inside a multi-byte character, not just at JSON boundaries.
-	const dto = status({ account: { email: "a".repeat(320), displayName: `é${"a".repeat(255)}` } });
+	const dto = status({
+		profile: {
+			state: "verified",
+			verifiedAtMs: 1,
+			email: "a".repeat(320),
+			displayName: `é${"a".repeat(255)}`,
+		},
+	});
 	const bytes = new TextEncoder().encode(JSON.stringify(dto));
 	const split = bytes.indexOf(0xc3) + 1;
 	transport.mockResolvedValue(
@@ -549,7 +616,9 @@ it("accepts fragmented UTF-8 and maximum-length public account labels", async ()
 });
 it("rejects invalid UTF-8 even inside otherwise valid public JSON", async () => {
 	// Arrange: a non-fatal decoder would silently replace this byte and accept it.
-	const bytes = Buffer.from(JSON.stringify(status({ account: { displayName: "x" } })));
+	const bytes = Buffer.from(
+		JSON.stringify(status({ profile: { state: "verified", verifiedAtMs: 1, displayName: "x" } })),
+	);
 	bytes[bytes.indexOf('"x"') + 1] = 0xff;
 	transport.mockResolvedValue(new Response(bytes));
 	// Act

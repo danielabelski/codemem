@@ -1,5 +1,9 @@
 import { generateKeyPairSync, sign } from "node:crypto";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import type {
+	CoordinatorAccountLinkStatusV3,
+	CoordinatorAccountProfileV3,
+} from "./coordinator-account-management-status.js";
 import { type CreateCoordinatorAppOptions, createCoordinatorApp } from "./coordinator-api.js";
 import { materials } from "./coordinator-auth-browser-transaction-test-fixtures.js";
 import { setupHistoricalStore } from "./coordinator-auth-historical-store-test-fixture.js";
@@ -222,14 +226,18 @@ async function publishProfile(f: Fixture) {
 		),
 	).toEqual({ kind: "recorded" });
 }
+type DisplayFields = Omit<
+	Extract<CoordinatorAccountProfileV3, { state: "verified" }>,
+	"state" | "verifiedAtMs"
+>;
 function dto(
 	f: Fixture,
-	state: string,
+	state: CoordinatorAccountLinkStatusV3["state"],
 	identityId: string | null = "identity-a",
-	account: unknown = null,
-) {
+	account: DisplayFields | null = null,
+): CoordinatorAccountLinkStatusV3 {
 	return {
-		version: 2,
+		version: 3,
 		coordinatorId: config.coordinatorId,
 		groupId: "group-a",
 		deviceId: f.key.deviceId,
@@ -237,7 +245,11 @@ function dto(
 		identityId,
 		state,
 		authority: identityId === null ? null : "controller_attestation",
-		account,
+		profile:
+			account === null
+				? { state: "unavailable" }
+				: { state: "verified", verifiedAtMs: NOW, ...account },
+		actions: { connect: state === "unlinked", disconnect: false, refresh: false },
 	};
 }
 function privateFields(text: string) {
@@ -261,7 +273,7 @@ function privateFields(text: string) {
 		expect(text).not.toContain(value);
 }
 
-it.each(["linked", "unlinked", "revoked", "no-profile", "conflict", "unverified-email"])(
+it.each(["linked", "unlinked", "revoked", "no-profile", "conflict", "unverified-email"] as const)(
 	"returns current %s status without mutating stored authority",
 	async (state) => {
 		// Arrange
@@ -281,12 +293,13 @@ it.each(["linked", "unlinked", "revoked", "no-profile", "conflict", "unverified-
 		const text = await response.text();
 		// Assert: exact keys prevent any stored provider identifiers/proofs escaping.
 		expect(response.status).toBe(200);
-		let account: unknown = null;
-		let expectedState = state;
+		let account: DisplayFields | null = null;
+		let expectedState: CoordinatorAccountLinkStatusV3["state"] = "linked";
+		if (state !== "no-profile" && state !== "unverified-email") expectedState = state;
 		if (state === "linked")
 			account = { email: "synthetic@example.test", displayName: "Synthetic Person" };
 		if (state === "no-profile") {
-			account = {};
+			account = null;
 			expectedState = "linked";
 		}
 		if (state === "unverified-email") {
@@ -384,7 +397,7 @@ for (const backend of ["SQLite", "D1"] as const) {
 			const text = await response.text();
 			// Assert: metadata is visible only for the running profile's matching Identity.
 			expect(response.status).toBe(200);
-			let expectedState = "linked";
+			let expectedState: CoordinatorAccountLinkStatusV3["state"] = "linked";
 			if (variant === "disagrees") expectedState = "conflict";
 			if (variant === "revoked") expectedState = "revoked";
 			expect(JSON.parse(text)).toEqual({
@@ -421,41 +434,49 @@ for (const backend of ["SQLite", "D1"] as const) {
 		});
 		expect(text).not.toMatch(/synthetic@example.test|Synthetic Person|identity-a/);
 	});
-	it.each(["linked", "unlinked", "revoked", "conflict", "unverified-email", "review_required"])(
-		`${backend} store projects %s without changing any stored fields`,
-		async (state) => {
-			// Arrange: conflict uses explicit history; ordinary D1 cases use the fresh Worker snapshot.
-			const f = await setup(backend, ORIGIN, identity(), {
-				history: state === "conflict" ? "issuer-conflict" : undefined,
-			});
-			if (state === "unlinked" || state === "conflict") await authorize(f);
-			else await seedLink(f);
-			if (state === "revoked")
-				f.db.prepare("UPDATE coordinator_auth_account_links SET revoked_at_ms = ?").run(NOW);
-			if (state === "unverified-email")
-				f.db.prepare("UPDATE coordinator_auth_account_profiles SET email_verified = 0").run();
-			if (state === "review_required")
-				await f.store.revokeAuthControllerAttestation(config.coordinatorId, review().attestationId);
-			const before = snapshot(f);
-			const nonces = f.db.prepare("SELECT * FROM request_nonces").all();
-			let account: unknown = null;
-			if (state === "linked")
-				account = { email: "synthetic@example.test", displayName: "Synthetic Person" };
-			if (state === "unverified-email") account = { displayName: "Synthetic Person" };
-			const identityId = ["conflict", "review_required"].includes(state) ? null : "identity-a";
-			// Act
-			const result = await f.store.readAccountLinkStatus({ groupId: "group-a", ...f.key }, config, {
+	it.each([
+		"linked",
+		"unlinked",
+		"revoked",
+		"conflict",
+		"unverified-email",
+		"review_required",
+	] as const)(`${backend} store projects %s without changing any stored fields`, async (state) => {
+		// Arrange: conflict uses explicit history; ordinary D1 cases use the fresh Worker snapshot.
+		const f = await setup(backend, ORIGIN, identity(), {
+			history: state === "conflict" ? "issuer-conflict" : undefined,
+		});
+		if (state === "unlinked" || state === "conflict") await authorize(f);
+		else await seedLink(f);
+		if (state === "revoked")
+			f.db.prepare("UPDATE coordinator_auth_account_links SET revoked_at_ms = ?").run(NOW);
+		if (state === "unverified-email")
+			f.db.prepare("UPDATE coordinator_auth_account_profiles SET email_verified = 0").run();
+		if (state === "review_required")
+			await f.store.revokeAuthControllerAttestation(config.coordinatorId, review().attestationId);
+		const before = snapshot(f);
+		const nonces = f.db.prepare("SELECT * FROM request_nonces").all();
+		let account: DisplayFields | null = null;
+		if (state === "linked")
+			account = { email: "synthetic@example.test", displayName: "Synthetic Person" };
+		if (state === "unverified-email") account = { displayName: "Synthetic Person" };
+		const identityId = ["conflict", "review_required"].includes(state) ? null : "identity-a";
+		// Act
+		const result = await f.store.accountManagement.readAccountManagementStatus(
+			{ groupId: "group-a", ...f.key },
+			config,
+			{
 				identityId: "identity-a",
-			});
-			// Assert
-			expect(result).toEqual(
-				dto(f, state === "unverified-email" ? "linked" : state, identityId, account),
-			);
-			privateFields(JSON.stringify(result));
-			expect(snapshot(f)).toEqual(before);
-			expect(f.db.prepare("SELECT * FROM request_nonces").all()).toEqual(nonces);
-		},
-	);
+			},
+		);
+		// Assert
+		expect(result).toEqual(
+			dto(f, state === "unverified-email" ? "linked" : state, identityId, account),
+		);
+		privateFields(JSON.stringify(result));
+		expect(snapshot(f)).toEqual(before);
+		expect(f.db.prepare("SELECT * FROM request_nonces").all()).toEqual(nonces);
+	});
 	it.each([
 		"controller-revoked",
 		"device-revoked",
@@ -498,9 +519,13 @@ for (const backend of ["SQLite", "D1"] as const) {
 			return row;
 		});
 		// Act: no HTTP snapshot helper, because the injected write is intentional.
-		const result = await f.store.readAccountLinkStatus({ groupId: "group-a", ...f.key }, config, {
-			identityId: "identity-a",
-		});
+		const result = await f.store.accountManagement.readAccountManagementStatus(
+			{ groupId: "group-a", ...f.key },
+			config,
+			{
+				identityId: "identity-a",
+			},
+		);
 		// Assert: link revocation keeps the derived identity; lost controller authority does not.
 		expect(result).toEqual(
 			dto(
@@ -536,16 +561,20 @@ it.each(["throws", "missing"])("returns a private 503 when the status reader %s"
 	const f = await setup();
 	await seedLink(f);
 	if (mode === "missing")
-		Object.defineProperty(f.store, "readAccountLinkStatus", { value: undefined });
+		Object.defineProperty(f.store.accountManagement, "readAccountManagementStatus", {
+			value: undefined,
+		});
 	else
-		vi.spyOn(f.store, "readAccountLinkStatus").mockRejectedValue(
+		vi.spyOn(f.store.accountManagement, "readAccountManagementStatus").mockRejectedValue(
 			new Error("opaque-subject-a private-session"),
 		);
 	// Act
 	const response = await get(f);
 	// Assert
 	expect(response.status).toBe(503);
-	privateFields(await response.text());
+	const text = await response.text();
+	expect(JSON.parse(text)).toEqual({ error: "auth_link_unavailable" });
+	privateFields(text);
 });
 
 it.each([
@@ -700,7 +729,7 @@ it("rejects cross-coordinator replay before metadata or nonce use and rejects or
 	const b = await setup("SQLite", "https://coordinator-b.example.test", a.key);
 	await seedLink(a);
 	await seedLink(b);
-	const metadata = vi.spyOn(b.store, "readAccountLinkStatus");
+	const metadata = vi.spyOn(b.store.accountManagement, "readAccountManagementStatus");
 	const verifier = vi.fn(b.options.requestVerifier);
 	b.app = createCoordinatorApp({ ...b.options, requestVerifier: verifier });
 	const pathA = statusPath("group-a", a.origin);

@@ -221,8 +221,9 @@ it("preserves missing-binding errors, pins native D1, and caches completed setup
 	const missing = await f.worker.fetch(new Request(`${ORIGIN}/auth/sign-in`), {});
 	const missingDiscoveryCalls = f.oidc.fetch.mock.calls.length;
 	const cold = await f.request("/auth/sign-in");
-	const discoveries = f.oidc.fetch.mock.calls.length;
+	const discoveries = f.oidc.fetch.mock.calls.map(([url]) => url);
 	const warm = await f.request("/auth/sign-in");
+	const management = await f.request("/auth/link-change/start");
 	const otherDb = {
 		prepare: vi.fn(() => {
 			throw new Error("different-binding-private");
@@ -239,6 +240,7 @@ it("preserves missing-binding errors, pins native D1, and caches completed setup
 		browserAuth: { config: f.config, csrfKey: f.csrfKey, oidcOptions: { fetch: failureFetch } },
 	});
 	const unavailable = await failure.fetch(new Request(`${ORIGIN}/auth/sign-in`), env);
+	const failedSetupCalls = failureFetch.mock.calls.length;
 	const legacy = await failure.fetch(new Request(`${ORIGIN}/v1/admin/groups`), env);
 	// Assert
 	expect(missing.status).toBe(500);
@@ -248,12 +250,29 @@ it("preserves missing-binding errors, pins native D1, and caches completed setup
 	expect([cold.status, warm.status, mismatch.status, unavailable.status, legacy.status]).toEqual([
 		200, 200, 503, 503, 401,
 	]);
-	expect(discoveries).toBe(3);
-	expect(f.oidc.fetch.mock.calls).toHaveLength(discoveries);
+	// Composition owns four SDK clients in order: signin, link start, the separate
+	// link-change start adapter, and callback. Account rendering performs no discovery.
+	const clients = ["signin", "link-start", "link-change-start", "callback"];
+	expect(discoveries).toEqual(clients.map(() => `${f.config.issuer}/.well-known/openid-configuration`));
+	expect(management.status).toBe(400);
+	expect(management.headers.getSetCookie()).toEqual([]);
+	expect(f.oidc.fetch.mock.calls.map(([url]) => url)).toEqual(discoveries);
+	expect(failureFetch).toHaveBeenCalledTimes(failedSetupCalls);
 	expect(otherDb.prepare).not.toHaveBeenCalled();
 	expect(await unavailable.text()).not.toContain("private-sdk-secret");
 	expect(unavailable.headers.get("cache-control")).toBe("no-store");
 	expect(unavailable.headers.get("referrer-policy")).toBe("no-referrer");
+	// Act: a separate Worker owns a separate completed setup; its warm routes reuse it.
+	const peer = createCloudflareCoordinatorWorker({
+		now: () => new Date(NOW).toISOString(),
+		browserAuth: { config: f.config, csrfKey: f.csrfKey, oidcOptions: { fetch: f.oidc.fetch } },
+	});
+	expect((await peer.fetch(new Request(`${ORIGIN}/auth/sign-in`), env)).status).toBe(200);
+	const peerDiscoveries = f.oidc.fetch.mock.calls.slice(discoveries.length).map(([url]) => url);
+	expect((await peer.fetch(new Request(`${ORIGIN}/auth/link-change/start`), env)).status).toBe(400);
+	// Assert: no global cross-instance setup cache and no rediscovery on either warm instance.
+	expect(peerDiscoveries).toEqual(discoveries);
+	expect(f.oidc.fetch.mock.calls.map(([url]) => url)).toEqual([...discoveries, ...peerDiscoveries]);
 });
 
 it("attaches scheduled retirement to waitUntil; defaults and missing/mismatched bindings do nothing", async () => {

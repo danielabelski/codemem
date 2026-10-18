@@ -4,6 +4,7 @@ import {
 	config,
 	input,
 	NOW,
+	otherKey,
 	seedAttestationSql,
 	seedEnrollmentSql,
 	seedKeyRevocationSql,
@@ -19,6 +20,7 @@ import { AuthLinkChangeBrowserOperations } from "./coordinator-auth-link-change-
 import {
 	AUTH_LINK_CHANGE_PURPOSE,
 	type CoordinatorAuthLinkChangeIntent,
+	type CoordinatorAuthLinkChangeStore,
 } from "./coordinator-auth-link-change-contract.js";
 import { createCoordinatorAccountManagementStore } from "./coordinator-auth-link-change-store.js";
 import { cleanAuthLinkProfiles } from "./coordinator-auth-link-profile.js";
@@ -29,12 +31,17 @@ import {
 import { AuthSessionOperations } from "./coordinator-auth-session.js";
 import { setupStore } from "./coordinator-auth-store-test-fixtures.js";
 import { createCoordinatorBrowserAuthCallback } from "./coordinator-browser-auth-callback.js";
-import { BROWSER_COOKIE_NAMES, issueBrowserCookie } from "./coordinator-browser-credential.js";
+import {
+	BROWSER_COOKIE_NAMES,
+	issueBrowserCookie,
+	readBrowserCookie,
+} from "./coordinator-browser-credential.js";
 import { importBrowserCsrfKey } from "./coordinator-browser-csrf.js";
 import { createCoordinatorBrowserLinkChange } from "./coordinator-browser-link-change.js";
 import { createCoordinatorOidcClient } from "./coordinator-oidc.js";
 import { oidcFixture, PROVIDER } from "./coordinator-oidc-test-fixtures.js";
 import { createInMemoryRequestRateLimiter } from "./request-rate-limit.js";
+import { fingerprintPublicKey } from "./sync-fingerprint.js";
 
 const cfg = { ...config, issuer: "https://accounts.google.com", redirectUri: PROVIDER.redirectUri };
 const cleanup: (() => void)[] = [];
@@ -43,7 +50,12 @@ afterEach(() => {
 	for (const close of cleanup.splice(0)) close();
 });
 async function setup(
-	options: { authority?: "controller_attestation" | "device_claim"; profile?: unknown } = {},
+	options: {
+		authority?: "controller_attestation" | "device_claim";
+		profile?: unknown;
+		initialLink?: boolean;
+		enrollmentIdentity?: string | null;
+	} = {},
 ) {
 	let now = NOW + 10;
 	const f = setupStore("SQLite", { authClock: () => now });
@@ -54,7 +66,10 @@ async function setup(
 	if (options.authority !== "device_claim") f.db.exec(seedAttestationSql);
 	f.db
 		.prepare("UPDATE enrolled_devices SET identity_id = ? WHERE device_id = ?")
-		.run(input.identityId, input.signer.deviceId);
+		.run(
+			options.enrollmentIdentity === undefined ? input.identityId : options.enrollmentIdentity,
+			input.signer.deviceId,
+		);
 	await f.store.assertAuthSchemaReady();
 	let beforeBatch: (() => void) | null = null;
 	const errors: unknown[] = [];
@@ -80,12 +95,13 @@ async function setup(
 	const browser = new AuthLinkChangeBrowserOperations(backend, () => now);
 	const links = new AuthLinkOperations(backend, () => now);
 	const transactions = new CoordinatorAuthBrowserTransactions(backend, () => now);
-	await seedCurrentLink(
-		links,
-		transactions,
-		options.authority ?? "controller_attestation",
-		options.profile,
-	);
+	if (options.initialLink !== false)
+		await seedCurrentLink(
+			links,
+			transactions,
+			options.authority ?? "controller_attestation",
+			options.profile,
+		);
 	const status = new AccountManagementStatusOperations(backend, () => now);
 	const management = createCoordinatorAccountManagementStore(backend, () => now);
 	const sessions = new AuthSessionOperations(backend, () => now);
@@ -434,11 +450,197 @@ it("projects server-derived V3 management capabilities and a verified empty prof
 	).toMatchObject({ state: "linked", profile: { state: "verified", verifiedAtMs: NOW + 10 } });
 });
 
+it("recognizes a nullable enrollment's own immutable device claim independently of management eligibility and the expected Identity pin", async () => {
+	const f = await setup({
+		authority: "device_claim",
+		enrollmentIdentity: null,
+		profile: { displayName: "Claimed profile", email: "claimed@example.test", emailVerified: true },
+	});
+	expect(
+		await f.status.readAccountManagementStatus(input.signer, cfg, { identityId: input.identityId }),
+	).toMatchObject({
+		state: "linked",
+		identityId: input.identityId,
+		authority: "device_claim",
+		profile: { state: "verified", displayName: "Claimed profile", email: "claimed@example.test" },
+		actions: { connect: false, disconnect: false, refresh: false },
+	});
+	expect(
+		await f.status.readAccountManagementStatus(input.signer, cfg, { identityId: "other-identity" }),
+	).toMatchObject({
+		state: "linked",
+		identityId: input.identityId,
+		authority: "device_claim",
+		profile: { state: "unavailable" },
+		actions: { connect: false, disconnect: false, refresh: false },
+	});
+	for (const intent of ["disconnect", "refresh"] as const)
+		expect(await f.changes.createAuthLinkChangeAttempt(create(intent), cfg)).toMatchObject({
+			kind: "rejected",
+		});
+	f.db.prepare("UPDATE coordinator_auth_account_links SET revoked_at_ms = ?").run(NOW + 10);
+	expect(
+		await f.status.readAccountManagementStatus(input.signer, cfg, { identityId: input.identityId }),
+	).toMatchObject({
+		state: "revoked",
+		identityId: input.identityId,
+		authority: "device_claim",
+		profile: { state: "unavailable" },
+		actions: { connect: false, disconnect: false, refresh: false },
+	});
+});
+
+it("redacts the recognized original claim when the current enrollment contradicts its immutable Identity", async () => {
+	const f = await setup({
+		authority: "device_claim",
+		profile: { displayName: "Private claimed profile" },
+	});
+	f.db
+		.prepare("UPDATE enrolled_devices SET identity_id = 'changed-identity' WHERE device_id = ?")
+		.run(input.signer.deviceId);
+	expect(
+		await f.status.readAccountManagementStatus(input.signer, cfg, { identityId: input.identityId }),
+	).toMatchObject({
+		state: "conflict",
+		identityId: null,
+		authority: null,
+		profile: { state: "unavailable" },
+		actions: { connect: false, disconnect: false, refresh: false },
+	});
+});
+
+it("does not turn another attested reader's recognition into permission to connect over an existing device-claim history", async () => {
+	const f = await setup({
+		authority: "device_claim",
+		profile: { displayName: "Original claimant" },
+	});
+	const signer = {
+		...input.signer,
+		deviceId: "another-reader",
+		publicKey: otherKey,
+		fingerprint: fingerprintPublicKey(otherKey),
+	};
+	await f.store.enrollDevice(signer.groupId, { ...signer, identityId: input.identityId });
+	expect(
+		await f.store.createAuthControllerAttestation({
+			...signer,
+			coordinatorId: cfg.coordinatorId,
+			identityId: input.identityId,
+			attestationId: "reader-attestation",
+			reviewReceiptId: "reader-review",
+			evidenceDigest: "e".repeat(64),
+		}),
+	).toMatchObject({ kind: "created" });
+	const status = await f.status.readAccountManagementStatus(signer, cfg, {
+		identityId: input.identityId,
+	});
+	expect(status.state).toBe("review_required");
+	expect(status.profile).toEqual({ state: "unavailable" });
+	expect(status.actions).toEqual({ connect: false, disconnect: false, refresh: false });
+});
+
+it("permits reviewed attested first connect and profile reads with a null legacy enrollment, without management authority", async () => {
+	const f = await setup({ initialLink: false, enrollmentIdentity: null });
+	expect(
+		await f.status.readAccountManagementStatus(input.signer, cfg, { identityId: input.identityId }),
+	).toMatchObject({
+		state: "unlinked",
+		authority: "controller_attestation",
+		actions: { connect: true, disconnect: false, refresh: false },
+	});
+	await seedCurrentLink(f.links, f.transactions, "controller_attestation", {
+		displayName: "Reviewed profile",
+	});
+	expect(
+		await f.status.readAccountManagementStatus(input.signer, cfg, { identityId: input.identityId }),
+	).toMatchObject({
+		state: "linked",
+		profile: { state: "verified", displayName: "Reviewed profile" },
+		actions: { connect: false, disconnect: false, refresh: false },
+	});
+	for (const intent of ["disconnect", "refresh"] as const)
+		expect(await f.changes.createAuthLinkChangeAttempt(create(intent), cfg)).toMatchObject({
+			kind: "rejected",
+		});
+	f.db
+		.prepare("UPDATE enrolled_devices SET identity_id = ? WHERE device_id = ?")
+		.run(input.identityId, input.signer.deviceId);
+	await confirm(f, "disconnect");
+	expect(await f.changes.finalizeAuthLinkChangeAttempt(final, cfg)).toMatchObject({
+		kind: "applied",
+	});
+	f.db
+		.prepare("UPDATE enrolled_devices SET identity_id = NULL WHERE device_id = ?")
+		.run(input.signer.deviceId);
+	expect(
+		await f.status.readAccountManagementStatus(input.signer, cfg, { identityId: input.identityId }),
+	).toMatchObject({
+		state: "disconnected",
+		actions: { connect: false, disconnect: false, refresh: false },
+	});
+	expect(
+		await f.links.createAuthLinkAttempt(
+			{
+				...input,
+				authority: { kind: "controller_attestation" },
+				expectedIdentityId: input.identityId,
+				attemptId: "no-null-reconnect",
+				runtimeVerifierHash: "1".repeat(64),
+				browserStartHash: "2".repeat(64),
+				loopbackRedirect: create().loopbackRedirect,
+			},
+			cfg,
+		),
+	).toMatchObject({ kind: "rejected" });
+});
+
+it.each([
+	"identity",
+	"group",
+	"key",
+	"fingerprint",
+	"disabled",
+	"attestation",
+	"device-revoked",
+	"key-revoked",
+] as const)(
+	"attested status still denies a null-enrollment first connect after %s contradicts its current source",
+	async (contradiction) => {
+		const f = await setup({ initialLink: false, enrollmentIdentity: null });
+		const mutations: Partial<Record<typeof contradiction, string>> = {
+			identity:
+				"UPDATE enrolled_devices SET identity_id = 'other-identity' WHERE device_id = 'device-a'",
+			group: "UPDATE groups SET archived_at = 'archived' WHERE group_id = 'group-a'",
+			fingerprint:
+				"UPDATE enrolled_devices SET fingerprint = '" +
+				"b".repeat(64) +
+				"' WHERE device_id = 'device-a'",
+			disabled: "UPDATE enrolled_devices SET enabled = 0 WHERE device_id = 'device-a'",
+			attestation:
+				"UPDATE coordinator_auth_controller_attestations SET revoked_at = 'revoked' WHERE attestation_id = 'attestation-a'",
+			"key-revoked": seedKeyRevocationSql,
+		};
+		if (contradiction === "key")
+			f.db
+				.prepare("UPDATE enrolled_devices SET public_key = ? WHERE device_id = ?")
+				.run(otherKey, input.signer.deviceId);
+		else if (contradiction === "device-revoked") await f.store.createDeviceRevocation(input.signer);
+		else f.db.exec(mutations[contradiction] ?? "");
+		const status = await f.status.readAccountManagementStatus(input.signer, cfg, {
+			identityId: input.identityId,
+		});
+		expect(status.actions).toEqual({ connect: false, disconnect: false, refresh: false });
+		expect(status.profile).toEqual({ state: "unavailable" });
+	},
+);
+
 async function reconnect(
 	f: Awaited<ReturnType<typeof setup>>,
 	attemptId = "reconnect-a",
 	subject = "account-b",
+	options: { signer?: typeof input.signer } = {},
 ) {
+	const signer = options.signer ?? input.signer;
 	const hash = (purpose: string) =>
 		createHash("sha256").update(`${attemptId}:${purpose}`).digest("hex");
 	const prior = f.db
@@ -456,7 +658,7 @@ async function reconnect(
 				authority,
 				expectedIdentityId: input.identityId,
 				attemptId,
-				signer: input.signer,
+				signer,
 				runtimeVerifierHash: hash("runtime"),
 				browserStartHash: hash("start"),
 				loopbackRedirect: create().loopbackRedirect,
@@ -506,12 +708,49 @@ async function reconnect(
 	).toMatchObject({ kind: "applied" });
 	return {
 		...final,
+		signer,
+		groupId: signer.groupId,
+		deviceId: signer.deviceId,
+		fingerprint: signer.fingerprint,
 		purpose: "coordinator-account-link-v1" as const,
 		attemptId,
 		runtimeVerifierHash: hash("runtime"),
 		completionSecretHash: hash("completion"),
 	};
 }
+it("reads a continued original claim in the new generation's proven group without requiring its historical group to stay live", async () => {
+	const f = await setup({ authority: "device_claim" });
+	await confirm(f, "disconnect");
+	expect(await f.changes.finalizeAuthLinkChangeAttempt(final, cfg)).toMatchObject({
+		kind: "applied",
+	});
+	await f.store.createGroup("group-b");
+	await f.store.enrollDevice("group-b", { ...input.signer, identityId: input.identityId });
+	f.db
+		.prepare("UPDATE groups SET archived_at = 'archived' WHERE group_id = ?")
+		.run(input.signer.groupId);
+	const signer = { ...input.signer, groupId: "group-b" };
+	const next = await reconnect(f, "group-b-continuation", "account-b", { signer });
+	expect(await f.links.finalizeAuthLinkAttempt(next, cfg)).toMatchObject({ kind: "applied" });
+	expect(
+		await f.status.readAccountManagementStatus(signer, cfg, { identityId: input.identityId }),
+	).toMatchObject({
+		state: "linked",
+		identityId: input.identityId,
+		profile: { state: "verified", displayName: "Account B" },
+	});
+	expect(
+		await f.status.readAccountManagementStatus(signer, cfg, { identityId: "other-identity" }),
+	).toMatchObject({
+		state: "linked",
+		identityId: input.identityId,
+		profile: { state: "unavailable" },
+		actions: { connect: false, disconnect: false, refresh: false },
+	});
+	expect(f.db.prepare("SELECT group_id FROM coordinator_auth_device_claims").get()).toEqual({
+		group_id: input.signer.groupId,
+	});
+});
 it("disconnects A then commits a separate fresh B generation and retains A's association", async () => {
 	const f = await setup();
 	await confirm(f, "disconnect");
@@ -778,7 +1017,10 @@ function browserPost(path: string, cookie: string, body: Record<string, string>)
 		body: new URLSearchParams(body),
 	});
 }
-async function browserSetup(intent: CoordinatorAuthLinkChangeIntent) {
+async function browserSetup(
+	intent: CoordinatorAuthLinkChangeIntent,
+	options: { fail?: CoordinatorAuthLinkChangeStore["failAuthLinkChangeAttempt"] } = {},
+) {
 	vi.spyOn(Date, "now").mockReturnValue(NOW + 10);
 	const f = await setup();
 	const oidc = oidcFixture({ issuer: cfg.issuer });
@@ -795,6 +1037,7 @@ async function browserSetup(intent: CoordinatorAuthLinkChangeIntent) {
 		oidcOptions: { fetch: oidc.fetch },
 		store: {
 			...f.management,
+			failAuthLinkChangeAttempt: options.fail ?? f.management.failAuthLinkChangeAttempt,
 			readAuthBrowserTransactionActivity: f.transactions.readAuthBrowserTransactionActivity.bind(
 				f.transactions,
 			),
@@ -917,13 +1160,208 @@ it("does not disclose the target or publish profile data when fresh proof is for
 	const html = await callback.response.text();
 	expect(html).not.toContain("private-subject");
 	expect(html).not.toContain("wrong-account");
-	expect(f.db.prepare("SELECT state FROM coordinator_auth_link_change_attempts").get()).toEqual({
-		state: "browser_claimed",
-	});
+	expect(
+		f.db.prepare("SELECT state,failure_reason FROM coordinator_auth_link_change_attempts").get(),
+	).toEqual({ state: "failed", failure_reason: "provider_failure" });
 	expect(f.db.prepare("SELECT * FROM coordinator_auth_link_profiles").all()).toEqual([]);
 	expect(f.db.prepare("SELECT ended_at_ms FROM coordinator_auth_account_links").get()).toEqual({
 		ended_at_ms: null,
 	});
+});
+
+async function retryChangeWithOldCookie(
+	f: Awaited<ReturnType<typeof browserSetup>>,
+	intent: CoordinatorAuthLinkChangeIntent,
+) {
+	const id = "retry-change";
+	const startCode = randomBytes(32);
+	expect(
+		await f.changes.createAuthLinkChangeAttempt(
+			{
+				...create(intent),
+				attemptId: id,
+				runtimeVerifierHash: "5".repeat(64),
+				browserStartHash: await hashCoordinatorAuthProofBytes32(startCode),
+			},
+			cfg,
+		),
+	).toMatchObject({ kind: "created" });
+	const url = new URL("/auth/link-change/start", cfg.redirectUri);
+	url.searchParams.set("attempt_id", id);
+	url.searchParams.set("start_code", encodeCoordinatorAuthProof32(startCode));
+	const page = (
+		await f.handlers.startPage(new Request(url, { headers: { Cookie: f.transactionCookie } }))
+	).response;
+	expect(page.status).toBe(200);
+	expect(
+		page.headers
+			.getSetCookie()
+			.some((cookie) => cookie.startsWith(`${BROWSER_COOKIE_NAMES.transaction}=`)),
+	).toBe(false);
+	const startCookie = page.headers
+		.getSetCookie()
+		.find((cookie) => cookie.startsWith(`${BROWSER_COOKIE_NAMES.start}=`))
+		?.split(";")[0];
+	if (!startCookie) throw new Error("Missing retry START cookie");
+	const response = (
+		await f.handlers.start(
+			browserPost("/auth/link-change/start", `${f.transactionCookie}; ${startCookie}`, {
+				csrf: hidden(await page.text(), "csrf"),
+				attempt_id: id,
+				start_code: encodeCoordinatorAuthProof32(startCode),
+			}),
+			"retry-browser",
+		)
+	).response;
+	expect(response.status).toBe(200);
+	const replacement = response.headers
+		.getSetCookie()
+		.find((cookie) => cookie.startsWith(`${BROWSER_COOKIE_NAMES.transaction}=`))
+		?.split(";")[0];
+	if (!replacement) throw new Error("Missing replacement TXN cookie");
+	const old = await readBrowserCookie(f.transactionCookie, "transaction");
+	const fresh = await readBrowserCookie(replacement, "transaction");
+	if (old.kind !== "present" || fresh.kind !== "present") throw new Error("Invalid retry cookie");
+	expect(fresh.cookieHash).not.toBe(old.cookieHash);
+	expect(
+		response.headers
+			.getSetCookie()
+			.some((cookie) => cookie.startsWith(`${BROWSER_COOKIE_NAMES.session}=`)),
+	).toBe(false);
+}
+
+function preservedChangeAuthority(f: Awaited<ReturnType<typeof setup>>) {
+	return [
+		"coordinator_auth_account_links",
+		"coordinator_auth_account_associations",
+		"coordinator_auth_sessions",
+		"coordinator_auth_account_profiles",
+		"coordinator_auth_link_profile_refreshes",
+		"coordinator_auth_link_audit_log",
+		"coordinator_identity_group_grants",
+		"coordinator_auth_device_claims",
+	].map((table) => [table, f.db.prepare(`SELECT * FROM ${table}`).all()]);
+}
+
+it.each(["disconnect", "refresh"] as const)(
+	"a consumed %s provider denial or wrong account fails only its own attempt and permits a new start",
+	async (intent) => {
+		for (const failure of ["provider-denial", "wrong-subject"] as const) {
+			const f = await browserSetup(intent);
+			const session = await signIn(f, "preserved-session");
+			expect(
+				await f.accountProfiles.recordAuthAccountProfile(
+					{ credentialHash: session.credentialHash, profile: { displayName: "Preserved profile" } },
+					cfg,
+				),
+			).toMatchObject({ kind: "recorded" });
+			const before = preservedChangeAuthority(f);
+			if (failure === "provider-denial") {
+				f.providerCallback.searchParams.delete("code");
+				f.providerCallback.searchParams.set("error", "access_denied");
+			} else f.oidc.claims.sub = "wrong-subject";
+			const response = (
+				await f.callback.handlers.callback(
+					new Request(f.providerCallback, { headers: { Cookie: f.transactionCookie } }),
+				)
+			).response;
+			expect(response.status).toBe(403);
+			expect(response.headers.getSetCookie()).toEqual([]);
+			expect(await response.text()).not.toMatch(/private-subject|wrong-subject|Preserved profile/);
+			expect(
+				f.db
+					.prepare(
+						"SELECT state,failure_reason FROM coordinator_auth_link_change_attempts WHERE attempt_id = 'change-a'",
+					)
+					.get(),
+			).toEqual({ state: "failed", failure_reason: "provider_failure" });
+			const cookie = await readBrowserCookie(f.transactionCookie, "transaction");
+			if (cookie.kind !== "present") throw new Error("Missing original binder");
+			expect(
+				await f.transactions.readAuthBrowserTransactionActivity(
+					{ binderHash: cookie.cookieHash },
+					cfg,
+				),
+			).toEqual({ kind: "inactive" });
+			expect(preservedChangeAuthority(f)).toEqual(before);
+			const calls = f.oidc.fetch.mock.calls.length;
+			const replay = await f.callback.handlers.callback(
+				new Request(f.providerCallback, { headers: { Cookie: f.transactionCookie } }),
+			);
+			expect(replay.response.status).toBe(403);
+			expect(replay.response.headers.getSetCookie()).toEqual([]);
+			expect(f.oidc.fetch).toHaveBeenCalledTimes(calls);
+			await retryChangeWithOldCookie(f, intent);
+		}
+	},
+);
+
+it.each(["state", "browser", "malformed-cookie"] as const)(
+	"an unauthenticated management callback with wrong %s cannot fail another browser's live attempt",
+	async (invalid) => {
+		const f = await browserSetup("disconnect");
+		let cookie = f.transactionCookie;
+		if (invalid === "state") f.providerCallback.searchParams.set("state", "x".repeat(43));
+		if (invalid === "browser")
+			cookie = (await issueBrowserCookie("transaction")).setCookie.split(";")[0] ?? "";
+		if (invalid === "malformed-cookie") cookie = `${BROWSER_COOKIE_NAMES.transaction}=bad`;
+		const before = f.oidc.fetch.mock.calls.length;
+		const response = await f.callback.handlers.callback(
+			new Request(f.providerCallback, { headers: { Cookie: cookie } }),
+		);
+		expect(response.response.status).toBe(invalid === "malformed-cookie" ? 400 : 403);
+		expect(response.response.headers.getSetCookie()).toEqual([]);
+		expect(f.oidc.fetch).toHaveBeenCalledTimes(before);
+		expect(
+			f.db.prepare("SELECT state,failure_reason FROM coordinator_auth_link_change_attempts").get(),
+		).toEqual({ state: "browser_claimed", failure_reason: null });
+	},
+);
+
+it("a failed management failure-write never reports completion or cancellation", async () => {
+	const f = await browserSetup("refresh", {
+		fail: async () => {
+			throw new Error("failure persistence unavailable");
+		},
+	});
+	f.oidc.claims.sub = "wrong-subject";
+	const before = preservedChangeAuthority(f);
+	const response = await f.callback.handlers.callback(
+		new Request(f.providerCallback, { headers: { Cookie: f.transactionCookie } }),
+	);
+	expect(response.response.status).toBe(503);
+	expect(response.response.headers.getSetCookie()).toEqual([]);
+	expect(f.db.prepare("SELECT state FROM coordinator_auth_link_change_attempts").get()).toEqual({
+		state: "browser_claimed",
+	});
+	expect(preservedChangeAuthority(f)).toEqual(before);
+});
+
+it("a completed management receipt rejects late provider failure without changing its retained effect", async () => {
+	const f = await setup();
+	await confirm(f, "refresh", { displayName: "Committed profile" });
+	expect(await f.changes.finalizeAuthLinkChangeAttempt(final, cfg)).toMatchObject({
+		kind: "applied",
+		status: { state: "completed" },
+	});
+	const before = preservedChangeAuthority(f);
+	const receipt = f.db.prepare("SELECT * FROM coordinator_auth_link_change_attempts").get() as {
+		browser_transaction_hash: string;
+	};
+	expect(
+		await f.changes.failAuthLinkChangeAttempt(
+			{
+				attemptId: final.attemptId,
+				requester: { kind: "browser", browserTransactionHash: receipt.browser_transaction_hash },
+				reason: "provider_failure",
+			},
+			cfg,
+		),
+	).toMatchObject({ kind: "rejected" });
+	expect(preservedChangeAuthority(f)).toEqual(before);
+	expect(f.db.prepare("SELECT * FROM coordinator_auth_link_change_attempts").get()).toEqual(
+		receipt,
+	);
 });
 
 it("a completed sign-in callback leaves transaction cookies untouched and permits a fresh start", async () => {

@@ -90,6 +90,25 @@ function snapshot(f: Fixture, except: readonly string[] = []) {
 function rows(f: Fixture, table: string) {
 	return f.db.prepare(`SELECT * FROM "${table}"`).all();
 }
+function expectLegacyCreateAuthority(f: Fixture, key: Identity) {
+	expect(rows(f, "enrolled_devices")).toEqual([
+		expect.objectContaining({
+			device_id: key.deviceId,
+			public_key: key.publicKey,
+			identity_id: null,
+			enabled: 1,
+		}),
+	]);
+	expect(rows(f, "coordinator_auth_controller_attestations")).toEqual([
+		expect.objectContaining({
+			device_id: key.deviceId,
+			public_key: key.publicKey,
+			identity_id: "identity-a",
+			revoked_at: null,
+			revision: 1,
+		}),
+	]);
+}
 function expectFirstLinkBirth(
 	f: Fixture,
 	genesis: Record<string, unknown>,
@@ -501,6 +520,7 @@ for (const backend of ["SQLite", "D1"] as const) {
 				await authorize(f, key);
 				const before = snapshot(f, TABLES);
 				const input = createBody({ loopback_redirect: redirect });
+				expectLegacyCreateAuthority(f, key);
 				// Act
 				const created = await request(app, key, ROOT, input);
 				const retry = await request(app, key, ROOT, input);

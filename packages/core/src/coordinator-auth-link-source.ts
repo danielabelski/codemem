@@ -129,7 +129,13 @@ function currentDeviceSql(t: string): string {
  * The caller binds the canonical key ID derived from the attempt's exact public key.
  */
 function authDeviceClaimReceiptSql(t: string): string {
-	return `EXISTS (SELECT 1 FROM coordinator_auth_account_links cl
+	// Materialize liveness separately so enclosing browser queries retain the full
+	// genesis/continuation predicate without exceeding native D1's expression depth.
+	return `EXISTS (WITH receipt_link AS MATERIALIZED (
+ SELECT cl.* FROM coordinator_auth_account_links cl
  WHERE cl.coordinator_id = ${t}.coordinator_id AND cl.link_id = ${t}.link_id AND cl.attempt_id = ${t}.attempt_id
- AND ${authLinkLiveGenerationSql({ link: "cl" })} AND ${authDeviceClaimProvenanceSql({ link: "cl", canonicalKeyId: "?" })})`;
+ AND ${authLinkLiveGenerationSql({ link: "cl" })}), receipt_provenance AS MATERIALIZED (
+ SELECT cl.coordinator_id,cl.link_id FROM receipt_link cl
+ WHERE ${authDeviceClaimProvenanceSql({ link: "cl", canonicalKeyId: "?" })})
+ SELECT 1 FROM receipt_provenance)`;
 }

@@ -130,7 +130,7 @@ function fixture(state: BlockedState) {
 		return {
 			kind: "status",
 			status: {
-				version: 2,
+				version: 3,
 				coordinatorId: "synthetic-coordinator",
 				groupId: context.groupId,
 				deviceId,
@@ -138,7 +138,8 @@ function fixture(state: BlockedState) {
 				...(state === "revoked"
 					? { state, identityId: store.actorId, authority: "device_claim" as const }
 					: { state, identityId: null, authority: null }),
-				account: null,
+				profile: { state: "unavailable" },
+				actions: { connect: false, disconnect: false, refresh: false },
 			},
 		};
 	});
@@ -187,7 +188,7 @@ describe("Google account state never gates unrelated application routes", () => 
 			const status = await f.app.request(`${ORIGIN}/api/account/link-status`, { headers });
 			expect(status.status).toBe(200);
 			expect(await status.json()).toMatchObject({
-				canLink: false,
+				actions: { connect: false, disconnect: false, refresh: false },
 				remote: state === "unavailable" ? { kind: "unavailable" } : { kind: "status", state },
 			});
 			const denied = await f.app.request(`${ORIGIN}/api/account/link-operations`, {
@@ -198,6 +199,7 @@ describe("Google account state never gates unrelated application routes", () => 
 					contextId: f.context.contextId,
 					authority: "device_claim",
 					coordinatorId: "synthetic-coordinator",
+					intent: "connect",
 				}),
 			});
 			expect(denied.status).toBe(state === "unavailable" ? 503 : 409);
@@ -254,7 +256,9 @@ describe("Google account state never gates unrelated application routes", () => 
 			const f = fixture(state);
 			const headers = await accountHeaders(f.app);
 			const blocked = await f.app.request(`${ORIGIN}/api/account/link-status`, { headers });
-			expect(await blocked.json()).toMatchObject({ canLink: false });
+			expect(await blocked.json()).toMatchObject({
+				actions: { connect: false, disconnect: false, refresh: false },
+			});
 			const peer = createPeer(f.store);
 			const accountReads = f.readRemoteStatus.mock.calls.length;
 			// Act: discover the current reset boundary through the real signed protocol.

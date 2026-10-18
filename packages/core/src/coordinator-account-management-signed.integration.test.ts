@@ -503,6 +503,7 @@ it("rejects fresh synthetic-provider proof for another account without exposing 
 	expect((await request(f, root)).status).toBe(201);
 	f.oidc.claims.sub = "wrong-synthetic-account";
 	const before = lifecycle(f);
+	const profiles = rows(f, "coordinator_auth_link_profiles");
 	// Act
 	const callback = await providerCallback(f);
 	const html = await callback.response.text();
@@ -510,10 +511,59 @@ it("rejects fresh synthetic-provider proof for another account without exposing 
 	expect(callback.response.status).toBe(403);
 	expect(html).not.toContain("fixture-subject");
 	expect(html).not.toContain("wrong-synthetic-account");
+	expect(callback.response.headers.getSetCookie()).toEqual([]);
 	expect(lifecycle(f)).toEqual(before);
+	expect(rows(f, "coordinator_auth_link_profiles")).toEqual(profiles);
 	expect(rows(f, "coordinator_auth_link_change_attempts")).toEqual([
-		expect.objectContaining({ state: "browser_claimed" }),
+		expect.objectContaining({
+			state: "failed",
+			failure_reason: "provider_failure",
+			failed_at_ms: NOW,
+			completed_at_ms: null,
+		}),
 	]);
+	// Arrange: a fresh signed intent must not be blocked by the failed ceremony.
+	const freshStartCode = Buffer.alloc(32, 31).toString("base64url");
+	const freshRuntime = Buffer.alloc(32, 33).toString("base64url");
+	const created = await request(
+		f,
+		root,
+		createBody({
+			attempt_id: "fresh-change",
+			runtime_verifier_hash: hash(freshRuntime),
+			browser_start_hash: hash(freshStartCode),
+		}),
+	);
+	expect(created.status).toBe(201);
+	// Act: retain the failed transaction cookie while beginning the next flow.
+	const freshPage = await f.app.request(
+		`${origin}/auth/link-change/start?attempt_id=fresh-change&start_code=${freshStartCode}`,
+		{ headers: { cookie: callback.cookie } },
+	);
+	expect(freshPage.status).toBe(200);
+	const freshCookie = cookies(freshPage, new Map());
+	const started = await postForm(
+		f,
+		"/auth/link-change/start",
+		`${callback.cookie}; ${freshCookie}`,
+		{
+			csrf: hidden(await freshPage.text(), "csrf"),
+			attempt_id: "fresh-change",
+			start_code: freshStartCode,
+		},
+	);
+	// Assert: only the new successful start replaces the transaction cookie.
+	expect(started.status).toBe(200);
+	expect(rows(f, "coordinator_auth_link_change_attempts")).toEqual([
+		expect.objectContaining({
+			attempt_id: "change-a",
+			state: "failed",
+			failure_reason: "provider_failure",
+		}),
+		expect.objectContaining({ attempt_id: "fresh-change", state: "browser_claimed" }),
+	]);
+	expect(lifecycle(f)).toEqual(before);
+	expect(rows(f, "coordinator_auth_link_profiles")).toEqual(profiles);
 });
 
 it("admits the original device-claim signer but denies a same-Identity reader without minting owner or grant authority", async () => {

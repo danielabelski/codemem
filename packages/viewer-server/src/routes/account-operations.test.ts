@@ -32,16 +32,18 @@ function remote(
 	patch: Partial<Extract<CoordinatorAccountLinkStatusRead, { kind: "status" }>["status"]> = {},
 ): CoordinatorAccountLinkStatusRead {
 	const subject = {
-		version: 2 as const,
+		version: 3 as const,
 		coordinatorId: "coordinator-a",
 		groupId: context.groupId,
 		deviceId: context.deviceId,
 		fingerprint: context.fingerprint,
+		profile: { state: "unavailable" as const },
+		actions: { connect: false, disconnect: false, refresh: false },
 	};
 	if (state === "review_required" || state === "conflict")
 		return {
 			kind: "status",
-			status: { ...subject, state, identityId: null, authority: null, account: null },
+			status: { ...subject, state, identityId: null, authority: null },
 		};
 	return {
 		kind: "status",
@@ -50,7 +52,11 @@ function remote(
 			identityId: context.identityId,
 			authority: "device_claim",
 			state,
-			account: null,
+			actions: {
+				connect: state === "unlinked",
+				disconnect: state === "linked",
+				refresh: state === "linked",
+			},
 			...patch,
 		} as Extract<CoordinatorAccountLinkStatusRead, { kind: "status" }>["status"],
 	};
@@ -112,6 +118,7 @@ async function fixture() {
 			contextId: context.contextId,
 			authority: "device_claim",
 			coordinatorId: "coordinator-a",
+			intent: "connect",
 		}),
 		extra = {},
 	) =>
@@ -181,7 +188,7 @@ describe("account operation HTTP contract", () => {
 		expect(publicText).not.toContain(PRIVATE);
 		expect(publicText).not.toContain(context.dbPath);
 		expect(JSON.parse(publicText)).toMatchObject({
-			canLink: false,
+			actions: { connect: false, disconnect: false, refresh: false },
 			blockedReason: "operation_active",
 			operation: { operationId: id },
 		});
@@ -440,17 +447,19 @@ describe("account operation status and cancellation", () => {
 		f.readContext.mockReturnValue(ready);
 		f.done.reject(new Error("synthetic failure"));
 		await f.done.promise.catch(() => {});
+		// Drain registry completion and final ownership release, not just the fake runtime promise.
+		for (let turn = 0; turn < 8; turn++) await Promise.resolve();
 		f.readRemoteStatus.mockResolvedValue(remote("linked"));
 		const finished = await f.request("/api/account/link-status", "GET");
 		// Assert
 		expect(await elsewhere.json()).toMatchObject({
-			canLink: false,
+			actions: { connect: false, disconnect: false, refresh: false },
 			blockedReason: "operation_active",
 			operation: null,
 			remote: { kind: "status", state: "unlinked" },
 		});
 		expect(await finished.json()).toMatchObject({
-			canLink: false,
+			actions: { connect: false, disconnect: true, refresh: true },
 			blockedReason: "already_linked",
 			operation: { operationId: id, state: "failed" },
 		});
@@ -513,6 +522,7 @@ describe("account operation request boundary", () => {
 				contextId: context.contextId,
 				authority: "device_claim",
 				coordinatorId: "coordinator-a",
+				intent: "connect",
 			});
 			const bytes = new TextEncoder().encode(json.padEnd(size));
 			const stream = new ReadableStream<Uint8Array>({

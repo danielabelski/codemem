@@ -224,8 +224,14 @@ async function linkA(f) {
 		identityId: a.store.actorId, fetch: request,
 	});
 	assert.equal(readiness.kind, "status");
-	assert.equal(readiness.status.state, "unlinked");
-	assert.equal(readiness.status.authority, f.deviceOwned ? "device_claim" : "controller_attestation");
+	assert.deepEqual(readiness.status, {
+		version: 3, coordinatorId: config.coordinatorId, groupId: review.groupId,
+		deviceId: a.deviceId, fingerprint: h.fingerprintPublicKey(a.key.publicKey),
+		identityId: a.store.actorId,
+		authority: f.deviceOwned ? "device_claim" : "controller_attestation",
+		state: "unlinked", profile: { state: "unavailable" },
+		actions: { connect: true, disconnect: false, refresh: false },
+	});
 	let browserDone;
 	const result = await h.linkCoordinatorAccount({
 		dbPath: a.dbPath, keysDir: a.keysDir, coordinatorUrl: origin, groupId: review.groupId,
@@ -516,17 +522,22 @@ test("fake-only device-owned Google link keeps the current Identity without owne
 	const profile = await f.request(completed.headers.get("location"), { headers: { cookie: sessionCookie } });
 	const status = await f.h.readCoordinatorAccountLinkStatus({ dbPath: f.a.dbPath, keysDir: f.a.keysDir,
 		coordinatorUrl: origin, groupId: "group-a", identityId: f.a.store.actorId, fetch: f.request });
-	// Assert: real signed-JWS SDK verification, browser session and fresh V2 status agree on A.
+	// Assert: real signed-JWS SDK verification, browser session and canonical V3 status agree on A.
 	assert.equal(profile.status, 200);
 	const profileHtml = await profile.text();
 	assert.ok(profileHtml.includes(`<code>${f.a.store.actorId}</code>`));
 	assert.match(profileHtml, /aria-label="Account profile"/);
 	assert.match(profileHtml, /Signed in/);
 	assert.equal(status.kind, "status");
-	assert.equal(status.status.version, 2);
-	assert.equal(status.status.state, "linked");
-	assert.equal(status.status.authority, "device_claim");
-	assert.equal(status.status.identityId, f.a.store.actorId);
+	assert.deepEqual(status.status, {
+		version: 3, coordinatorId: f.config.coordinatorId, groupId: "group-a",
+		deviceId: f.a.deviceId, fingerprint: f.h.fingerprintPublicKey(f.a.key.publicKey),
+		identityId: f.a.store.actorId, authority: "device_claim", state: "linked",
+		profile: { state: "verified", verifiedAtMs: f.now, displayName: "Fixture User", email: "user@example.test" },
+		// First linking preserves the legacy NULL enrollment label; it does not
+		// manufacture the stricter requester authority needed to manage/reconnect.
+		actions: { connect: false, disconnect: false, refresh: false },
+	});
 	assert.equal(f.link.identityId, f.a.store.actorId);
 	assert.deepEqual(Object.keys(f.link).sort(), ["attemptId", "coordinatorId", "identityId", "state"]);
 	assert.ok(f.provider.requests.some(({ url }) => url.endsWith("/token")));

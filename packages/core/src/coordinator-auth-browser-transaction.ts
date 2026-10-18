@@ -311,13 +311,9 @@ export class CoordinatorAuthBrowserTransactions implements CoordinatorAuthBrowse
 		// fails closed, even for an expired row; unrelated coordinators never match.
 		const row = await this.first<{ activity: string }>({
 			sql: `SELECT CASE
- WHEN b.issuer <> ? OR b.auth_config_revision <> ? OR b.redirect_uri <> ? THEN 'config_changed'
+ WHEN b.coordinator_id <> ? OR b.issuer <> ? OR b.auth_config_revision <> ? OR b.redirect_uri <> ? THEN 'config_changed'
  WHEN b.state = 'expired' OR b.expires_at_ms <= ? THEN 'inactive'
- WHEN b.purpose = 'signin' AND b.state = 'consumed' AND EXISTS (
- SELECT 1 FROM coordinator_auth_session_receipts completed
- WHERE completed.coordinator_id = b.coordinator_id AND completed.browser_transaction_hash = b.browser_transaction_hash
- AND completed.source = 'signin' AND completed.attempt_id IS NULL
- AND completed.auth_config_revision = b.auth_config_revision) THEN 'inactive'
+ WHEN b.purpose = 'signin' AND b.state = 'consumed' THEN 'inactive'
  WHEN b.purpose = 'link_change' AND NOT EXISTS (SELECT 1 FROM coordinator_auth_link_change_attempts a
  WHERE a.coordinator_id = b.coordinator_id AND a.attempt_id = b.attempt_id
  AND a.browser_transaction_hash = b.browser_transaction_hash AND a.browser_binder_hash = b.binder_hash
@@ -329,8 +325,18 @@ export class CoordinatorAuthBrowserTransactions implements CoordinatorAuthBrowse
  AND a.auth_config_revision = b.auth_config_revision
  AND (a.state IN ('finalized','session_redeemed','failed','expired') OR a.expires_at_ms <= ?))
  THEN 'inactive' ELSE 'active' END AS activity
- FROM ${TABLE} b WHERE b.coordinator_id = ? AND b.binder_hash = ?`,
-			values: [c.issuer, c.revision, c.redirectUri, now, now, now, c.coordinatorId, i.binderHash],
+ FROM ${TABLE} b WHERE b.binder_hash = ? ORDER BY (b.coordinator_id = ?) DESC LIMIT 1`,
+			values: [
+				c.coordinatorId,
+				c.issuer,
+				c.revision,
+				c.redirectUri,
+				now,
+				now,
+				now,
+				i.binderHash,
+				c.coordinatorId,
+			],
 		});
 		if (!row || row.activity === "inactive") return { kind: "inactive" };
 		if (row.activity === "active") return { kind: "active" };
@@ -722,9 +728,15 @@ export class CoordinatorAuthBrowserTransactions implements CoordinatorAuthBrowse
 			c,
 			now,
 		);
+		// Separate binder/config matching from deep finalized-claim proof under D1's depth limit.
 		const row = await this.first<{ browser_transaction_hash: string }>({
-			sql: `SELECT b.browser_transaction_hash FROM ${TABLE} b WHERE ${MATCH_CONFIG} AND b.purpose = 'link'
- AND b.attempt_id = ? AND b.binder_hash = ? AND b.state IN ('pending','consumed') AND b.expires_at_ms > ? AND ${linkMatch("'browser_claimed','oidc_verified','confirmed','finalized','session_redeemed'", source.sql)}`,
+			sql: `WITH bound_browser AS MATERIALIZED (
+ SELECT b.* FROM ${TABLE} b WHERE ${MATCH_CONFIG} AND b.purpose = 'link'
+ AND b.attempt_id = ? AND b.binder_hash = ? AND b.state IN ('pending','consumed') AND b.expires_at_ms > ?
+ ), authorized_browser AS MATERIALIZED (
+ SELECT b.browser_transaction_hash FROM bound_browser b
+ WHERE ${linkMatch("'browser_claimed','oidc_verified','confirmed','finalized','session_redeemed'", source.sql)})
+ SELECT browser_transaction_hash FROM authorized_browser`,
 			values: [...configValues(c), i.attemptId, i.binderHash, now, ...source.values, now],
 		});
 		return row ? { browserTransactionHash: row.browser_transaction_hash } : null;

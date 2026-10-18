@@ -69,16 +69,18 @@ function status(
 	authority: "device_claim" | "controller_attestation" = "device_claim",
 ): CoordinatorAccountLinkStatusRead {
 	const subject = {
-		version: 2 as const,
+		version: 3 as const,
 		coordinatorId: "coordinator-a",
 		groupId: "group-a",
 		deviceId: local.deviceId,
 		fingerprint: local.fingerprint,
+		profile: { state: "unavailable" as const },
+		actions: { connect: false, disconnect: false, refresh: false },
 	};
 	if (state === "review_required" || state === "conflict")
 		return {
 			kind: "status",
-			status: { ...subject, state, identityId: null, authority: null, account: null },
+			status: { ...subject, state, identityId: null, authority: null },
 		};
 	return {
 		kind: "status",
@@ -89,9 +91,20 @@ function status(
 			...(state === "linked"
 				? {
 						state,
-						account: { email: "fixture@example.test", displayName: "Fixture name", pictureUrl },
+						profile: {
+							state: "verified",
+							verifiedAtMs: 1,
+							email: "fixture@example.test",
+							displayName: "Fixture name",
+							pictureUrl,
+						},
 					}
-				: { state, account: null }),
+				: { state, profile: { state: "unavailable" } }),
+			actions: {
+				connect: state === "unlinked",
+				disconnect: state === "linked",
+				refresh: state === "linked",
+			},
 		},
 	};
 }
@@ -111,7 +124,7 @@ describe("account status route", () => {
 			f.readRemoteStatus.mockResolvedValue(status("unlinked", local.identityId, authority));
 			const body = await (await f.request()).json(); // Act
 			expect(body).toMatchObject({
-				canLink: true,
+				actions: { connect: true, disconnect: false, refresh: false },
 				remote: { authority, identityId: local.identityId },
 			}); // Assert
 		},
@@ -131,13 +144,23 @@ describe("account status route", () => {
 				local,
 				coordinator: ready.coordinator,
 				remote: { kind: "status", state },
-				canLink: state === "unlinked",
+				actions: {
+					connect: state === "unlinked",
+					disconnect: state === "linked",
+					refresh: state === "linked",
+				},
 				operation: null,
 			});
-			expect(body.remote.account).toEqual(
+			expect(body.remote.profile).toEqual(
 				state === "linked"
-					? { email: "fixture@example.test", displayName: "Fixture name", pictureUrl }
-					: null,
+					? {
+							state: "verified",
+							verifiedAtMs: 1,
+							email: "fixture@example.test",
+							displayName: "Fixture name",
+							pictureUrl,
+						}
+					: { state: "unavailable" },
 			);
 			if (state === "review_required") expect(body.blockedReason).toBe("review_required");
 			expect(new Date(body.checkedAt).toISOString()).toBe(body.checkedAt);
@@ -165,9 +188,9 @@ describe("account status route", () => {
 			const body = await (await f.request()).json(); // Act
 			// Assert
 			expect(body).toMatchObject({
-				canLink: false,
+				actions: { connect: false, disconnect: false, refresh: false },
 				blockedReason: "identity_mismatch",
-				remote: { identityMatches: false, account: null },
+				remote: { identityMatches: false, profile: { state: "unavailable" } },
 			});
 			expect(JSON.stringify(body)).not.toContain("fixture@example.test");
 			expect(JSON.stringify(body)).not.toContain(pictureUrl);
@@ -183,7 +206,7 @@ describe("account status route", () => {
 			f.readRemoteStatus.mockResolvedValue(remote);
 			const body = await (await f.request()).json(); // Act
 			expect(body).toMatchObject({
-				canLink: false,
+				actions: { connect: false, disconnect: false, refresh: false },
 				remote: { kind: "unavailable", code: "context_changed" },
 			}); // Assert
 			expect(JSON.stringify(body)).not.toContain("fixture@example.test");
@@ -191,6 +214,34 @@ describe("account status route", () => {
 		},
 	);
 });
+describe("account profile freshness and management authority", () => {
+	it.each([{ state: "verified", verifiedAtMs: 1 }, { state: "unavailable" }] as const)(
+		"preserves linked profile %j without inventing management permission",
+		async (profile) => {
+			// Arrange: readable current account data does not grant disconnect/refresh authority.
+			const f = await fixture();
+			const remote = status("linked");
+			if (remote.kind !== "status") throw new Error("Expected status fixture");
+			remote.status.profile = profile;
+			remote.status.actions = { connect: false, disconnect: false, refresh: false };
+			f.readRemoteStatus.mockResolvedValue(remote);
+			// Act
+			const response = await f.request();
+			const body = await response.json();
+			// Assert: verified-empty is distinct from unavailable, and neither is unlinked.
+			expect(response.status).toBe(200);
+			expect(body).toMatchObject({
+				version: 1,
+				remote: { state: "linked", identityId: local.identityId, identityMatches: true, profile },
+				actions: { connect: false, disconnect: false, refresh: false },
+			});
+			expect(body.remote.profile).toEqual(profile);
+			privateResponse(response);
+			expect(f.storeFactory).not.toHaveBeenCalled();
+		},
+	);
+});
+
 describe("account unavailable status", () => {
 	it.each<CoordinatorAccountLinkStatusRead>([
 		{ kind: "unsupported" },
@@ -201,7 +252,7 @@ describe("account unavailable status", () => {
 		f.readRemoteStatus.mockResolvedValue(Object.assign({ email: "injected@example.test" }, remote));
 		const body = await (await f.request()).json(); // Act
 		expect(body.remote).toEqual(remote); // Assert
-		expect(body.canLink).toBe(false);
+		expect(body.actions).toEqual({ connect: false, disconnect: false, refresh: false });
 		expect(JSON.stringify(body)).not.toContain("unlinked");
 		expect(JSON.stringify(body)).not.toContain("injected@example.test");
 	});
@@ -217,7 +268,11 @@ describe("account status request boundary", () => {
 		const f = await fixture(); // Arrange
 		f.readContext.mockReturnValue({ ...ready, setup, context: null });
 		const body = await (await f.request()).json(); // Act
-		expect(body).toMatchObject({ setup, remote: { kind: "not_checked" }, canLink: false }); // Assert
+		expect(body).toMatchObject({
+			setup,
+			remote: { kind: "not_checked" },
+			actions: { connect: false, disconnect: false, refresh: false },
+		}); // Assert
 		expect(f.readRemoteStatus).not.toHaveBeenCalled();
 		expect(f.storeFactory).not.toHaveBeenCalled();
 	});
@@ -313,7 +368,7 @@ describe("account status freshness", () => {
 			// Assert
 			expect(body).toMatchObject({
 				contextId: fresh.context?.contextId ?? null,
-				canLink: false,
+				actions: { connect: false, disconnect: false, refresh: false },
 				remote: { kind: "unavailable", code: "context_changed" },
 				local: fresh.context
 					? {
@@ -334,7 +389,7 @@ describe("account status freshness", () => {
 			.mockResolvedValueOnce(status("linked"));
 		const first = await (await f.request()).json(); // Act
 		const second = await (await f.request()).json();
-		expect(first.canLink).toBe(true); // Assert
+		expect(first.actions).toEqual({ connect: true, disconnect: false, refresh: false }); // Assert
 		expect(second.remote.state).toBe("linked");
 		expect(f.readRemoteStatus).toHaveBeenCalledTimes(2);
 	});

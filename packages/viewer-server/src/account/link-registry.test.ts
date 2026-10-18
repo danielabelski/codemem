@@ -50,6 +50,7 @@ function fixture(
 	const registry = createRegistry({ readContext, link });
 	const start = () => {
 		const started = registry.start({
+			intent: "connect",
 			context: structuredClone(subject),
 			expectedCoordinatorId,
 			expectedAuthority: "device_claim",
@@ -95,6 +96,7 @@ describe("account link runtime-wide ownership", () => {
 			const firstId = first.start();
 			// Act: the slot must be reserved before the Core microtask starts.
 			const blocked = second.registry.start({
+				intent: "connect",
 				context: subject,
 				expectedCoordinatorId: "coordinator-b",
 				expectedAuthority: "device_claim",
@@ -154,6 +156,7 @@ describe("account link runtime-wide ownership", () => {
 			first.registry.cancel(firstId);
 			expect(
 				second.registry.start({
+					intent: "connect",
 					context,
 					expectedCoordinatorId: "coordinator-a",
 					expectedAuthority: "device_claim",
@@ -178,6 +181,7 @@ describe("account link runtime-wide ownership", () => {
 			const third = fixture();
 			expect(
 				third.registry.start({
+					intent: "connect",
 					context,
 					expectedCoordinatorId: "coordinator-a",
 					expectedAuthority: "device_claim",
@@ -224,6 +228,7 @@ describe("account link runtime-wide shutdown", () => {
 		expect(second.registry.hasActive()).toBe(true);
 		expect(
 			second.registry.start({
+				intent: "connect",
 				context,
 				expectedCoordinatorId: "coordinator-a",
 				expectedAuthority: "device_claim",
@@ -254,6 +259,7 @@ describe("account link runtime-wide shutdown", () => {
 			else void first.registry.close();
 			expect(
 				second.registry.start({
+					intent: "connect",
 					context,
 					expectedCoordinatorId: "coordinator-a",
 					expectedAuthority: "device_claim",
@@ -285,6 +291,7 @@ describe("account link runtime module and callback isolation", () => {
 		const expectedLifecycleToken = second.registry.lifecycleToken();
 		// Act
 		const blocked = second.registry.start({
+			intent: "connect",
 			context,
 			expectedCoordinatorId: "coordinator-a",
 			expectedAuthority: "device_claim",
@@ -301,6 +308,7 @@ describe("account link runtime module and callback isolation", () => {
 		await settle();
 		expect(
 			second.registry.start({
+				intent: "connect",
 				context,
 				expectedCoordinatorId: "coordinator-a",
 				expectedLifecycleToken,
@@ -323,6 +331,7 @@ describe("account link runtime module and callback isolation", () => {
 		});
 		// Act
 		const blocked = outer.registry.start({
+			intent: "connect",
 			context,
 			expectedCoordinatorId: "coordinator-a",
 			expectedAuthority: "device_claim",
@@ -353,6 +362,7 @@ describe("account link registry", () => {
 		await settle();
 		expect(
 			second.registry.start({
+				intent: "connect",
 				context,
 				expectedCoordinatorId: "coordinator-a",
 				expectedLifecycleToken,
@@ -362,6 +372,7 @@ describe("account link registry", () => {
 		expect(second.link).not.toHaveBeenCalled();
 		expect(second.registry.forContext(context.contextId)).toBeNull();
 		const fresh = second.registry.start({
+			intent: "connect",
 			context,
 			expectedCoordinatorId: "coordinator-a",
 			expectedLifecycleToken: second.registry.lifecycleToken(),
@@ -375,6 +386,7 @@ describe("account link registry", () => {
 		const f = fixture(); // Arrange
 		const id = f.start(); // Act
 		const duplicate = f.registry.start({
+			intent: "connect",
 			context: { ...context, groupId: "group-b" },
 			expectedCoordinatorId: "coordinator-b",
 			expectedAuthority: "device_claim",
@@ -415,6 +427,7 @@ describe("account link private capability snapshots", () => {
 		const operation = f.registry.get(id);
 		// Assert: only browserUrl may return the capability, never a public snapshot.
 		expect(operation).toEqual({
+			intent: "connect",
 			operationId: id,
 			groupId: context.groupId,
 			contextId: context.contextId,
@@ -499,6 +512,7 @@ describe("account link context and cancellation", () => {
 				context: fresh,
 			});
 			const started = f.registry.start({
+				intent: "connect",
 				context,
 				expectedCoordinatorId: "coordinator-a",
 				expectedAuthority: "device_claim",
@@ -514,6 +528,7 @@ describe("account link context and cancellation", () => {
 		if ("error" in ready) throw new Error("Expected ready fixture");
 		f.readContext.mockReturnValue({ ...ready, setup: "device_unavailable" });
 		const started = f.registry.start({
+			intent: "connect",
 			context,
 			expectedCoordinatorId: "coordinator-a",
 			expectedAuthority: "device_claim",
@@ -619,6 +634,7 @@ describe("account link shutdown outcomes", () => {
 		expect(f.registry.browserUrl(id)).toBeNull();
 		expect(
 			f.registry.start({
+				intent: "connect",
 				context,
 				expectedCoordinatorId: "coordinator-a",
 				expectedAuthority: "device_claim",
@@ -703,6 +719,7 @@ describe("account link failures and lifecycle", () => {
 		expect(options.signal?.aborted).toBe(true); // Assert
 		expect(
 			f.registry.start({
+				intent: "connect",
 				context,
 				expectedCoordinatorId: "coordinator-a",
 				expectedAuthority: "device_claim",

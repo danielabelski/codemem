@@ -21,7 +21,6 @@ const TX = "coordinator_auth_browser_transactions";
 const SESSION = "coordinator_auth_sessions";
 const RECEIPT = "coordinator_auth_session_receipts";
 const PROFILE = "coordinator_auth_account_profiles";
-const CLEAR = `${BROWSER_COOKIE_NAMES.transaction}=; Max-Age=0; Path=/; Secure; HttpOnly; SameSite=Lax`;
 const protectedTables = [
 	"account_links",
 	"link_attempts",
@@ -194,28 +193,59 @@ async function setup(options: { linked?: boolean } = {}) {
 		traps,
 	};
 }
-async function ceremony(f: Fixture) {
-	const { response: page } = await f.started.signInPage(new Request(`${ORIGIN}/auth/sign-in`));
+// HTTP cookie-header model only, including START deletion and expiry ordering.
+function nativeCookies() {
+	const values = new Map<string, { value: string; expiry: number }>();
+	return {
+		apply(response: Response) {
+			for (const header of response.headers.getSetCookie()) {
+				const [pair, ...attributes] = header.split(";").map(value => value.trim());
+				const separator = pair.indexOf("=");
+				const name = pair.slice(0, separator);
+				const age = attributes.find(value => /^max-age=/i.test(value))?.slice(8);
+				const expires = attributes.find(value => /^expires=/i.test(value))?.slice(8);
+				let expiry = expires === undefined ? Infinity : Date.parse(expires);
+				if (age !== undefined && /^-?\d+$/.test(age)) expiry = Date.now() + Number(age)*1000;
+				if (expiry <= Date.now()) values.delete(name);
+				else values.set(name, { value: pair.slice(separator+1), expiry });
+			}
+		},
+		header: () => [...values].filter(([, value]) => value.expiry > Date.now())
+			.map(([name, value]) => `${name}=${value.value}`).join("; "),
+	};
+}
+
+async function ceremony(f: Fixture, jar = nativeCookies()) {
+	const { response: page } = await f.started.signInPage(request(`${ORIGIN}/auth/sign-in`, jar.header()));
+	expect(page.status).toBe(200);
+	jar.apply(page);
 	const csrf = (await page.text()).match(/name="csrf" value="([^"]+)"/)?.[1];
 	if (!csrf) throw new Error("Missing CSRF form");
-	const cookie = page.headers.getSetCookie()[0].split(";")[0];
 	const { response } = await f.started.signInStart(
 		new Request(`${ORIGIN}/auth/sign-in`, {
 			method: "POST",
-			headers: { origin: ORIGIN, cookie, "content-type": "application/x-www-form-urlencoded" },
+			headers: { origin: ORIGIN, cookie: jar.header(), "content-type": "application/x-www-form-urlencoded" },
 			body: new URLSearchParams({ csrf }),
 		}),
 		"fixture-client",
 	);
+	expect(response.status).toBe(200);
+	jar.apply(response);
+	expect(await readBrowserCookie(jar.header(), "start")).toMatchObject({ kind: "absent" });
 	const href = (await response.text()).match(/href="(https:[^"]+)"/)?.[1];
 	if (!href) throw new Error("Missing provider anchor");
 	const authorization = new URL(href.replaceAll("&amp;", "&"));
-	const txn = response.headers.getSetCookie()[0].split(";")[0];
+	const txn = jar.header();
+	const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(authorization.searchParams.get("state") ?? ""));
+	const stateHash = Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2,"0")).join("");
+	const row = (await rows(f)).find(row => row.state_hash === stateHash);
+	if (!row) throw new Error("Missing matching native browser proof");
 	return {
+		jar,
 		authorization,
 		callback: f.fixture.authorize(authorization),
 		cookie: txn,
-		row: (await rows(f)).find((row) => row.purpose === "signin")!,
+		row,
 	};
 }
 function request(url: URL | string, cookie?: string) {
@@ -266,18 +296,17 @@ it("runs the real Google sign-in ceremony, persists coherent session/profile, an
 	);
 	const result = await f.callbacks[0].callback(request(encoded, c.cookie));
 	const replay = await f.callbacks[1].callback(request(c.callback, c.cookie));
-	// Assert: native getSetCookie preserves both fields; bearer header intentionally remains public.
+	// Assert: only SESSION is issued; retained TXN cookies are never deleted by a callback.
 	expect(result.outcome).toBe("signed_in");
 	expect(result.response.status).toBe(303);
 	expect(result.response.headers.get("location")).toBe(`${ORIGIN}/auth/account`);
 	const cookies = result.response.headers.getSetCookie();
-	expect(cookies).toHaveLength(2);
+	expect(cookies).toHaveLength(1);
 	expect(cookies[0]).toMatch(
 		new RegExp(
 			`^${BROWSER_COOKIE_NAMES.session}=[A-Za-z0-9_-]{43}; Max-Age=28800; Path=/; Secure; HttpOnly; SameSite=Lax$`,
 		),
 	);
-	expect(cookies[1]).toBe(CLEAR);
 	const credential = await readBrowserCookie(cookies[0].split(";")[0], "session");
 	if (credential.kind !== "present") throw new Error("Missing session credential");
 	const stored = (await rows(f, SESSION))[0];
@@ -315,6 +344,88 @@ it("runs the real Google sign-in ceremony, persists coherent session/profile, an
 	await untouched(f);
 });
 
+it.each(["provider-denied", "unlinked"] as const)(
+	"native consumed %s signin permits a fresh START with the retained TXN but rejects old callback replay",
+	async (mode) => {
+		// Arrange: actual native D1 consumption; only the provider transport is synthetic.
+		const f = await setup({ linked: mode !== "unlinked" });
+		const c = await ceremony(f);
+		if (mode === "provider-denied") {
+			c.callback.searchParams.delete("code");
+			c.callback.searchParams.set("error", "access_denied");
+		}
+		const before = await authority(f);
+		// Act
+		const failed = await f.callbacks[0].callback(request(c.callback, c.cookie));
+		c.jar.apply(failed.response);
+		// Assert: no cookie deletion or receipt is needed to release a consumed signin.
+		expect(failed.response.status).toBe(403);
+		expect(failed.response.headers.getSetCookie()).toEqual([]);
+		expect(c.jar.header()).toBe(c.cookie);
+		expect(await f.stores[1].readAuthBrowserTransactionActivity({ binderHash: String(c.row.binder_hash) }, f.config)).toEqual({ kind: "inactive" });
+		const history = await rows(f);
+		expect(history.find(row => row.state_hash === c.row.state_hash)).toMatchObject({ state: "consumed", nonce: null, pkce_verifier: null });
+		expect(await rows(f, RECEIPT)).toEqual([]);
+		// Act: real GET, fresh START/CSRF, and POST carry the old retained TXN together.
+		const fresh = await ceremony(f, c.jar);
+		// Assert: a new pending proof, not resurrection of the old request or authority.
+		expect(fresh.row.binder_hash).not.toBe(c.row.binder_hash);
+		expect(fresh.row.browser_sequence).toBeGreaterThan(Number(c.row.browser_sequence));
+		expect(fresh.row).toMatchObject({ state: "pending", nonce: expect.any(String), pkce_verifier: expect.any(String) });
+		expect((await rows(f)).filter(row => row.state_hash !== fresh.row.state_hash)).toEqual(history);
+		f.transport.mockClear();
+		const pending = await rows(f);
+		for (const cookie of [c.cookie, fresh.cookie]) {
+			const replay = await f.callbacks[1].callback(request(c.callback, cookie));
+			expect(replay.response.status).toBe(403);
+			expect(replay.response.headers.getSetCookie()).toEqual([]);
+			c.jar.apply(replay.response);
+		}
+		expect(c.jar.header()).toBe(fresh.cookie);
+		expect(f.transport).not.toHaveBeenCalled();
+		expect(await rows(f)).toEqual(pending);
+		expect(await rows(f, SESSION)).toEqual([]);
+		expect(await rows(f, RECEIPT)).toEqual([]);
+		expect(await authority(f)).toEqual(before);
+		await untouched(f);
+	},
+);
+
+it("native delayed callback delivery retains a newer TXN while issuing only the committed SESSION", async () => {
+	// Arrange: hold delivery after real native D1 admission has committed.
+	const f = await setup();
+	const c = await ceremony(f);
+	const before = await authority(f);
+	const admitted = Promise.withResolvers<void>();
+	const release = Promise.withResolvers<void>();
+	const signin = f.stores[0].signInWithConsumedBrowserTransaction.bind(f.stores[0]);
+	vi.spyOn(f.stores[0], "signInWithConsumedBrowserTransaction").mockImplementation(async (...args) => {
+		const result = await signin(...args);
+		admitted.resolve();
+		await release.promise;
+		return result;
+	});
+	const factory = await createCoordinatorBrowserAuthCallback({ config: f.config, store: f.stores[0], completeLink: f.completeLink, oidcOptions: { fetch: f.transport } });
+	if (!factory.ok) throw new Error("Delayed callback composition failed");
+	// Act: a new real ceremony is admitted before the older response reaches the jar.
+	const pending = factory.handlers.callback(request(c.callback, c.cookie));
+	await admitted.promise;
+	const fresh = await ceremony(f, c.jar);
+	release.resolve();
+	const delayed = await pending;
+	c.jar.apply(delayed.response);
+	// Assert: SESSION delivery does not delete or replace the newer pending TXN.
+	expect(delayed.response.status).toBe(303);
+	expect(delayed.response.headers.getSetCookie()).toEqual([expect.stringMatching(/^__Host-codemem-session=/)]);
+	expect(await readBrowserCookie(c.jar.header(), "transaction")).toMatchObject({ kind: "present", cookieHash: fresh.row.binder_hash });
+	expect((await rows(f)).find(row => row.state_hash === fresh.row.state_hash)).toEqual(fresh.row);
+	const session = await readBrowserCookie(c.jar.header(), "session");
+	if (session.kind !== "present") throw new Error("Missing delayed SESSION");
+	expect(await rows(f, SESSION)).toEqual([expect.objectContaining({ credential_hash: session.cookieHash, browser_transaction_hash: c.row.browser_transaction_hash })]);
+	expect(await authority(f)).toEqual(before);
+	await untouched(f);
+});
+
 it("admits one of eight callbacks across two actual D1 store objects", async () => {
 	// Arrange: one binding, not separate isolates or separate SQL connections.
 	const f = await setup();
@@ -328,9 +439,9 @@ it("admits one of eight callbacks across two actual D1 store objects", async () 
 	expect(results.filter(({ response }) => response.status === 303)).toHaveLength(1);
 	expect(results.filter(({ response }) => response.status === 403)).toHaveLength(7);
 	for (const result of results) {
-		expect(result.response.headers.getSetCookie()).toHaveLength(
-			result.response.status === 303 ? 2 : 0,
-		);
+		const cookies = result.response.headers.getSetCookie();
+		expect(cookies).toHaveLength(result.response.status === 303 ? 1 : 0);
+		if (result.response.status === 303) expect(cookies[0]).toMatch(/^__Host-codemem-session=/);
 		await redacted(result, c.row, c.callback.searchParams.get("code"));
 	}
 	expect(await rows(f, SESSION)).toHaveLength(1);
@@ -358,7 +469,7 @@ it("preserves victim pending material for wrong/missing cookies or wrong/missing
 	];
 	// Act
 	const results = await Promise.all(requests.map((r) => f.callbacks[0].callback(r)));
-	// Assert: only a matching consume may burn the private proofs or clear TXN.
+	// Assert: mismatched callbacks neither burn private proofs nor mutate cookies.
 	for (const result of results) {
 		expect([400, 403]).toContain(result.response.status);
 		expect(result.response.headers.getSetCookie()).toEqual([]);
@@ -404,18 +515,22 @@ it.each(["signature", "unlinked", "consume", "admission", "profile"] as const)(
 			mode
 		];
 		expect(result.response.status).toBe(status);
-		let cookies: unknown[] = [CLEAR];
-		if (mode === "consume") cookies = [];
-		if (success) cookies = [expect.stringContaining(BROWSER_COOKIE_NAMES.session), CLEAR];
+		const cookies = success ? [expect.stringMatching(/^__Host-codemem-session=[A-Za-z0-9_-]{43}; Max-Age=28800;/)] : [];
 		expect(result.response.headers.getSetCookie()).toEqual(cookies);
-		expect((await rows(f)).find((row) => row.purpose === "signin")).toMatchObject(
+		expect((await rows(f)).find((row) => row.state_hash === c.row.state_hash)).toMatchObject(
 			mode === "consume"
 				? { state: "pending", nonce: c.row.nonce, pkce_verifier: c.row.pkce_verifier }
 				: { state: "consumed", nonce: null, pkce_verifier: null },
 		);
 		expect(await rows(f, SESSION)).toHaveLength(success ? 1 : 0);
 		expect(await rows(f, PROFILE)).toEqual([]);
-		if (success) expect(result.outcome).toBe("signed_in_profile_not_recorded");
+		if (success) {
+			expect(result.outcome).toBe("signed_in_profile_not_recorded");
+			const session = await readBrowserCookie(result.response.headers.getSetCookie()[0].split(";")[0], "session");
+			if (session.kind !== "present") throw new Error("Missing committed SESSION after profile fault");
+			expect(await rows(f, SESSION)).toEqual([expect.objectContaining({ credential_hash: session.cookieHash })]);
+			expect(await f.stores[1].readAuthSession(session.cookieHash, f.config)).not.toBeNull();
+		}
 		await redacted(result, c.row, c.callback.searchParams.get("code"));
 		await untouched(f);
 	},

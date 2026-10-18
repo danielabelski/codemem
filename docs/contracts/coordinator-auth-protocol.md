@@ -160,8 +160,9 @@ its independent proof before the link becomes permanent.
 Confirm and cancel POSTs use the existing exact-Origin and CSRF guard and resolve
 the attempt through the original browser cookie. Cancellation affects only that
 attempt and explicitly retires its temporary provider material before reporting
-success or clearing the transaction cookie. A storage or cleanup fault returns
-an error without clearing the cookie; no rollback is promised after a committed
+success. Terminal responses never clear the transaction cookie: a delayed reply
+could otherwise erase a newer ceremony. A storage or cleanup fault returns
+an error without changing cookies; no rollback is promised after a committed
 failure. General maintenance runs only through an explicit operator call or
 the optional scheduled handler; no request performs a general purge.
 
@@ -184,7 +185,11 @@ Lookup faults return an unavailable response without exposing storage errors.
 An active sign-in, link, or owner-enrollment transaction still returns 409 without
 changing cookies. A missing or expired transaction, or its exact link attempt in
 `finalized`, `session_redeemed`, `failed`, or `expired` state (or past its deadline),
-allows a fresh start. Only a successful start POST replaces the old transaction
+allows a fresh start. A consumed sign-in is also inactive, whether session
+issuance succeeded or failed; replay still cannot exchange its erased provider
+proof. An authenticated management callback that fails provider verification or
+account matching fails only its own attempt, allowing a fresh ceremony without
+changing the linked account. Only a successful start POST replaces the old transaction
 cookie. Start-page responses and existing-session redirects never delete it:
 a delayed response based on an inactive snapshot must not erase a newer transaction.
 No other transaction is cancelled or modified. Account confirmation does not clear
