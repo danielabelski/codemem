@@ -39,7 +39,7 @@ async function launch() {
 }
 function linked(overrides: Partial<AccountView> = {}): AccountView {
 	return status({
-		canLink: false,
+		actions: { connect: false, disconnect: false, refresh: false },
 		remote: {
 			kind: "status",
 			coordinatorId: "coordinator-one",
@@ -47,7 +47,7 @@ function linked(overrides: Partial<AccountView> = {}): AccountView {
 			authority: "device_claim",
 			identityMatches: true,
 			state: "linked",
-			account: { email: "ada@example.test" },
+			profile: { state: "verified", verifiedAtMs: 1, ...{ email: "ada@example.test" } },
 		},
 		...overrides,
 	});
@@ -66,7 +66,7 @@ function configureFailure(fault: string): void {
 				identityId: "identity-other",
 				authority: "device_claim",
 				state: "linked",
-				account: null,
+				profile: { state: "unavailable" },
 				identityMatches: false,
 			},
 		});
@@ -139,7 +139,7 @@ describe("Viewer-owned previous-context Google popup completion", () => {
 			view = linked({ contextId: "context-other", selectedGroupId: "group-other" });
 			if (mode !== "stale poll") {
 				await tick();
-				expect(mount.textContent).toContain("Cancel previous link");
+				expect(mount.textContent).toContain("Cancel previous operation");
 			}
 			polled = operation("succeeded");
 			if (["operationId", "contextId", "groupId"].includes(outcome))
@@ -150,7 +150,7 @@ describe("Viewer-owned previous-context Google popup completion", () => {
 					: response({ version: 1, operation: polled, current: false }),
 			);
 			if (mode === "expired poll") vi.setSystemTime(new Date("2026-01-01T00:05:01Z"));
-			if (mode === "cancel") await click("Cancel previous link");
+			if (mode === "cancel") await click("Cancel previous operation");
 			else if (mode === "status" || mode === "expired poll") await click("Check status");
 			else await tick();
 			expect(popup.close).not.toHaveBeenCalled();

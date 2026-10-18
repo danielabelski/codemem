@@ -12,7 +12,7 @@ import {
 vi.mock("../lib/api/account", async (importOriginal) => ({
 	...(await importOriginal<typeof import("../lib/api/account")>()),
 	getAccountStatus: vi.fn(),
-	startAccountLink: vi.fn(),
+	startAccountOperation: vi.fn(),
 	getAccountOperation: vi.fn(),
 	getAccountBrowserUrl: vi.fn(),
 	cancelAccountLink: vi.fn(),
@@ -76,7 +76,7 @@ function assertSharingNavigation() {
 	expect(teams.getAttribute("aria-selected")).toBe("true");
 }
 function assertNoAccountWrites() {
-	expect(account.startAccountLink).not.toHaveBeenCalled();
+	expect(account.startAccountOperation).not.toHaveBeenCalled();
 	expect(account.cancelAccountLink).not.toHaveBeenCalled();
 	expect(account.getAccountBrowserUrl).not.toHaveBeenCalled();
 }
@@ -91,7 +91,10 @@ beforeEach(() => {
 		}),
 	);
 	vi.mocked(account.getAccountStatus).mockResolvedValue(status());
-	vi.mocked(account.startAccountLink).mockResolvedValue({ version: 1, operation: operation() });
+	vi.mocked(account.startAccountOperation).mockResolvedValue({
+		version: 1,
+		operation: operation(),
+	});
 	vi.mocked(account.getAccountBrowserUrl).mockResolvedValue({ version: 1, url: privateUrl });
 	vi.spyOn(window, "open").mockReturnValue(null);
 	mount = document.createElement("div");
@@ -149,7 +152,9 @@ describe("My Account inside Sharing", () => {
 			assertNoAccountWrites();
 		},
 	);
+});
 
+describe("My Account status inside Sharing", () => {
 	it.each(["pending", "unavailable", "unsupported", "review_required"] as const)(
 		"does not gate Sharing navigation or project actions on account %s",
 		async (state) => {
@@ -165,12 +170,15 @@ describe("My Account inside Sharing", () => {
 				);
 			if (state === "unsupported")
 				vi.mocked(account.getAccountStatus).mockResolvedValue(
-					status({ canLink: false, remote: { kind: "unsupported" } }),
+					status({
+						actions: { connect: false, disconnect: false, refresh: false },
+						remote: { kind: "unsupported" },
+					}),
 				);
 			if (state === "review_required")
 				vi.mocked(account.getAccountStatus).mockResolvedValue(
 					status({
-						canLink: false,
+						actions: { connect: false, disconnect: false, refresh: false },
 						remote: {
 							kind: "status",
 							coordinatorId: "coordinator-one",
@@ -178,7 +186,7 @@ describe("My Account inside Sharing", () => {
 							authority: null,
 							identityMatches: false,
 							state: "review_required",
-							account: null,
+							profile: { state: "unavailable" },
 						},
 					}),
 				);
@@ -206,7 +214,9 @@ describe("My Account inside Sharing", () => {
 				expect(card().querySelector('[role="status"]')?.textContent).toBe(
 					"This profile can’t link Google yet. Check the selected profile and group. If they’re correct, ask the person who runs the coordinator to check this device.",
 				);
-				const details = required(card().querySelector("details"));
+				const details = required(
+					card().querySelector<HTMLDetailsElement>(".recipient-policy-management-details"),
+				);
 				expect(details.open).toBe(false);
 				expect(details.querySelector("summary")?.textContent).toBe("What to check before linking");
 				const steps = [...details.querySelectorAll("ol > li")].map((step) => step.textContent);
@@ -216,9 +226,16 @@ describe("My Account inside Sharing", () => {
 				expect(card().textContent).not.toMatch(
 					/review-device-owner|enroll-owner|one-time owner review|administrator|credential/i,
 				);
-				expect(button("Link Google account").disabled).toBe(true);
+				expect(
+					[...card().querySelectorAll("button")].some(
+						(node) => node.textContent === "Link Google account",
+					),
+				).toBe(false);
 				expect(button("Check status").disabled).toBe(false);
-			} else expect(card().querySelector("details")).toBeNull();
+			} else
+				expect(
+					card().querySelector<HTMLDetailsElement>(".recipient-policy-management-details"),
+				).toBeNull();
 			assertNoAccountWrites();
 		},
 	);
@@ -231,7 +248,7 @@ describe("My Account data and lifetime inside Sharing", () => {
 			// Arrange
 			vi.mocked(account.getAccountStatus).mockResolvedValue(
 				status({
-					canLink: false,
+					actions: { connect: false, disconnect: false, refresh: false },
 					remote: {
 						kind: "status",
 						coordinatorId: "coordinator-one",
@@ -239,7 +256,11 @@ describe("My Account data and lifetime inside Sharing", () => {
 						identityMatches,
 						authority: "device_claim",
 						state: "linked",
-						account: { displayName: "Example Person", email: "fake@example.test" },
+						profile: {
+							state: "verified",
+							verifiedAtMs: 1,
+							...{ displayName: "Example Person", email: "fake@example.test" },
+						},
 					},
 				}),
 			);
@@ -250,7 +271,11 @@ describe("My Account data and lifetime inside Sharing", () => {
 			expect(card().textContent?.includes("Example Person")).toBe(identityMatches);
 			for (const text of ["Local identity", "Laptop", "https://coordinator.example"])
 				expect(card().textContent).toContain(text);
-			expect(button("Link Google account").disabled).toBe(true);
+			expect(
+				[...card().querySelectorAll("button")].some(
+					(node) => node.textContent === "Link Google account",
+				),
+			).toBe(false);
 			expect(card().querySelector("input, select, textarea")).toBeNull();
 			expect(card().textContent).not.toMatch(/rename|unlink|administrator/i);
 			assertNoAccountWrites();
@@ -261,11 +286,17 @@ describe("My Account data and lifetime inside Sharing", () => {
 		"honors server canLink=%s without automatically starting",
 		async (canLink) => {
 			// Arrange
-			vi.mocked(account.getAccountStatus).mockResolvedValue(status({ canLink }));
+			vi.mocked(account.getAccountStatus).mockResolvedValue(
+				status({ actions: { connect: canLink, disconnect: false, refresh: false } }),
+			);
 			// Act
 			await show();
 			// Assert
-			expect(button("Link Google account").disabled).toBe(!canLink);
+			expect(
+				[...card().querySelectorAll("button")].some(
+					(node) => node.textContent === "Link Google account",
+				),
+			).toBe(canLink);
 			expect(window.open).not.toHaveBeenCalled();
 			assertNoAccountWrites();
 		},
@@ -273,7 +304,7 @@ describe("My Account data and lifetime inside Sharing", () => {
 
 	it("retains an active account flow and private URL delivery across Sharing rerenders", async () => {
 		// Arrange
-		vi.mocked(account.startAccountLink).mockResolvedValue({
+		vi.mocked(account.startAccountOperation).mockResolvedValue({
 			version: 1,
 			operation: operation("awaiting_browser"),
 		});
@@ -287,10 +318,10 @@ describe("My Account data and lifetime inside Sharing", () => {
 		expect(button("Cancel linking").disabled).toBe(false);
 		expect(button("Open Google sign-in")).toBeTruthy();
 		expect(account.getAccountStatus).toHaveBeenCalledTimes(1);
-		expect(account.startAccountLink).toHaveBeenCalledExactlyOnceWith(
+		expect(account.startAccountOperation).toHaveBeenCalledExactlyOnceWith(
 			"group-one",
 			"context-one",
-			{ authority: "device_claim", coordinatorId: "coordinator-one" },
+			{ authority: "device_claim", coordinatorId: "coordinator-one", intent: "connect" },
 			expect.any(AbortSignal),
 		);
 		expect(account.getAccountBrowserUrl).toHaveBeenCalledTimes(1);

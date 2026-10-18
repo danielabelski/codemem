@@ -66,14 +66,17 @@ afterEach(() => {
 describe("My Account conflict transport recovery", () => {
 	it("recovers an active conflict from status after a transient operation GET failure", async () => {
 		await probe();
-		view = status({ operation: operation("awaiting_browser"), canLink: false });
+		view = status({
+			operation: operation("awaiting_browser"),
+			actions: { connect: false, disconnect: false, refresh: false },
+		});
 		transport
 			.mockResolvedValueOnce(
 				response({ error: "account_link_in_progress", operationId: "op-one" }, 409),
 			)
 			.mockRejectedValueOnce(new TypeError("private-operation-failure"));
 		await act(async () => {
-			await flow.link();
+			await flow.begin("connect");
 		});
 		await settle();
 		expect(flow.operation).toEqual(view.operation);
@@ -96,14 +99,17 @@ describe("My Account conflict transport recovery", () => {
 			const candidate = operation("awaiting_browser");
 			if (mismatch === "context") candidate.contextId = "other-context";
 			else candidate.groupId = "other-group";
-			view = status({ operation: candidate, canLink: false });
+			view = status({
+				operation: candidate,
+				actions: { connect: false, disconnect: false, refresh: false },
+			});
 			transport
 				.mockResolvedValueOnce(
 					response({ error: "account_link_in_progress", operationId: "op-one" }, 409),
 				)
 				.mockRejectedValueOnce(new TypeError("private-operation-failure"));
 			await act(async () => {
-				await flow.link();
+				await flow.begin("connect");
 			});
 			await settle();
 			await tick();
@@ -126,7 +132,10 @@ describe("My Account stale work and conflict safety", () => {
 			const candidate = operation(mode === "finished" ? "succeeded" : "starting");
 			if (mode === "wrong-context") candidate.contextId = "old-context";
 			if (mode === "wrong-group") candidate.groupId = "other-group";
-			view = status({ operation: candidate, canLink: false });
+			view = status({
+				operation: candidate,
+				actions: { connect: false, disconnect: false, refresh: false },
+			});
 			view.checkedAt = "2026-01-01T00:01:00Z";
 			transport.mockImplementation(async (url, options) => {
 				if (String(url).endsWith("link-operations") && options?.method === "POST")
@@ -137,7 +146,7 @@ describe("My Account stale work and conflict safety", () => {
 			});
 			// Act
 			await act(async () => {
-				await flow.link();
+				await flow.begin("connect");
 			});
 			await settle();
 			// Assert: the conflict response alone is never authority to resume a job.
@@ -158,8 +167,8 @@ describe("My Account stale work and conflict safety", () => {
 		transport.mockImplementationOnce(() => startResponse.promise);
 		// Act: both calls precede the state rerender.
 		await act(async () => {
-			const first = flow.link();
-			const second = flow.link();
+			const first = flow.begin("connect");
+			const second = flow.begin("connect");
 			startResponse.resolve(response({ version: 1, operation: operation() }));
 			await Promise.all([first, second]);
 		});
@@ -184,7 +193,10 @@ describe("My Account stale work and conflict safety", () => {
 	});
 	it("clears the cached private URL when the selected group changes", async () => {
 		// Arrange
-		view = status({ operation: operation("awaiting_browser"), canLink: false });
+		view = status({
+			operation: operation("awaiting_browser"),
+			actions: { connect: false, disconnect: false, refresh: false },
+		});
 		await probe();
 		expect(flow.fallback).toBe(true);
 		view = status({ contextId: "context-two", selectedGroupId: "group-two" });
@@ -197,7 +209,10 @@ describe("My Account stale work and conflict safety", () => {
 	});
 	it("discards a late old-job result after changing context", async () => {
 		// Arrange
-		view = status({ operation: operation(), canLink: false });
+		view = status({
+			operation: operation(),
+			actions: { connect: false, disconnect: false, refresh: false },
+		});
 		await probe();
 		const late = deferred<Response>();
 		transport.mockImplementationOnce(() => late.promise);
@@ -221,7 +236,10 @@ describe("My Account polling generation and local cleanup", () => {
 	it("rejects an old timer fired after group selection but before effect cleanup", async () => {
 		// Arrange
 		const timers = vi.spyOn(window, "setTimeout");
-		view = status({ operation: operation(), canLink: false });
+		view = status({
+			operation: operation(),
+			actions: { connect: false, disconnect: false, refresh: false },
+		});
 		await probe();
 		const callback = timers.mock.calls.find(([, delay]) => delay === 1000)?.[0];
 		if (typeof callback !== "function") throw new Error("Missing operation timer");
@@ -266,7 +284,10 @@ describe("My Account polling generation and local cleanup", () => {
 
 describe("My Account cancellation and terminal privacy", () => {
 	it("sends one cancellation for two calls before rerender without aborting it", async () => {
-		view = status({ operation: operation(), canLink: false });
+		view = status({
+			operation: operation(),
+			actions: { connect: false, disconnect: false, refresh: false },
+		});
 		await probe();
 		const pending = deferred<Response>();
 		transport.mockImplementationOnce(() => pending.promise);
@@ -282,7 +303,10 @@ describe("My Account cancellation and terminal privacy", () => {
 		expect(flow.busy).toBe(false);
 	});
 	it("does not let an old cancellation release a newer generation's cancellation", async () => {
-		view = status({ operation: operation(), canLink: false });
+		view = status({
+			operation: operation(),
+			actions: { connect: false, disconnect: false, refresh: false },
+		});
 		await probe();
 		const old = deferred<Response>();
 		transport.mockImplementationOnce(() => old.promise);
@@ -316,7 +340,10 @@ describe("My Account cancellation and terminal privacy", () => {
 	});
 	it("does not duplicate a pending cancellation and redacts a lost cancellation reply", async () => {
 		// Arrange
-		view = status({ operation: operation(), canLink: false });
+		view = status({
+			operation: operation(),
+			actions: { connect: false, disconnect: false, refresh: false },
+		});
 		await probe();
 		const pending = deferred<Response>();
 		transport.mockImplementationOnce(() => pending.promise);
@@ -340,11 +367,17 @@ describe("My Account cancellation and terminal privacy", () => {
 		"clears a cached browser URL and stops polling on %s",
 		async (state) => {
 			// Arrange
-			view = status({ operation: operation("awaiting_browser"), canLink: false });
+			view = status({
+				operation: operation("awaiting_browser"),
+				actions: { connect: false, disconnect: false, refresh: false },
+			});
 			await probe();
 			const terminal = { ...operation(state), browserUrlAvailable: false, failure: null };
 			transport.mockResolvedValueOnce(response({ version: 1, current: true, operation: terminal }));
-			view = status({ operation: terminal, canLink: false });
+			view = status({
+				operation: terminal,
+				actions: { connect: false, disconnect: false, refresh: false },
+			});
 			// Act
 			await tick();
 			act(() => flow.openFallback());
@@ -352,7 +385,7 @@ describe("My Account cancellation and terminal privacy", () => {
 			// Assert
 			expect(window.open).not.toHaveBeenCalled();
 			expect(flow.fallback).toBe(false);
-			expect(flow.operation).toEqual(terminal);
+			expect(flow.operation).toEqual(state === "outcome_unknown" ? null : terminal);
 			expect(calls("/op-one")).toHaveLength(1);
 			expect(calls("browser-url")).toHaveLength(1);
 		},
@@ -365,7 +398,7 @@ describe("My Account verified status precedence", () => {
 		async (state) => {
 			// Arrange: registry TTL may retain a terminal record after verified completion.
 			view = status({
-				canLink: false,
+				actions: { connect: false, disconnect: false, refresh: false },
 				operation: operation(state),
 				remote: {
 					kind: "status",
@@ -374,7 +407,7 @@ describe("My Account verified status precedence", () => {
 					authority: "device_claim",
 					identityMatches: true,
 					state: "linked",
-					account: { email: "verified@example.test" },
+					profile: { state: "verified", verifiedAtMs: 1, ...{ email: "verified@example.test" } },
 				},
 			});
 			// Act
@@ -395,7 +428,11 @@ describe("My Account pending request cleanup", () => {
 		"aborts pending %s on unmount without cancelling the backend job",
 		async (mode) => {
 			// Arrange
-			if (mode === "cancel") view = status({ operation: operation(), canLink: false });
+			if (mode === "cancel")
+				view = status({
+					operation: operation(),
+					actions: { connect: false, disconnect: false, refresh: false },
+				});
 			await probe();
 			const blank = { opener: {}, closed: false, close: vi.fn() };
 			vi.mocked(window.open).mockReturnValue(blank as unknown as Window);
@@ -414,7 +451,7 @@ describe("My Account pending request cleanup", () => {
 			// Act
 			let action!: Promise<void>;
 			act(() => {
-				action = mode === "cancel" ? flow.cancel() : flow.link();
+				action = mode === "cancel" ? flow.cancel() : flow.begin("connect");
 			});
 			await settle();
 			const signal = transport.mock.calls.at(-1)?.[1]?.signal;
@@ -435,7 +472,10 @@ describe("My Account pending request cleanup", () => {
 describe("My Account uncertain transport recovery", () => {
 	it("keeps an old-context cancellation handle through drift and an unavailable refresh", async () => {
 		vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
-		view = status({ operation: operation("awaiting_browser"), canLink: false });
+		view = status({
+			operation: operation("awaiting_browser"),
+			actions: { connect: false, disconnect: false, refresh: false },
+		});
 		await probe();
 		transport
 			.mockResolvedValueOnce(response({ operation: operation("awaiting_browser"), current: false }))
@@ -444,7 +484,11 @@ describe("My Account uncertain transport recovery", () => {
 		expect(flow.operation).toBeNull();
 		expect(flow.pendingOperation?.operationId).toBe("op-one");
 		expect(flow.fallback).toBe(false);
-		view = status({ contextId: "context-two", selectedGroupId: "group-two", canLink: false });
+		view = status({
+			contextId: "context-two",
+			selectedGroupId: "group-two",
+			actions: { connect: false, disconnect: false, refresh: false },
+		});
 		await act(async () => {
 			await flow.refresh();
 		});
@@ -464,7 +508,10 @@ describe("My Account uncertain transport recovery", () => {
 		"clears a previous handle only after confirmed %s",
 		async (mode) => {
 			vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
-			view = status({ operation: operation(), canLink: false });
+			view = status({
+				operation: operation(),
+				actions: { connect: false, disconnect: false, refresh: false },
+			});
 			await probe();
 			transport.mockResolvedValueOnce(response({ operation: operation(), current: false }));
 			view = status({ contextId: "context-two", selectedGroupId: "group-two" });
@@ -488,7 +535,12 @@ describe("My Account configuration recovery", () => {
 		await probe();
 		await chooseGroup("group-one");
 		transport.mockResolvedValueOnce(response({ error: "account_group_not_configured" }, 400));
-		view = status({ groups: [], selectedGroupId: null, contextId: null, canLink: false });
+		view = status({
+			groups: [],
+			selectedGroupId: null,
+			contextId: null,
+			actions: { connect: false, disconnect: false, refresh: false },
+		});
 		await act(async () => {
 			await flow.refresh();
 		});
@@ -580,12 +632,15 @@ describe("My Account previous-context outcomes", () => {
 		async (path, state, notice, statusCode) => {
 			// Arrange: the terminal reply must precede the fresh status success or failure.
 			vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
-			view = status({ operation: operation(), canLink: false });
+			view = status({
+				operation: operation(),
+				actions: { connect: false, disconnect: false, refresh: false },
+			});
 			await probe();
 			view = status({
 				contextId: "new-context",
 				selectedGroupId: "new-group",
-				canLink: false,
+				actions: { connect: false, disconnect: false, refresh: false },
 				remote: {
 					kind: "status",
 					coordinatorId: "coordinator-one",
@@ -593,7 +648,7 @@ describe("My Account previous-context outcomes", () => {
 					authority: "device_claim",
 					state: "linked",
 					identityMatches: true,
-					account: { email: "new@example.test" },
+					profile: { state: "verified", verifiedAtMs: 1, ...{ email: "new@example.test" } },
 				},
 			});
 			if (path === "pending-poll" || path === "previous-cancel") {
@@ -644,14 +699,20 @@ describe("My Account previous-context outcomes", () => {
 describe("My Account transient polling continuity", () => {
 	it("requires fresh current status after recovery and never delivers a URL from an uncertain operation", async () => {
 		vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
-		view = status({ operation: operation(), canLink: false });
+		view = status({
+			operation: operation(),
+			actions: { connect: false, disconnect: false, refresh: false },
+		});
 		await probe();
 		transport.mockRejectedValueOnce(new TypeError("offline"));
 		await tick();
 		transport.mockResolvedValueOnce(
 			response({ operation: operation("awaiting_browser"), current: true }),
 		);
-		view = status({ operation: operation("awaiting_browser"), canLink: false });
+		view = status({
+			operation: operation("awaiting_browser"),
+			actions: { connect: false, disconnect: false, refresh: false },
+		});
 		await tick();
 		expect(flow.pendingOperation).toBeNull();
 		expect(flow.operation?.state).toBe("awaiting_browser");
@@ -663,7 +724,10 @@ describe("My Account transient polling continuity", () => {
 	});
 	it("retries transient polls after an uncertain cancellation without replaying capabilities", async () => {
 		vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
-		view = status({ operation: operation("awaiting_browser"), canLink: false });
+		view = status({
+			operation: operation("awaiting_browser"),
+			actions: { connect: false, disconnect: false, refresh: false },
+		});
 		await probe();
 		transport.mockRejectedValueOnce(new TypeError("lost cancel"));
 		await act(async () => {
@@ -687,7 +751,10 @@ describe("My Account transient polling continuity", () => {
 	});
 	it("stops automatic retries at the operation deadline without discarding cancellation", async () => {
 		vi.setSystemTime(new Date("2026-01-01T00:04:59Z"));
-		view = status({ operation: operation(), canLink: false });
+		view = status({
+			operation: operation(),
+			actions: { connect: false, disconnect: false, refresh: false },
+		});
 		await probe();
 		transport.mockRejectedValueOnce(new TypeError("offline"));
 		await tick();
@@ -698,42 +765,43 @@ describe("My Account transient polling continuity", () => {
 	});
 });
 
+const notice =
+	"The earlier link finished for its original Identity. Check status there to confirm.";
+const retainExpiredPrevious = async () => {
+	vi.setSystemTime(new Date("2026-01-01T00:04:59Z"));
+	view = status({
+		operation: operation(),
+		actions: { connect: false, disconnect: false, refresh: false },
+	});
+	await probe();
+	view = status({
+		contextId: "new-context",
+		selectedGroupId: "new-group",
+		actions: { connect: false, disconnect: false, refresh: false },
+		remote: {
+			kind: "status",
+			coordinatorId: "coordinator-one",
+			identityId: "new-identity",
+			authority: "device_claim",
+			state: "linked",
+			identityMatches: true,
+			profile: { state: "verified", verifiedAtMs: 1, ...{ email: "new@example.test" } },
+		},
+	});
+	transport.mockResolvedValueOnce(response({ operation: operation(), current: false }));
+	await tick();
+	await tick();
+	expect(flow.pendingOperation?.operationId).toBe("op-one");
+	expect(calls("/op-one")).toHaveLength(1);
+};
+const expectReadOnly = () => {
+	expect(transport.mock.calls.filter(([, options]) => options?.method === "POST")).toHaveLength(0);
+	expect(calls("browser-url")).toHaveLength(0);
+	expect(window.open).not.toHaveBeenCalled();
+	expect(flow.operation).toBeNull();
+	expect(flow.fallback).toBe(false);
+};
 describe("My Account expired previous-operation manual recovery", () => {
-	const notice =
-		"The earlier link finished for its original Identity. Check status there to confirm.";
-	const retainExpiredPrevious = async () => {
-		vi.setSystemTime(new Date("2026-01-01T00:04:59Z"));
-		view = status({ operation: operation(), canLink: false });
-		await probe();
-		view = status({
-			contextId: "new-context",
-			selectedGroupId: "new-group",
-			canLink: false,
-			remote: {
-				kind: "status",
-				coordinatorId: "coordinator-one",
-				identityId: "new-identity",
-				authority: "device_claim",
-				state: "linked",
-				identityMatches: true,
-				account: { email: "new@example.test" },
-			},
-		});
-		transport.mockResolvedValueOnce(response({ operation: operation(), current: false }));
-		await tick();
-		await tick();
-		expect(flow.pendingOperation?.operationId).toBe("op-one");
-		expect(calls("/op-one")).toHaveLength(1);
-	};
-	const expectReadOnly = () => {
-		expect(transport.mock.calls.filter(([, options]) => options?.method === "POST")).toHaveLength(
-			0,
-		);
-		expect(calls("browser-url")).toHaveLength(0);
-		expect(window.open).not.toHaveBeenCalled();
-		expect(flow.operation).toBeNull();
-		expect(flow.fallback).toBe(false);
-	};
 	it.each([200, 503])(
 		"checks the expired old ID once and retains its success notice when current status returns %s",
 		async (statusCode) => {
@@ -765,6 +833,9 @@ describe("My Account expired previous-operation manual recovery", () => {
 			expectReadOnly();
 		},
 	);
+});
+
+describe("My Account expired previous-operation uncertainty", () => {
 	it.each(["active", "missing", "unavailable"] as const)(
 		"handles an expired manual operation read that is %s without restarting automatic retries",
 		async (outcome) => {
@@ -827,7 +898,10 @@ describe("My Account expired previous-operation manual recovery", () => {
 
 describe("My Account uncertain transport privacy", () => {
 	it("does not let a late previous cancellation clear or unlock a newer cancellation", async () => {
-		view = status({ operation: operation(), canLink: false });
+		view = status({
+			operation: operation(),
+			actions: { connect: false, disconnect: false, refresh: false },
+		});
 		await probe();
 		transport.mockRejectedValueOnce(new TypeError("offline"));
 		await tick();
@@ -868,7 +942,7 @@ describe("My Account uncertain transport privacy", () => {
 			response({ version: 1, operation: operation("awaiting_browser") }, 202),
 		);
 		await act(async () => {
-			await flow.link();
+			await flow.begin("connect");
 		});
 		await settle();
 		expect(flow.fallback).toBe(true);
@@ -877,7 +951,7 @@ describe("My Account uncertain transport privacy", () => {
 		await tick();
 		act(() => flow.openFallback());
 		await act(async () => {
-			await flow.link();
+			await flow.begin("connect");
 		});
 		// Assert: old unlinked status cannot authorize another start or cached browser URL.
 		expect(flow.view).toBeNull();
@@ -895,17 +969,20 @@ describe("My Account uncertain transport privacy", () => {
 			await flow.refresh();
 		});
 		await settle();
-		expect(flow.view?.canLink).toBe(true);
+		expect(flow.view?.actions.connect).toBe(true);
 		expect(calls("link-status")).toHaveLength(2);
 	});
 	it("recovers a lost start reply through fresh status without replaying the POST", async () => {
 		// Arrange
 		await probe();
-		view = status({ operation: operation(), canLink: false });
+		view = status({
+			operation: operation(),
+			actions: { connect: false, disconnect: false, refresh: false },
+		});
 		transport.mockRejectedValueOnce(new TypeError("lost-private-reply"));
 		// Act
 		await act(async () => {
-			await flow.link();
+			await flow.begin("connect");
 		});
 		await settle();
 		// Assert
@@ -923,7 +1000,10 @@ describe("My Account uncertain transport privacy", () => {
 describe("My Account cancellation supersedes local delivery", () => {
 	it("keeps cancellation pending when replacing the operation aborts an old poll", async () => {
 		// Arrange
-		view = status({ operation: operation("awaiting_browser"), canLink: false });
+		view = status({
+			operation: operation("awaiting_browser"),
+			actions: { connect: false, disconnect: false, refresh: false },
+		});
 		await probe();
 		transport.mockImplementationOnce(
 			(_url, options) =>
@@ -964,7 +1044,7 @@ describe("My Account cancellation supersedes local delivery", () => {
 			.mockResolvedValueOnce(response({ version: 1, operation: operation("awaiting_browser") }))
 			.mockImplementationOnce(() => url.promise);
 		await act(async () => {
-			await flow.link();
+			await flow.begin("connect");
 		});
 		await settle();
 		transport.mockImplementationOnce(() => cancel.promise);
@@ -1018,7 +1098,7 @@ describe("My Account reserved blank cleanup", () => {
 				);
 			// Act
 			await act(async () => {
-				await flow.link();
+				await flow.begin("connect");
 			});
 			await settle();
 			// Assert
@@ -1026,9 +1106,231 @@ describe("My Account reserved blank cleanup", () => {
 			expect(popup.location.replace).not.toHaveBeenCalled();
 			expect(flow.fallback).toBe(false);
 			expect(flow.message).toBe(
-				"Google sign-in could not be opened. Cancel linking, or wait for status to update.",
+				"Google sign-in could not be opened. Cancel the account operation, or check status.",
 			);
 			expect(flow.message).not.toContain("private-url-details");
 		},
 	);
+});
+
+describe("retained terminal operation reconciliation", () => {
+	it("clears an adopted pending operation once status reports its terminal receipt", async () => {
+		const old = { ...operation("awaiting_browser"), intent: "disconnect" as const };
+		view = status({
+			operation: old,
+			actions: { connect: false, disconnect: false, refresh: false },
+		});
+		await probe();
+		view = status({
+			contextId: "context-two",
+			selectedGroupId: "group-two",
+			groups: ["group-one", "group-two"],
+		});
+		await chooseGroup("group-two");
+		expect(flow.pendingOperation?.operationId).toBe(old.operationId);
+		view = { ...view, operation: { ...old, state: "succeeded" } };
+		await act(async () => {
+			await flow.refresh();
+		});
+		await settle();
+		expect(flow.pendingOperation).toBeNull();
+		expect(flow.operation).toBeNull();
+		const next = { ...operation("starting"), contextId: "context-two", groupId: "group-two" };
+		transport.mockResolvedValueOnce(response({ version: 1, operation: next }));
+		await act(async () => {
+			await flow.begin("connect");
+		});
+		expect(calls("link-operations")).toHaveLength(1);
+	});
+});
+
+describe("account operation uncertainty and status race", () => {
+	it("keeps a running connect visible when a linked status arrives before the local receipt", async () => {
+		const running = operation("awaiting_browser");
+		view = status({
+			operation: running,
+			actions: { connect: false, disconnect: false, refresh: false },
+			remote: {
+				kind: "status",
+				coordinatorId: "coordinator-one",
+				identityId: "identity-one",
+				authority: "device_claim",
+				identityMatches: true,
+				state: "linked",
+				profile: { state: "verified", verifiedAtMs: 1, email: "person@example.test" },
+			},
+		});
+		await probe();
+		expect(flow.operation).toEqual(running);
+		expect(flow.message).not.toMatch(/linked|success/i);
+		transport.mockResolvedValueOnce(response({ version: 1, operation: running, current: true }));
+		await tick();
+		expect(calls("/op-one")).toHaveLength(1);
+		expect(flow.operation?.state).toBe("awaiting_browser");
+	});
+	it("holds a polled unknown outcome through failed status and settles it on a fresh trusted status", async () => {
+		const running = { ...operation("awaiting_browser"), intent: "disconnect" as const };
+		view = status({
+			operation: running,
+			actions: { connect: false, disconnect: false, refresh: false },
+			remote: {
+				kind: "status",
+				coordinatorId: "coordinator-one",
+				identityId: "identity-one",
+				authority: "device_claim",
+				identityMatches: true,
+				state: "linked",
+				profile: { state: "unavailable" },
+			},
+		});
+		await probe();
+		const unknown = { ...running, state: "outcome_unknown" as const };
+		transport
+			.mockResolvedValueOnce(response({ version: 1, operation: unknown, current: true }))
+			.mockRejectedValueOnce(new TypeError("status lost"));
+		await tick();
+		expect(flow.view).toBeNull();
+		expect(flow.message).toContain("Check status");
+		await act(async () => {
+			await flow.begin("disconnect");
+		});
+		expect(calls("link-operations")).toHaveLength(0);
+		view = status({
+			operation: unknown,
+			actions: { connect: false, disconnect: true, refresh: true },
+			remote: {
+				kind: "status",
+				coordinatorId: "coordinator-one",
+				identityId: "identity-one",
+				authority: "device_claim",
+				identityMatches: true,
+				state: "linked",
+				profile: { state: "unavailable" },
+			},
+		});
+		await act(async () => {
+			await flow.refresh();
+		});
+		expect(flow.view).toEqual(view);
+		expect(flow.operation).toBeNull();
+		const next = { ...operation("starting"), intent: "disconnect" as const };
+		transport.mockResolvedValueOnce(response({ version: 1, operation: next }));
+		await act(async () => {
+			await flow.begin("disconnect");
+		});
+		expect(calls("link-operations")).toHaveLength(1);
+	});
+});
+
+describe("unknown outcome status fences", () => {
+	it("does not start a second intent while a cancellation outcome awaits its status response", async () => {
+		const running = { ...operation("awaiting_browser"), intent: "disconnect" as const };
+		view = status({
+			operation: running,
+			actions: { connect: false, disconnect: true, refresh: true },
+			remote: {
+				kind: "status",
+				coordinatorId: "coordinator-one",
+				identityId: "identity-one",
+				authority: "device_claim",
+				identityMatches: true,
+				state: "linked",
+				profile: { state: "unavailable" },
+			},
+		});
+		await probe();
+		const delayedStatus = deferred<Response>();
+		transport
+			.mockResolvedValueOnce(
+				response({ version: 1, operation: { ...running, state: "outcome_unknown" } }),
+			)
+			.mockImplementationOnce(() => delayedStatus.promise);
+		await act(async () => {
+			await flow.cancel();
+		});
+		await settle();
+		expect(flow.view).toBeNull();
+		await act(async () => {
+			await flow.begin("disconnect");
+		});
+		expect(calls("link-operations")).toHaveLength(0);
+		delayedStatus.resolve(response({ error: "account_status_unavailable" }, 503));
+		await settle();
+		expect(flow.view).toBeNull();
+		await act(async () => {
+			await flow.begin("disconnect");
+		});
+		expect(calls("link-operations")).toHaveLength(0);
+	});
+	it("keeps old-context uncertainty blocked when fresh status belongs to another group", async () => {
+		view = status({
+			operation: { ...operation("outcome_unknown"), intent: "disconnect" },
+			actions: { connect: false, disconnect: true, refresh: true },
+			remote: {
+				kind: "status",
+				coordinatorId: "coordinator-one",
+				identityId: "identity-one",
+				authority: "device_claim",
+				identityMatches: true,
+				state: "linked",
+				profile: { state: "unavailable" },
+			},
+		});
+		await probe();
+		// First status reconciles its own context; a new local uncertain reply must then be retained on a group change.
+		view = status({
+			operation: { ...operation("awaiting_browser"), intent: "disconnect" },
+			actions: { connect: false, disconnect: false, refresh: false },
+		});
+		await act(async () => {
+			await flow.refresh();
+		});
+		view = status({
+			contextId: "context-two",
+			selectedGroupId: "group-two",
+			groups: ["group-one", "group-two"],
+		});
+		await chooseGroup("group-two");
+		expect(flow.pendingOperation?.contextId).toBe("context-one");
+		await act(async () => {
+			await flow.begin("connect");
+		});
+		expect(calls("link-operations")).toHaveLength(0);
+	});
+});
+
+describe("fresh status clears retained uncertainty", () => {
+	it("releases same-context pending unknown even when the fresh status retains another terminal record", async () => {
+		view = status({
+			operation: { ...operation("outcome_unknown"), intent: "refresh" },
+			actions: { connect: false, disconnect: false, refresh: false },
+			remote: { kind: "unavailable", code: "coordinator_unavailable" },
+		});
+		await probe();
+		expect(flow.operation?.state).toBe("outcome_unknown");
+		view = status({
+			operation: { ...operation("outcome_unknown"), operationId: "op-new", intent: "refresh" },
+			actions: { connect: false, disconnect: true, refresh: true },
+			remote: {
+				kind: "status",
+				coordinatorId: "coordinator-one",
+				identityId: "identity-one",
+				authority: "device_claim",
+				identityMatches: true,
+				state: "linked",
+				profile: { state: "unavailable" },
+			},
+		});
+		await act(async () => {
+			await flow.refresh();
+		});
+		expect(flow.pendingOperation).toBeNull();
+		expect(flow.operation).toBeNull();
+		const next = { ...operation("starting"), intent: "refresh" as const };
+		transport.mockResolvedValueOnce(response({ version: 1, operation: next }));
+		await act(async () => {
+			await flow.begin("refresh");
+		});
+		expect(calls("link-operations")).toHaveLength(1);
+	});
 });

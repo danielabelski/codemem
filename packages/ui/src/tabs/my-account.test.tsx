@@ -92,7 +92,7 @@ describe("My Account safe operator review guidance", () => {
 		view = status({
 			selectedGroupId: groupId,
 			groups: [groupId],
-			canLink: false,
+			actions: { connect: false, disconnect: false, refresh: false },
 			remote: {
 				kind: "status",
 				coordinatorId: "coordinator-one",
@@ -100,7 +100,7 @@ describe("My Account safe operator review guidance", () => {
 				authority: null,
 				identityMatches: false,
 				state: "review_required",
-				account: {},
+				profile: { state: "verified", verifiedAtMs: 1 },
 			},
 		});
 		// Act
@@ -115,7 +115,7 @@ describe("My Account safe operator review guidance", () => {
 		);
 		expect(mount.querySelector("code")).toBeNull();
 		expect(mount.textContent).not.toContain(groupId);
-		expect(button("Link Google account").disabled).toBe(true);
+		expect(buttons().some((node) => node.textContent === "Link Google account")).toBe(false);
 	});
 });
 
@@ -123,7 +123,7 @@ describe("My Account optional device review instructions", () => {
 	it("keeps device recovery separate from the short live status without admin onboarding", async () => {
 		// Arrange
 		view = status({
-			canLink: false,
+			actions: { connect: false, disconnect: false, refresh: false },
 			remote: {
 				kind: "status",
 				coordinatorId: "coordinator-one",
@@ -131,7 +131,7 @@ describe("My Account optional device review instructions", () => {
 				identityMatches: false,
 				authority: null,
 				state: "review_required",
-				account: null,
+				profile: { state: "unavailable" },
 			},
 		});
 		// Act
@@ -163,13 +163,13 @@ describe("My Account optional device review instructions", () => {
 		expect(outsideInstructions.textContent).not.toMatch(
 			/review-device-owner|database|config|keys directory|Confirmation defaults/,
 		);
-		expect(button("Link Google account").disabled).toBe(true);
+		expect(buttons().some((node) => node.textContent === "Link Google account")).toBe(false);
 		expect(button("Check status").disabled).toBe(false);
 	});
 	it("opens and closes native instructions without requests or account actions", async () => {
 		// Arrange
 		view = status({
-			canLink: false,
+			actions: { connect: false, disconnect: false, refresh: false },
 			remote: {
 				kind: "status",
 				coordinatorId: "coordinator-one",
@@ -177,11 +177,11 @@ describe("My Account optional device review instructions", () => {
 				identityMatches: false,
 				state: "review_required",
 				authority: null,
-				account: null,
+				profile: { state: "unavailable" },
 			},
 		});
 		await show();
-		const details = mount.querySelector("details");
+		const details = mount.querySelector<HTMLDetailsElement>(".recipient-policy-management-details");
 		const summary = details?.querySelector("summary");
 		if (!details || !summary) throw new Error("Missing native review disclosure");
 		const initialRequests = transport.mock.calls.length;
@@ -193,7 +193,7 @@ describe("My Account optional device review instructions", () => {
 		expect(transport).toHaveBeenCalledTimes(initialRequests);
 		expect(window.open).not.toHaveBeenCalled();
 		expect(transport.mock.calls.some(([, options]) => options?.method === "POST")).toBe(false);
-		expect(button("Link Google account").disabled).toBe(true);
+		expect(buttons().some((node) => node.textContent === "Link Google account")).toBe(false);
 		expect(button("Check status").disabled).toBe(false);
 		// Act: closing the instructions must be equally read-only.
 		await act(async () => summary.click());
@@ -235,10 +235,12 @@ describe("My Account unavailable recovery", () => {
 		"gives actionable %s guidance without automatically linking or polling",
 		async (code, reason, action, helper) => {
 			// Arrange: unavailable status cannot prove whether Google is linked.
-			view = status({ canLink: false, remote: { kind: "unavailable", code } });
-			// Act: elapsed time and a disabled link click must not trigger account work.
+			view = status({
+				actions: { connect: false, disconnect: false, refresh: false },
+				remote: { kind: "unavailable", code },
+			});
+			// Act: elapsed time without a permitted action must not trigger account work.
 			await show();
-			await click("Link Google account");
 			await tick();
 			await tick();
 			// Assert: each known reason has its own safe recovery, not a generic retry.
@@ -250,7 +252,7 @@ describe("My Account unavailable recovery", () => {
 			expect(text).not.toMatch(
 				/No Google account is linked|This Google account is linked|review-device-owner/,
 			);
-			expect(button("Link Google account").disabled).toBe(true);
+			expect(buttons().some((node) => node.textContent === "Link Google account")).toBe(false);
 			expect(calls("link-status")).toHaveLength(1);
 			expect(transport.mock.calls.some(([, options]) => options?.method === "POST")).toBe(false);
 			expect(window.open).not.toHaveBeenCalled();
@@ -260,7 +262,10 @@ describe("My Account unavailable recovery", () => {
 		"uses a fixed safe fallback for unknown unavailable reason %s",
 		async (code) => {
 			// Arrange: future or malicious reason strings are not display copy.
-			view = status({ canLink: false, remote: { kind: "unavailable", code } });
+			view = status({
+				actions: { connect: false, disconnect: false, refresh: false },
+				remote: { kind: "unavailable", code },
+			});
 			// Act
 			await show();
 			await tick();
@@ -270,7 +275,7 @@ describe("My Account unavailable recovery", () => {
 			expect(mount.querySelector('[role="status"]')?.textContent).toMatch(
 				/check|operator|person who runs/i,
 			);
-			expect(button("Link Google account").disabled).toBe(true);
+			expect(buttons().some((node) => node.textContent === "Link Google account")).toBe(false);
 			expect(calls("link-status")).toHaveLength(1);
 			expect(transport.mock.calls.some(([, options]) => options?.method === "POST")).toBe(false);
 			expect(window.open).not.toHaveBeenCalled();
@@ -281,22 +286,28 @@ describe("My Account unavailable recovery", () => {
 describe("My Account read-only status", () => {
 	it("explains a foreign active operation without exposing its details or enabling linking", async () => {
 		// Arrange: the selected group's unlinked status is not permission to start another job.
-		view = status({ blockedReason: "operation_active", operation: null, canLink: false });
+		view = status({
+			blockedReason: "operation_active",
+			operation: null,
+			actions: { connect: false, disconnect: false, refresh: false },
+		});
 		// Act
 		await show();
 		// Assert
-		expect(mount.textContent).toContain("Another account link is running in this Viewer");
-		expect(button("Link Google account").disabled).toBe(true);
+		expect(mount.textContent).toContain("Another account operation is running in this Viewer");
+		expect(buttons().some((node) => node.textContent === "Link Google account")).toBe(false);
 		expect(buttons().some((node) => node.textContent === "Cancel linking")).toBe(false);
 		expect(mount.innerHTML).not.toContain("op-one");
 		expect(mount.innerHTML).not.toContain("private-fixture");
 		expect(calls("browser-url")).toHaveLength(0);
-		expect(mount.querySelector("details")).toBeNull();
+		expect(mount.querySelector<HTMLDetailsElement>(".my-account-technical-details")?.open).toBe(
+			false,
+		);
 	});
 	it("shows verified account, local device and coordinator without account administration", async () => {
 		// Arrange
 		view = status({
-			canLink: false,
+			actions: { connect: false, disconnect: false, refresh: false },
 			remote: {
 				kind: "status",
 				coordinatorId: "coordinator-one",
@@ -304,7 +315,11 @@ describe("My Account read-only status", () => {
 				authority: "device_claim",
 				identityMatches: true,
 				state: "linked",
-				account: { displayName: "Example Person", email: "person@example.test" },
+				profile: {
+					state: "verified",
+					verifiedAtMs: 1,
+					...{ displayName: "Example Person", email: "person@example.test" },
+				},
 			},
 		});
 		// Act
@@ -325,7 +340,9 @@ describe("My Account read-only status", () => {
 				.map((node) => node.textContent),
 		).toEqual(["Check status"]);
 		expect(mount.querySelector('[role="status"][aria-live="polite"]')).not.toBeNull();
-		expect(mount.querySelector("details")).toBeNull();
+		expect(mount.querySelector<HTMLDetailsElement>(".my-account-technical-details")?.open).toBe(
+			false,
+		);
 	});
 	it.each([
 		"review_required",
@@ -345,25 +362,32 @@ describe("My Account read-only status", () => {
 				state,
 			),
 			state: "unlinked",
-			account: { displayName: "Unverified secret", email: "unverified@example.test" },
+			profile: {
+				state: "verified",
+				verifiedAtMs: 1,
+				...{ displayName: "Unverified secret", email: "unverified@example.test" },
+			},
 		};
 		if (state === "review_required" || state === "revoked" || state === "conflict")
 			remote.state = state;
 		if (state === "linked_mismatch") remote.state = "linked";
-		view = status({ canLink: false, remote });
+		view = status({ actions: { connect: false, disconnect: false, refresh: false }, remote });
 		if (state === "offline") view.remote = { kind: "unavailable", code: "network" };
 		if (state === "unsupported") view.remote = { kind: "unsupported" };
 		// Act
 		await show();
 		// Assert
-		expect(button("Link Google account").disabled).toBe(true);
+		expect(buttons().some((node) => node.textContent === "Link Google account")).toBe(false);
 		expect(mount.textContent).not.toContain("No Google account is linked");
 		expect(mount.textContent).not.toContain("Unverified secret");
 		expect(mount.textContent).not.toContain("unverified@example.test");
 		if (state === "review_required") {
 			expect(mount.textContent).toMatch(/profile/i);
 			expect(mount.textContent).not.toMatch(/review-device-owner|enroll-owner/);
-		} else expect(mount.querySelector("details")).toBeNull();
+		} else
+			expect(mount.querySelector<HTMLDetailsElement>(".my-account-technical-details")?.open).toBe(
+				false,
+			);
 		if (state === "conflict") expect(mount.textContent).toContain("conflicting account link");
 	});
 	it("requires explicit group selection rather than choosing the first group", async () => {
@@ -372,14 +396,14 @@ describe("My Account read-only status", () => {
 			groups: ["group-one", "group-two"],
 			selectedGroupId: null,
 			setup: "group_selection_required",
-			canLink: false,
+			actions: { connect: false, disconnect: false, refresh: false },
 		});
 		// Act
 		await show();
 		// Assert
 		expect(mount.querySelector<HTMLSelectElement>("select")?.value).toBe("");
 		expect(mount.querySelector('label[for="my-account-group"]')?.textContent).toBe("Group");
-		expect(button("Link Google account").disabled).toBe(true);
+		expect(buttons().some((node) => node.textContent === "Link Google account")).toBe(false);
 	});
 });
 
@@ -389,7 +413,7 @@ describe("My Account retained outcomes and current guidance", () => {
 		async (state) => {
 			// Arrange: a terminal result must not hide a known device review requirement.
 			view = status({
-				canLink: false,
+				actions: { connect: false, disconnect: false, refresh: false },
 				operation: operation(state),
 				remote: {
 					kind: "status",
@@ -398,7 +422,7 @@ describe("My Account retained outcomes and current guidance", () => {
 					authority: null,
 					identityMatches: false,
 					state: "review_required",
-					account: null,
+					profile: { state: "unavailable" },
 				},
 			});
 			const outcome = {
@@ -411,11 +435,13 @@ describe("My Account retained outcomes and current guidance", () => {
 			// Assert
 			expect(mount.querySelector('[role="status"]')?.textContent).toBe(outcome);
 			expect(mount.textContent).toMatch(/profile/i);
-			const details = mount.querySelector("details");
+			const details = mount.querySelector<HTMLDetailsElement>(
+				".recipient-policy-management-details",
+			);
 			expect(details?.open).toBe(false);
 			expect(details?.textContent).toMatch(/operator|person who runs/i);
 			expect(mount.textContent).not.toMatch(/review-device-owner|one-time owner review/);
-			expect(button("Link Google account").disabled).toBe(true);
+			expect(buttons().some((node) => node.textContent === "Link Google account")).toBe(false);
 			expect(button("Check status").disabled).toBe(false);
 			expect(transport.mock.calls.some(([, options]) => options?.method === "POST")).toBe(false);
 			expect(window.open).not.toHaveBeenCalled();
@@ -426,7 +452,7 @@ describe("My Account retained outcomes and current guidance", () => {
 		async (state) => {
 			// Arrange: a retained terminal job must not hide the current reason linking is blocked.
 			view = status({
-				canLink: false,
+				actions: { connect: false, disconnect: false, refresh: false },
 				operation: operation(state === "review_required" ? "outcome_unknown" : "failed"),
 				remote: {
 					kind: "status",
@@ -435,7 +461,11 @@ describe("My Account retained outcomes and current guidance", () => {
 					identityMatches: false,
 					authority: state === "review_required" ? null : "device_claim",
 					state: state === "review_required" ? "review_required" : "unlinked",
-					account: { displayName: "Unverified secret", email: "unverified@example.test" },
+					profile: {
+						state: "verified",
+						verifiedAtMs: 1,
+						...{ displayName: "Unverified secret", email: "unverified@example.test" },
+					},
 				},
 			});
 			// Act
@@ -450,7 +480,7 @@ describe("My Account retained outcomes and current guidance", () => {
 			expect(mount.textContent).toContain(
 				state === "review_required" ? "profile" : "does not match this local Identity",
 			);
-			expect(button("Link Google account").disabled).toBe(true);
+			expect(buttons().some((node) => node.textContent === "Link Google account")).toBe(false);
 			expect(mount.textContent).not.toContain("Unverified secret");
 			expect(mount.textContent).not.toContain("unverified@example.test");
 		},
@@ -475,7 +505,10 @@ describe("My Account linking lifecycle", () => {
 		"ignores repeated status clicks during %s and retains one browser delivery",
 		async (state) => {
 			vi.mocked(window.open).mockReturnValue(null);
-			view = status({ operation: operation(state), canLink: false });
+			view = status({
+				operation: operation(state),
+				actions: { connect: false, disconnect: false, refresh: false },
+			});
 			await show();
 			for (let attempt = 0; attempt < 6; attempt++) await click("Check status");
 			expect(button("Check status").disabled).toBe(true);
@@ -503,7 +536,7 @@ describe("My Account linking lifecycle", () => {
 			view = status({
 				groups: ["group-one", "group-two"],
 				operation: operation(state),
-				canLink: false,
+				actions: { connect: false, disconnect: false, refresh: false },
 			});
 			await show();
 			const select = mount.querySelector<HTMLSelectElement>("select");
@@ -555,10 +588,16 @@ describe("My Account linking lifecycle", () => {
 		await click("Check status");
 		expect(popup.close).not.toHaveBeenCalled();
 	});
+});
+
+describe("My Account popup fallback", () => {
 	it("isolates an explicit synchronous fallback without re-fetching private URLs", async () => {
 		// Arrange
 		vi.mocked(window.open).mockReturnValue(null);
-		view = status({ operation: operation("awaiting_browser"), canLink: false });
+		view = status({
+			operation: operation("awaiting_browser"),
+			actions: { connect: false, disconnect: false, refresh: false },
+		});
 		await show();
 		// Act
 		await click("Open Google sign-in");
@@ -577,7 +616,10 @@ describe("My Account linking lifecycle", () => {
 		"https://coordinator.example/auth/link/start#secret",
 	])("never opens invalid private URL %s", async (url) => {
 		// Arrange
-		view = status({ operation: operation("awaiting_browser"), canLink: false });
+		view = status({
+			operation: operation("awaiting_browser"),
+			actions: { connect: false, disconnect: false, refresh: false },
+		});
 		transport.mockImplementation(async (path) =>
 			String(path).endsWith("browser-url") ? response({ version: 1, url }) : response(view),
 		);
@@ -604,7 +646,7 @@ describe("My Account configured coordinator browser origins", () => {
 		view = status({
 			coordinator: { origin },
 			operation: operation("awaiting_browser"),
-			canLink: false,
+			actions: { connect: false, disconnect: false, refresh: false },
 		});
 		transport.mockImplementation(async (path) =>
 			String(path).endsWith("browser-url") ? response({ version: 1, url }) : response(view),
@@ -629,7 +671,10 @@ describe("My Account uncertain cancellation recovery", () => {
 	it("offers explicit previous-link cancellation after drift without attaching its account or URL", async () => {
 		vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
 		vi.mocked(window.open).mockReturnValue(null);
-		view = status({ operation: operation("awaiting_browser"), canLink: false });
+		view = status({
+			operation: operation("awaiting_browser"),
+			actions: { connect: false, disconnect: false, refresh: false },
+		});
 		await show();
 		transport.mockResolvedValueOnce(
 			response({ operation: operation("awaiting_browser"), current: false }),
@@ -639,7 +684,7 @@ describe("My Account uncertain cancellation recovery", () => {
 			selectedGroupId: "group-two",
 			groups: ["group-two", "group-three"],
 			blockedReason: "operation_active",
-			canLink: false,
+			actions: { connect: false, disconnect: false, refresh: false },
 			local: {
 				deviceId: "device-two",
 				fingerprint: "fingerprint-two",
@@ -650,35 +695,43 @@ describe("My Account uncertain cancellation recovery", () => {
 		await tick();
 		expect(mount.textContent).toContain("New identity");
 		expect(mount.textContent).not.toContain("Local identity");
-		expect(mount.textContent).toContain("earlier link may still finish for its original Identity");
-		expect(button("Cancel previous link").disabled).toBe(false);
+		expect(mount.textContent).toContain(
+			"earlier account operation may still finish for its original Identity",
+		);
+		expect(button("Cancel previous operation").disabled).toBe(false);
 		expect(button("Check status").disabled).toBe(false);
 		expect(mount.querySelector<HTMLSelectElement>("select")?.disabled).toBe(false);
 		expect(buttons().some((node) => node.textContent === "Open Google sign-in")).toBe(false);
 		expect(calls("/cancel")).toHaveLength(0);
 		transport.mockResolvedValueOnce(response({ operation: operation("cancelled") }));
-		await click("Cancel previous link");
+		await click("Cancel previous operation");
 		expect(calls("/cancel")).toHaveLength(1);
-		expect(buttons().some((node) => node.textContent === "Cancel previous link")).toBe(false);
+		expect(buttons().some((node) => node.textContent === "Cancel previous operation")).toBe(false);
 		expect(calls("browser-url")).toHaveLength(1);
 		expect(mount.innerHTML).not.toContain("private-fixture");
 		expect(window.open).not.toHaveBeenCalled();
 	});
 	it("keeps status and cancellation available when polling remains unavailable past its deadline", async () => {
 		vi.setSystemTime(new Date("2026-01-01T00:04:59Z"));
-		view = status({ operation: operation("awaiting_browser"), canLink: false });
+		view = status({
+			operation: operation("awaiting_browser"),
+			actions: { connect: false, disconnect: false, refresh: false },
+		});
 		await show();
 		transport.mockRejectedValueOnce(new TypeError("offline"));
 		await tick();
 		await tick();
-		expect(button("Cancel previous link").disabled).toBe(false);
+		expect(button("Cancel previous operation").disabled).toBe(false);
 		expect(button("Check status").disabled).toBe(false);
 		expect(buttons().some((node) => node.textContent === "Open Google sign-in")).toBe(false);
 		expect(calls("/op-one")).toHaveLength(1);
 	});
 	it("keeps polling after a lost cancellation reply until verified status resolves linking", async () => {
 		vi.mocked(window.open).mockReturnValue(null);
-		view = status({ operation: operation("awaiting_browser"), canLink: false });
+		view = status({
+			operation: operation("awaiting_browser"),
+			actions: { connect: false, disconnect: false, refresh: false },
+		});
 		await show();
 		expect(calls("browser-url")).toHaveLength(1);
 		transport.mockRejectedValueOnce(new TypeError("private-cancel-failure"));
@@ -697,7 +750,7 @@ describe("My Account uncertain cancellation recovery", () => {
 			response({ version: 1, current: true, operation: operation("succeeded") }),
 		);
 		view = status({
-			canLink: false,
+			actions: { connect: false, disconnect: false, refresh: false },
 			remote: {
 				kind: "status",
 				coordinatorId: "coordinator-one",
@@ -705,7 +758,7 @@ describe("My Account uncertain cancellation recovery", () => {
 				identityMatches: true,
 				authority: "device_claim",
 				state: "linked",
-				account: { email: "verified@example.test" },
+				profile: { state: "verified", verifiedAtMs: 1, ...{ email: "verified@example.test" } },
 			},
 		});
 		await tick();
@@ -724,13 +777,16 @@ describe("My Account recovery", () => {
 	it("resumes from status without storage and reloads verified account on terminal success", async () => {
 		// Arrange
 		const storage = vi.spyOn(Storage.prototype, "setItem");
-		view = status({ operation: operation(), canLink: false });
+		view = status({
+			operation: operation(),
+			actions: { connect: false, disconnect: false, refresh: false },
+		});
 		await show();
 		transport.mockResolvedValueOnce(
 			response({ version: 1, current: true, operation: operation("succeeded") }),
 		);
 		view = status({
-			canLink: false,
+			actions: { connect: false, disconnect: false, refresh: false },
 			remote: {
 				kind: "status",
 				coordinatorId: "coordinator-one",
@@ -738,7 +794,7 @@ describe("My Account recovery", () => {
 				identityMatches: true,
 				state: "linked",
 				authority: "device_claim",
-				account: { email: "verified@example.test" },
+				profile: { state: "verified", verifiedAtMs: 1, ...{ email: "verified@example.test" } },
 			},
 		});
 		// Act
@@ -768,7 +824,10 @@ describe("My Account recovery", () => {
 		"reports %s cancellation without claiming nothing changed",
 		async (state) => {
 			// Arrange
-			view = status({ operation: operation(), canLink: false });
+			view = status({
+				operation: operation(),
+				actions: { connect: false, disconnect: false, refresh: false },
+			});
 			await show();
 			const result = {
 				...operation(state),
@@ -776,7 +835,10 @@ describe("My Account recovery", () => {
 			};
 			transport.mockResolvedValueOnce(response({ version: 1, operation: result }));
 			if (state === "outcome_unknown")
-				view = status({ operation: result as AccountOperation, canLink: false });
+				view = status({
+					operation: result as AccountOperation,
+					actions: { connect: false, disconnect: false, refresh: false },
+				});
 			// Act
 			await click("Cancel linking");
 			// Assert
@@ -785,4 +847,369 @@ describe("My Account recovery", () => {
 			expect(mount.textContent).not.toContain("nothing changed");
 		},
 	);
+});
+
+describe("account-management intents", () => {
+	function linked(
+		profile:
+			| Extract<
+					Extract<AccountView["remote"], { kind: "status" }>["profile"],
+					{ state: "verified" }
+			  >
+			| { state: "unavailable" } = { state: "unavailable" },
+	) {
+		view = status({
+			actions: { connect: false, disconnect: true, refresh: true },
+			remote: {
+				kind: "status",
+				coordinatorId: "coordinator-one",
+				identityId: "identity-one",
+				authority: "device_claim",
+				identityMatches: true,
+				state: "linked",
+				profile,
+			},
+		});
+	}
+	it("shows unavailable linked profile honestly and hides technical IDs until expanded", async () => {
+		linked();
+		await show();
+		expect(mount.textContent).toContain("linked without profile details");
+		expect(button("Refresh profile").disabled).toBe(false);
+		expect(button("Unlink Google account").disabled).toBe(false);
+		expect(buttons().some((item) => item.textContent === "Link Google account")).toBe(false);
+		expect(mount.querySelector<HTMLDetailsElement>(".my-account-technical-details")?.open).toBe(
+			false,
+		);
+	});
+	it("empty verified snapshot removes the old photo, name, and email without unlinking", async () => {
+		linked({
+			state: "verified",
+			verifiedAtMs: 1,
+			displayName: "Old name",
+			email: "old@example.test",
+			pictureUrl: "https://lh3.googleusercontent.com/a/photo",
+		});
+		await show();
+		expect(mount.textContent).toContain("Old name");
+		if (view.remote.kind === "status") view.remote.profile = { state: "verified", verifiedAtMs: 2 };
+		await click("Check status");
+		expect(mount.textContent).not.toContain("Old name");
+		expect(mount.textContent).not.toContain("old@example.test");
+		expect(mount.querySelector(".my-account-profile img")).toBeNull();
+		expect(button("Refresh profile").disabled).toBe(false);
+	});
+	it.each(["refresh", "disconnect"] as const)(
+		"posts %s from one gesture without a local confirmation",
+		async (intent) => {
+			linked();
+			const started = operation("starting");
+			started.intent = intent;
+			transport.mockImplementation(async (url) => {
+				if (url === "/api/account/session") return response({ csrfToken: "fixture-token" });
+				if (String(url).includes("link-status")) return response(view);
+				return response({ version: 1, operation: started });
+			});
+			await show();
+			await click(intent === "refresh" ? "Refresh profile" : "Unlink Google account");
+			const start = calls("link-operations");
+			expect(start).toHaveLength(1);
+			expect(JSON.parse(String(start[0][1]?.body))).toEqual({
+				groupId: "group-one",
+				contextId: "context-one",
+				coordinatorId: "coordinator-one",
+				authority: "device_claim",
+				intent,
+			});
+			expect(window.open).toHaveBeenCalledWith("about:blank", "_blank");
+			expect(mount.querySelector("[role=dialog]")).toBeNull();
+			expect(button("Refresh profile").disabled).toBe(true);
+			expect(button("Unlink Google account").disabled).toBe(true);
+		},
+	);
+	it("offers connect after disconnection, but never exposes profile or management controls on revocation or conflict", async () => {
+		view = status({
+			remote: {
+				kind: "status",
+				coordinatorId: "coordinator-one",
+				identityId: "identity-one",
+				authority: "device_claim",
+				identityMatches: true,
+				state: "disconnected",
+				profile: { state: "unavailable" },
+			},
+		});
+		await show();
+		expect(button("Link Google account").disabled).toBe(false);
+		for (const state of ["revoked", "conflict"] as const) {
+			view = status({
+				actions: { connect: true, disconnect: true, refresh: true },
+				remote: {
+					kind: "status",
+					coordinatorId: "coordinator-one",
+					identityId: null,
+					authority: null,
+					identityMatches: false,
+					state,
+					profile: { state: "verified", verifiedAtMs: 1, displayName: "Secret" },
+				},
+			});
+			await click("Check status");
+			expect(mount.textContent).not.toContain("Secret");
+			expect(
+				buttons().some((item) =>
+					/^(Unlink Google account|Refresh profile|Link Google account)$/.test(
+						item.textContent ?? "",
+					),
+				),
+			).toBe(false);
+		}
+	});
+});
+
+describe("management cancellation and stale context", () => {
+	it("never turns Check status or cancellation into an unlink request", async () => {
+		view = status({
+			actions: { connect: false, disconnect: true, refresh: true },
+			remote: {
+				kind: "status",
+				coordinatorId: "coordinator-one",
+				identityId: "identity-one",
+				authority: "device_claim",
+				identityMatches: true,
+				state: "linked",
+				profile: { state: "unavailable" },
+			},
+		});
+		await show();
+		await click("Check status");
+		expect(calls("link-operations")).toHaveLength(0);
+		const pending = operation("awaiting_browser");
+		pending.intent = "disconnect";
+		view = {
+			...view,
+			operation: pending,
+			actions: { connect: false, disconnect: false, refresh: false },
+		};
+		await click("Check status");
+		transport.mockImplementation(async (url) => {
+			if (String(url).includes("link-status")) return response(view);
+			return response({ version: 1, operation: { ...pending, state: "cancelled" } });
+		});
+		await click("Cancel unlinking");
+		expect(calls("link-operations")).toHaveLength(0);
+		expect(calls("cancel")).toHaveLength(1);
+	});
+	it("drops a stale disconnect start reply after the account card unmounts", async () => {
+		view = status({
+			groups: ["group-one", "group-two"],
+			actions: { connect: false, disconnect: true, refresh: true },
+			remote: {
+				kind: "status",
+				coordinatorId: "coordinator-one",
+				identityId: "identity-one",
+				authority: "device_claim",
+				identityMatches: true,
+				state: "linked",
+				profile: { state: "unavailable" },
+			},
+		});
+		const pending = deferred<Response>();
+		transport.mockImplementation(async (url) => {
+			if (url === "/api/account/session") return response({ csrfToken: "fixture" });
+			if (String(url).includes("link-status")) return response(view);
+			if (url === "/api/account/link-operations") return pending.promise;
+			throw new Error("Unexpected request");
+		});
+		await show();
+		await click("Unlink Google account");
+		await act(async () => {
+			// Group selection is locked during an active start; unmount supersedes its context.
+			render(null, mount);
+		});
+		pending.resolve(
+			response({
+				version: 1,
+				operation: { ...operation("awaiting_browser"), intent: "disconnect" },
+			}),
+		);
+		await settle();
+		expect(calls("browser-url")).toHaveLength(0);
+		expect(popup.location.replace).not.toHaveBeenCalled();
+		expect(popup.close).toHaveBeenCalled();
+	});
+});
+
+describe("management browser delivery", () => {
+	it.each(["disconnect", "refresh"] as const)(
+		"opens only the allowlisted hosted %s start URL",
+		async (intent) => {
+			const remote = {
+				kind: "status" as const,
+				coordinatorId: "coordinator-one",
+				identityId: "identity-one",
+				authority: "device_claim" as const,
+				identityMatches: true,
+				state: "linked" as const,
+				profile: { state: "unavailable" as const },
+			};
+			const active = { ...operation("awaiting_browser"), intent };
+			view = status({
+				remote,
+				actions: { connect: false, disconnect: true, refresh: true },
+				operation: active,
+			});
+			const managementUrl =
+				"https://coordinator.example/auth/link-change/start?code=private-fixture";
+			transport.mockImplementation(async (url) => {
+				if (url === "/api/account/session") return response({ csrfToken: "fixture" });
+				if (String(url).includes("link-status")) return response(view);
+				if (String(url).endsWith("browser-url"))
+					return response({ version: 1, url: managementUrl });
+				return response({ version: 1, operation: active, current: true });
+			});
+			await show();
+			// A restored operation cannot reserve a popup outside a gesture; offer an explicit fallback.
+			expect(button("Open Google sign-in")).toBeTruthy();
+			await click("Open Google sign-in");
+			assertIsolatedPopup(managementUrl);
+			expect(mount.innerHTML).not.toContain(managementUrl);
+		},
+	);
+});
+
+describe("retained management outcomes", () => {
+	const linked = () =>
+		status({
+			actions: { connect: false, disconnect: true, refresh: true },
+			remote: {
+				kind: "status",
+				coordinatorId: "coordinator-one",
+				identityId: "identity-one",
+				authority: "device_claim",
+				identityMatches: true,
+				state: "linked",
+				profile: { state: "verified", verifiedAtMs: 1, email: "verified@example.test" },
+			},
+		});
+	it.each(["refresh", "disconnect"] as const)(
+		"permits a new %s after a retained succeeded refresh",
+		async (intent) => {
+			view = { ...linked(), operation: { ...operation("succeeded"), intent: "refresh" } };
+			await show();
+			expect(button("Refresh profile").disabled).toBe(false);
+			expect(button("Unlink Google account").disabled).toBe(false);
+			const next = { ...operation("starting"), intent };
+			transport.mockImplementation(async (url) => {
+				if (String(url).includes("link-status")) return response(view);
+				return response({ version: 1, operation: next });
+			});
+			await click(intent === "refresh" ? "Refresh profile" : "Unlink Google account");
+			expect(JSON.parse(String(calls("link-operations")[0][1]?.body)).intent).toBe(intent);
+		},
+	);
+	it("permits connect after a retained succeeded disconnect on a disconnected status", async () => {
+		view = {
+			...status({
+				remote: {
+					kind: "status",
+					coordinatorId: "coordinator-one",
+					identityId: "identity-one",
+					authority: "device_claim",
+					identityMatches: true,
+					state: "disconnected",
+					profile: { state: "unavailable" },
+				},
+			}),
+			operation: { ...operation("succeeded"), intent: "disconnect" },
+		};
+		await show();
+		expect(button("Link Google account").disabled).toBe(false);
+		await click("Link Google account");
+		expect(JSON.parse(String(calls("link-operations")[0][1]?.body)).intent).toBe("connect");
+	});
+	it.each(["starting", "awaiting_browser"] as const)(
+		"blocks a second intent for retained %s",
+		async (state) => {
+			view = { ...linked(), operation: { ...operation(state), intent: "refresh" } };
+			await show();
+			expect(button("Refresh profile").disabled).toBe(true);
+			expect(button("Unlink Google account").disabled).toBe(true);
+			expect(calls("link-operations")).toHaveLength(0);
+		},
+	);
+});
+
+describe("fresh status and account-management errors", () => {
+	it.each(["linked", "disconnected"] as const)(
+		"enables server-allowed actions after fresh %s status retains an unknown outcome",
+		async (state) => {
+			const intent = state === "linked" ? "refresh" : "disconnect";
+			view = status({
+				actions:
+					state === "linked"
+						? { connect: false, disconnect: true, refresh: true }
+						: { connect: true, disconnect: false, refresh: false },
+				operation: { ...operation("outcome_unknown"), intent },
+				remote: {
+					kind: "status",
+					coordinatorId: "coordinator-one",
+					identityId: "identity-one",
+					authority: "device_claim",
+					identityMatches: true,
+					state,
+					profile: { state: "unavailable" },
+				},
+			});
+			await show();
+			const action = state === "linked" ? "Refresh profile" : "Link Google account";
+			expect(button(action).disabled).toBe(false);
+			const next = { ...operation("starting"), intent: state === "linked" ? "refresh" : "connect" };
+			transport.mockImplementation(async (url) => {
+				if (String(url).includes("link-status")) return response(view);
+				return response({ version: 1, operation: next });
+			});
+			await click(action);
+			expect(JSON.parse(String(calls("link-operations")[0][1]?.body)).intent).toBe(next.intent);
+		},
+	);
+	it.each(["connect", "disconnect", "refresh"] as const)(
+		"gives schema upgrade guidance for failed %s",
+		async (intent) => {
+			view = status({
+				operation: { ...operation("failed"), intent, failure: "schema_upgrade_required" },
+			});
+			await show();
+			expect(mount.querySelector('[role="status"]')?.textContent).toMatch(
+				/schema upgrade.*back up and upgrade/i,
+			);
+		},
+	);
+});
+
+describe("linked status before local finalization", () => {
+	it("keeps a running connect visibly in progress instead of claiming success", async () => {
+		view = status({
+			operation: operation("awaiting_browser"),
+			actions: { connect: false, disconnect: false, refresh: false },
+			remote: {
+				kind: "status",
+				coordinatorId: "coordinator-one",
+				identityId: "identity-one",
+				authority: "device_claim",
+				identityMatches: true,
+				state: "linked",
+				profile: { state: "verified", verifiedAtMs: 1, email: "person@example.test" },
+			},
+		});
+		await show();
+		expect(mount.querySelector('[role="status"]')?.textContent).toMatch(
+			/Google sign-in|Google proof/,
+		);
+		expect(mount.querySelector('[role="status"]')?.textContent).not.toMatch(
+			/account linked|success/i,
+		);
+		expect(button("Cancel linking").disabled).toBe(false);
+		expect(buttons().some((node) => node.textContent === "Link Google account")).toBe(false);
+	});
 });

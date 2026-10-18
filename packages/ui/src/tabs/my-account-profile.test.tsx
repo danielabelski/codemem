@@ -14,7 +14,7 @@ beforeEach(() => {
 	mount = document.createElement("div");
 	document.body.append(mount);
 	view = status({
-		canLink: false,
+		actions: { connect: false, disconnect: false, refresh: false },
 		remote: {
 			kind: "status",
 			coordinatorId: "coordinator-one",
@@ -22,7 +22,7 @@ beforeEach(() => {
 			authority: "device_claim",
 			identityMatches: true,
 			state: "linked",
-			account,
+			profile: { state: "verified", verifiedAtMs: 1, ...account },
 		},
 	});
 	vi.stubGlobal(
@@ -44,10 +44,11 @@ async function show() {
 	await act(async () => render(<MyAccount />, mount));
 	await settle();
 }
-function setAccount(
-	value: NonNullable<Extract<AccountView["remote"], { kind: "status" }>["account"]>,
-) {
-	if (view.remote.kind === "status") view.remote.account = value;
+function setAccount(value: Partial<typeof account> | null) {
+	if (view.remote.kind === "status")
+		view.remote.profile = value
+			? { state: "verified", verifiedAtMs: 1, ...value }
+			: { state: "unavailable" };
 }
 
 it("renders verified profile text and a lazy anonymous no-referrer photo", async () => {
@@ -93,7 +94,7 @@ it.each([
 	[{ displayName: "Example Person" }, "Example Person", "EP"],
 	[{ email: "person@example.test" }, "Google account", "G"],
 	[{}, "Google account", "G"],
-] as const)("supports older profile shape %j", async (value, label, initials) => {
+] as const)("supports verified empty profile %j", async (value, label, initials) => {
 	// Arrange
 	setAccount(value);
 	// Act

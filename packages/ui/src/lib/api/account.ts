@@ -1,4 +1,7 @@
+export type AccountIntent = "connect" | "disconnect" | "refresh";
+
 export type AccountOperation = {
+	intent: AccountIntent;
 	operationId: string;
 	groupId: string;
 	contextId: string;
@@ -54,11 +57,19 @@ export type AccountView = {
 				coordinatorId: string;
 				authority: "controller_attestation" | "device_claim" | null;
 				identityId: string | null;
-				state: "review_required" | "unlinked" | "linked" | "revoked" | "conflict";
+				state: "review_required" | "unlinked" | "disconnected" | "linked" | "revoked" | "conflict";
 				identityMatches: boolean;
-				account: null | { email?: string; displayName?: string; pictureUrl?: string };
+				profile:
+					| {
+							state: "verified";
+							verifiedAtMs: number;
+							email?: string;
+							displayName?: string;
+							pictureUrl?: string;
+					  }
+					| { state: "unavailable" };
 		  };
-	canLink: boolean;
+	actions: { connect: boolean; disconnect: boolean; refresh: boolean };
 	blockedReason:
 		| null
 		| "setup_incomplete"
@@ -189,10 +200,14 @@ export function getAccountStatus(groupId?: string, signal?: AbortSignal): Promis
 		{ signal },
 	);
 }
-export function startAccountLink(
+export function startAccountOperation(
 	groupId: string,
 	contextId: string,
-	checked: { authority: "controller_attestation" | "device_claim"; coordinatorId: string },
+	checked: {
+		authority: "controller_attestation" | "device_claim";
+		coordinatorId: string;
+		intent: AccountIntent;
+	},
 	signal?: AbortSignal,
 ): Promise<{ version: 1; operation: AccountOperation }> {
 	return request("/api/account/link-operations", {
@@ -226,7 +241,11 @@ export function cancelAccountLink(
 	});
 }
 
-export function validAccountBrowserUrl(value: string, origin: string): boolean {
+export function validAccountBrowserUrl(
+	value: string,
+	origin: string,
+	intent: AccountIntent = "connect",
+): boolean {
 	try {
 		const url = new URL(value);
 		const secure = url.protocol === "https:";
@@ -235,7 +254,7 @@ export function validAccountBrowserUrl(value: string, origin: string): boolean {
 		return (
 			(secure || localHttp) &&
 			url.origin === origin &&
-			url.pathname === "/auth/link/start" &&
+			url.pathname === (intent === "connect" ? "/auth/link/start" : "/auth/link-change/start") &&
 			!url.username &&
 			!url.password &&
 			!url.hash

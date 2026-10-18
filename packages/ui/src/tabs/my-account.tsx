@@ -4,16 +4,16 @@ import {
 	type AccountView,
 	validAccountPictureUrl,
 } from "../lib/api/account";
-import { useMyAccount } from "./my-account-flow";
+import { operationNeedsReconciliation, useMyAccount } from "./my-account-flow";
 
 const SCHEMA_UPGRADE_MESSAGE =
-	"The coordinator needs a database schema upgrade before Google linking can work. Ask the person who runs it to back up and upgrade the coordinator. Normal device sync is still available.";
+	"The coordinator needs a database schema upgrade before Google account management can work. Ask the person who runs it to back up and upgrade the coordinator. Normal device sync is still available.";
 
 const FAILURE_MESSAGES: Partial<Record<NonNullable<AccountOperation["failure"]>, string>> = {
 	schema_upgrade_required: SCHEMA_UPGRADE_MESSAGE,
-	link_stopped: "Linking stopped. Check status before trying again.",
+	link_stopped: "The account operation stopped. Check status before trying again.",
 	link_conflict:
-		"Account linking conflicts with an existing or revoked link. Ask the coordinator operator; this action cannot replace links or move Identities.",
+		"Account management conflicts with an existing or revoked link. Ask the coordinator operator; this action cannot replace links or move Identities.",
 };
 
 const UNAVAILABLE_MESSAGES = new Map<string, string>([
@@ -45,7 +45,7 @@ const UNAVAILABLE_MESSAGES = new Map<string, string>([
 	],
 	[
 		"invalid_response",
-		"The coordinator returned an unexpected account-linking response. Ask the person who runs it to check that the coordinator and Viewer are up to date.",
+		"The coordinator returned an unexpected account-management response. Ask the person who runs it to check that the coordinator and Viewer are up to date.",
 	],
 ]);
 
@@ -53,13 +53,13 @@ function remoteSummary(view: AccountView): string {
 	if (view.setup === "group_selection_required")
 		return "Choose a group to check this Identity’s account status.";
 	if (view.setup !== "ready")
-		return "Account linking is not ready for this local Identity. Check the Viewer’s coordinator and device setup.";
+		return "Account management is not ready for this local Identity. Check the Viewer’s coordinator and device setup.";
 	if (view.remote.kind === "unsupported")
-		return "Google linking is not available on this coordinator. Ask the person who runs it to enable or update its Google-linking service.";
+		return "Google account management is not available on this coordinator. Ask the person who runs it to enable or update its Google-linking service.";
 	if (view.remote.kind === "unavailable")
 		return (
 			UNAVAILABLE_MESSAGES.get(view.remote.code) ??
-			"Google linking is unavailable. Check the selected coordinator, or ask the person who runs it for help."
+			"Google account management is unavailable. Check the selected coordinator, or ask the person who runs it for help."
 		);
 	if (view.remote.kind === "not_checked")
 		return "Choose Check status to see whether you can link Google.";
@@ -72,25 +72,36 @@ function remoteSummary(view: AccountView): string {
 	if (view.remote.state === "revoked")
 		return "This Identity’s account link was revoked. Linking here cannot restore or replace it.";
 	if (view.remote.state === "linked")
-		return "This Google account is linked to the local Codemem Identity. Linking does not change sharing access.";
+		return view.remote.profile.state === "unavailable"
+			? "Google account linked without profile details. Refresh profile to request verified details."
+			: "This Google account is linked to the local Codemem Identity. Linking does not change sharing access.";
+	if (view.remote.state === "disconnected")
+		return "Google account disconnected. Your Identity, devices, history, and sharing remain in place.";
 	if (view.blockedReason === "operation_active")
-		return "Another account link is running in this Viewer. Check status after it finishes.";
+		return "Another account operation is running in this Viewer. Check status after it finishes.";
 	return "No Google account is linked to this Identity. Linking will not move the Identity or grant sharing access.";
 }
 
 function accountSummary(view: AccountView | null, operation: AccountOperation | null): string {
 	if (!view)
-		return "Google-linking status could not be loaded. Check that the Viewer is running, then check status again.";
-	if (operation?.state === "starting") return "Preparing Google sign-in…";
+		return "Google account status could not be loaded. Check that the Viewer is running, then check status again.";
+	const action = operation
+		? { connect: "Linking", disconnect: "Unlinking", refresh: "Profile refresh" }[operation.intent]
+		: "Linking";
+	if (operation?.state === "starting") return `${action}: preparing Google sign-in…`;
 	if (operation?.state === "awaiting_browser")
-		return "Waiting for Google sign-in. Keep this Viewer open on the same computer.";
+		return `${action}: waiting for Google proof. Keep this Viewer open on the same computer.`;
 	if (operation?.state === "outcome_unknown")
-		return "We couldn’t confirm whether linking finished. Check status.";
-	if (operation?.state === "failed")
-		return (
-			FAILURE_MESSAGES[operation.failure ?? "request_failed"] ??
-			"Linking did not finish. Check status before trying again."
-		);
+		return `We couldn’t confirm whether ${action.toLowerCase()} finished. Check status.`;
+	if (operation?.state === "failed") {
+		if (operation.failure === "schema_upgrade_required") return SCHEMA_UPGRADE_MESSAGE;
+		if (operation.intent === "connect")
+			return (
+				FAILURE_MESSAGES[operation.failure ?? "request_failed"] ??
+				`${action} did not finish. Check status before trying again.`
+			);
+		return `${action} did not finish. Check status before trying again.`;
+	}
 	if (operation?.state === "cancelled")
 		return "Cancellation was reported. Check status to confirm the account state.";
 	return remoteSummary(view);
@@ -148,7 +159,9 @@ function VerifiedAccount({ view }: { view: AccountView }) {
 		!view.remote.identityMatches
 	)
 		return null;
-	const { displayName, email, pictureUrl } = view.remote.account ?? {};
+	const profile = view.remote.profile;
+	if (profile.state !== "verified") return null;
+	const { displayName, email, pictureUrl } = profile;
 	return (
 		<div className="my-account-profile">
 			<AccountAvatar
@@ -191,21 +204,66 @@ function DeviceLinkRecovery({ view }: { view: AccountView | null }) {
 	);
 }
 
-function AccountActions({ flow }: { flow: ReturnType<typeof useMyAccount> }) {
-	const { view, operation, pendingOperation, busy, fallback } = flow;
-	const running = operation?.state === "starting" || operation?.state === "awaiting_browser";
+function StartActions({
+	flow,
+	canStart,
+}: {
+	flow: ReturnType<typeof useMyAccount>;
+	canStart: boolean;
+}) {
+	const { view } = flow;
+	const state =
+		view?.remote.kind === "status" && view.remote.identityMatches ? view.remote.state : null;
 	return (
-		<div className="peer-actions">
-			{view && !running ? (
+		<>
+			{state && ["unlinked", "disconnected"].includes(state) && view?.actions.connect ? (
 				<button
 					className="settings-save"
 					type="button"
-					disabled={busy || !view.canLink || Boolean(pendingOperation)}
-					onClick={() => void flow.link()}
+					disabled={!canStart}
+					onClick={() => void flow.begin("connect")}
 				>
 					Link Google account
 				</button>
 			) : null}
+			{state === "linked" && view?.actions.refresh ? (
+				<button
+					className="settings-save"
+					type="button"
+					disabled={!canStart}
+					onClick={() => void flow.begin("refresh")}
+				>
+					Refresh profile
+				</button>
+			) : null}
+			{state === "linked" && view?.actions.disconnect ? (
+				<button
+					className="settings-button"
+					type="button"
+					disabled={!canStart}
+					onClick={() => void flow.begin("disconnect")}
+				>
+					Unlink Google account
+				</button>
+			) : null}
+		</>
+	);
+}
+
+function AccountActions({ flow }: { flow: ReturnType<typeof useMyAccount> }) {
+	const { view, operation, pendingOperation, busy, fallback } = flow;
+	const running = operation?.state === "starting" || operation?.state === "awaiting_browser";
+	const canStart =
+		!busy &&
+		!operationNeedsReconciliation(operation) &&
+		!operationNeedsReconciliation(pendingOperation) &&
+		!(view?.operation?.state === "starting" || view?.operation?.state === "awaiting_browser");
+	const action = operation
+		? { connect: "linking", disconnect: "unlinking", refresh: "profile refresh" }[operation.intent]
+		: "linking";
+	return (
+		<div className="peer-actions">
+			<StartActions flow={flow} canStart={canStart} />
 			{fallback && running ? (
 				<button className="settings-save" type="button" onClick={flow.openFallback}>
 					Open Google sign-in
@@ -218,7 +276,7 @@ function AccountActions({ flow }: { flow: ReturnType<typeof useMyAccount> }) {
 					disabled={busy}
 					onClick={() => void flow.cancel()}
 				>
-					Cancel linking
+					Cancel {action}
 				</button>
 			) : null}
 			{pendingOperation && !running ? (
@@ -228,7 +286,7 @@ function AccountActions({ flow }: { flow: ReturnType<typeof useMyAccount> }) {
 					disabled={busy}
 					onClick={() => void flow.cancelPrevious()}
 				>
-					Cancel previous link
+					Cancel previous operation
 				</button>
 			) : null}
 			<button
@@ -289,17 +347,19 @@ export function MyAccount() {
 			{guidance ? <p className="small">{guidance}</p> : null}
 			{flow.pendingOperation ? (
 				<p className="small">
-					An earlier link may still finish for its original Identity. Its current account context is
-					unverified and may differ from the Identity shown here. Cancel previous link requests
-					cancellation of that earlier attempt. Check status to confirm.
+					An earlier account operation may still finish for its original Identity. Its current
+					account context is unverified and may differ from the Identity shown here. Cancel previous
+					operation requests cancellation of that earlier attempt. Check status to confirm.
 				</p>
 			) : null}
 			{view?.local ? (
-				<p className="small my-account-technical-details">
-					Codemem Identity: {view.local.identityLabel || view.local.identityId}
-					{" · "}Device: {view.local.deviceLabel || view.local.deviceId}
-					{view.coordinator ? <> · Coordinator: {view.coordinator.origin}</> : null}
-				</p>
+				<details className="my-account-technical-details small">
+					<summary>Account diagnostics</summary>
+					<p>Codemem Identity: {view.local.identityLabel || view.local.identityId}</p>
+					<p>Device: {view.local.deviceLabel || view.local.deviceId}</p>
+					<p>Device ID: {view.local.deviceId}</p>
+					{view.coordinator ? <p>Coordinator: {view.coordinator.origin}</p> : null}
+				</details>
 			) : null}
 			<DeviceLinkRecovery view={view} />
 			<AccountActions flow={flow} />

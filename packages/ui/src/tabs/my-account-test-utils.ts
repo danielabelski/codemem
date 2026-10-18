@@ -5,6 +5,7 @@ import type { AccountOperation, AccountView } from "../lib/api/account";
 export const privateUrl = "https://coordinator.example/auth/link/start?code=private-fixture";
 export const operation = (state: AccountOperation["state"] = "starting"): AccountOperation => ({
 	operationId: "op-one",
+	intent: "connect",
 	contextId: "context-one",
 	groupId: "group-one",
 	state,
@@ -35,9 +36,9 @@ export const status = (overrides: Partial<AccountView> = {}): AccountView => ({
 		state: "unlinked",
 		authority: "device_claim",
 		identityMatches: true,
-		account: null,
+		profile: { state: "unavailable" },
 	},
-	canLink: true,
+	actions: { connect: true, disconnect: false, refresh: false },
 	blockedReason: null,
 	operation: null,
 	checkedAt: "2026-01-01T00:00:00Z",
