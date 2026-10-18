@@ -1,5 +1,6 @@
 import { env, exports } from "cloudflare:workers";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { consumeNativeLinkProof } from "./native-auth-proof-fixture.js";
 import {
 	type CoordinatorBrowserAuthLinkCompletionInput,
 	createCoordinatorBrowserAuthCallback,
@@ -85,6 +86,7 @@ async function reviewedAccount(
 		attemptId: crypto.randomUUID(),
 		signer: review,
 		runtimeVerifierHash: "d".repeat(64),
+		browserStartHash: "8".repeat(64),
 		loopbackRedirect: "http://127.0.0.1:4567/codemem/auth/complete",
 	};
 	await store.createGroup(review.groupId, "Fixture group");
@@ -92,9 +94,9 @@ async function reviewedAccount(
 	expect(await store.createAuthControllerAttestation(review)).toMatchObject({ kind: "created" });
 	expect(await store.createAuthLinkAttempt(start, config)).toMatchObject({ kind: "created" });
 	if (options.linked !== false) {
-		const browser = { attemptId: start.attemptId, browserTransactionHash: "e".repeat(64) };
+		const browser = { attemptId: start.attemptId, browserTransactionHash: "e".repeat(64), binderHash: "" };
 		const confirm = { ...browser, completionSecretHash: "f".repeat(64) };
-		expect(await store.claimAuthLinkAttempt(browser, config)).toMatchObject({ kind: "applied" });
+		await consumeNativeLinkProof({ store, cfg: config }, start, browser);
 		expect(
 			await store.recordAuthLinkOidcVerified(
 				{ ...browser, account: { issuer: config.issuer, subject: "fixture-subject" } },
@@ -140,7 +142,7 @@ async function setup(options: { linked?: boolean } = {}) {
 				await env.COORDINATOR_DB.prepare(`SELECT * FROM ${TX} WHERE coordinator_id = ?`)
 					.bind(config.coordinatorId)
 					.all<Record<string, unknown>>()
-			).results;
+			).results.filter((row) => row.browser_transaction_hash !== "e".repeat(64));
 			expect(persisted).toHaveLength(1);
 			expect(persisted[0]).toMatchObject({ state: "consumed", nonce: null, pkce_verifier: null });
 		}
@@ -172,7 +174,6 @@ async function setup(options: { linked?: boolean } = {}) {
 		callbacks.push(created.handlers);
 	}
 	const traps = stores.flatMap((store) => [
-		vi.spyOn(store, "signInWithAuthAccount").mockRejectedValue(new Error("legacy trap")),
 		vi
 			.spyOn(store, "cancelAuthSigninBrowserTransaction")
 			.mockRejectedValue(new Error("cancel trap")),
@@ -214,7 +215,7 @@ async function ceremony(f: Fixture) {
 		authorization,
 		callback: f.fixture.authorize(authorization),
 		cookie: txn,
-		row: (await rows(f))[0],
+		row: (await rows(f)).find((row) => row.purpose === "signin")!,
 	};
 }
 function request(url: URL | string, cookie?: string) {
@@ -363,7 +364,7 @@ it("preserves victim pending material for wrong/missing cookies or wrong/missing
 		expect(result.response.headers.getSetCookie()).toEqual([]);
 		await redacted(result, c.row, c.callback.searchParams.get("code"));
 	}
-	expect(await rows(f)).toEqual([c.row]);
+	expect((await rows(f)).filter((row) => row.purpose === "signin")).toEqual([c.row]);
 	expect(f.transport).not.toHaveBeenCalled();
 	expect(await rows(f, SESSION)).toEqual([]);
 	await untouched(f);
@@ -407,7 +408,7 @@ it.each(["signature", "unlinked", "consume", "admission", "profile"] as const)(
 		if (mode === "consume") cookies = [];
 		if (success) cookies = [expect.stringContaining(BROWSER_COOKIE_NAMES.session), CLEAR];
 		expect(result.response.headers.getSetCookie()).toEqual(cookies);
-		expect((await rows(f))[0]).toMatchObject(
+		expect((await rows(f)).find((row) => row.purpose === "signin")).toMatchObject(
 			mode === "consume"
 				? { state: "pending", nonce: c.row.nonce, pkce_verifier: c.row.pkce_verifier }
 				: { state: "consumed", nonce: null, pkce_verifier: null },
@@ -433,6 +434,7 @@ it("dispatches consumed link success and provider denial to the required frozen 
 				{
 					purpose: "link",
 					attemptId: f.start.attemptId,
+					browserStartHash: f.start.browserStartHash,
 					stateHash: String(c.row.state_hash),
 					binderHash: String(c.row.binder_hash),
 					nonce: String(c.row.nonce),
@@ -490,6 +492,7 @@ it("fails missing link continuation before discovery and keeps callback routing 
 	// Arrange
 	const f = await setup();
 	const missing = { config: f.config, store: f.stores[0], oidcOptions: { fetch: f.transport } };
+	const before = await rows(f);
 	// Act
 	const invalid = await createCoordinatorBrowserAuthCallback(
 		missing as Parameters<typeof createCoordinatorBrowserAuthCallback>[0],
@@ -508,6 +511,6 @@ it("fails missing link continuation before discovery and keeps callback routing 
 	for (const response of [wrong.response, method.response, unmounted])
 		expect(response.headers.getSetCookie()).toEqual([]);
 	expect(f.transport).not.toHaveBeenCalled();
-	expect(await rows(f)).toEqual([]);
+	expect(await rows(f)).toEqual(before);
 	await untouched(f);
 });

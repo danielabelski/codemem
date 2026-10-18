@@ -1,5 +1,4 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { upgradeAuthLifecycleSchema } from "./coordinator-auth-lifecycle-upgrade-sqlite.js";
 import type { AuthLinkBackend } from "./coordinator-auth-link.js";
 import { consumeSigninProof, NOW } from "./coordinator-auth-link-test-fixtures.js";
 import { issueBrowserCookie, readBrowserCookie } from "./coordinator-browser-credential.js";
@@ -291,7 +290,6 @@ it.each(["confirm", "finalize"] as const)(
 	async (stage) => {
 		// Arrange: keep the real prepared ceremony; after upgrade this case exercises only storage.
 		await prepared(stage);
-		upgradeAuthLifecycleSchema(f.db);
 		const before = f.snapshot();
 		// Act
 		const rewrite = () =>

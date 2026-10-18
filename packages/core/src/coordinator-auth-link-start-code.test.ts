@@ -10,6 +10,7 @@ import {
 	materials,
 	transactionRows,
 } from "./coordinator-auth-browser-transaction-test-fixtures.js";
+import { skipAuthStatementRun } from "./coordinator-auth-fault-test-fixture.js";
 import {
 	AUTH_LINK_SCHEMA_SQL,
 	type CoordinatorAuthLinkCreateInput as Create,
@@ -28,6 +29,7 @@ import {
 	TABLES,
 	TTL,
 } from "./coordinator-auth-link-test-fixtures.js";
+import { CoordinatorAuthSchemaUpgradeRequiredError } from "./coordinator-auth-schema.js";
 import { sqliteD1 } from "./coordinator-auth-store-test-fixtures.js";
 import { D1CoordinatorStore } from "./d1-coordinator-store.js";
 
@@ -174,8 +176,7 @@ for (const backend of ["SQLite", "D1"] as const) {
 				expect(result).toEqual({
 					kind: "rejected",
 					error:
-						proof === "omitted" ||
-						(typeof proof === "string" && Object.hasOwn(alternateProofs, proof))
+						typeof proof === "string" && Object.hasOwn(alternateProofs, proof)
 							? "attempt_unavailable"
 							: "invalid_input",
 				});
@@ -237,9 +238,9 @@ for (const backend of ["SQLite", "D1"] as const) {
 			expect(f.db.prepare("SELECT * FROM enrolled_devices").all()).toEqual(grants);
 		});
 	});
-	describe(`${backend} legacy compatibility and scope`, () => {
+	describe(`${backend} strict commitment and scope`, () => {
 		const test = backendTest(backend);
-		test("legacy NULL rows allow trusted old claim/start but reject supplied code", async ({
+		test("committed rows reject omitted start proof and trusted hash-only claims", async ({
 			fixture: f,
 		}) => {
 			// Arrange
@@ -266,12 +267,12 @@ for (const backend of ["SQLite", "D1"] as const) {
 			expect(denied).toEqual({ kind: "rejected", error: "attempt_unavailable" });
 			expect(afterDenied).toEqual(before);
 			expect(orphans).toEqual([]);
-			expect(accepted).toEqual({ kind: "started", expiresAtMs: NOW + TTL });
-			expect(claimed).toEqual({
-				kind: "applied",
-				status: status("browser_claimed", "legacy-claim"),
-			});
-			expect(rows(f, TABLES[0]).every((row) => row.browser_start_hash === null)).toBe(true);
+			expect(accepted).toEqual({ kind: "rejected", error: "invalid_input" });
+			expect(claimed).toEqual({ kind: "rejected", error: "attempt_unavailable" });
+			expect(rows(f, TABLES[0]).every((row) => typeof row.browser_start_hash === "string")).toBe(
+				true,
+			);
+			expect(transactionRows(f)).toEqual([]);
 		});
 		test("signin ignores extra code metadata and cannot claim a link attempt", async ({
 			fixture: f,
@@ -414,15 +415,14 @@ for (const backend of ["SQLite", "D1"] as const) {
 			await authorize(f);
 			await f.store.createAuthLinkAttempt(protectedAttempt(), f.cfg);
 			const before = snapshot(f);
-			f.db.exec(
-				"CREATE TRIGGER ignore_protected_claim BEFORE UPDATE ON coordinator_auth_link_attempts WHEN NEW.state = 'browser_claimed' BEGIN SELECT RAISE(IGNORE); END",
-			);
+			const restore = skipAuthStatementRun(f.db, "UPDATE coordinator_auth_link_attempts");
 			// Act
 			const result = f.store.startAuthBrowserTransaction(start(), browserConfig);
 			// Assert
 			await expect(result).rejects.toThrow("auth_browser_transaction_persistence_incomplete");
 			expect(snapshot(f)).toEqual(before);
 			expect(transactionRows(f)).toEqual([]);
+			restore();
 		},
 	);
 }
@@ -464,21 +464,25 @@ function assertUpgrade(db: Database.Database, before: Record<string, unknown>) {
 	expect(() => db.prepare(`UPDATE ${TABLES[0]} SET browser_start_hash = ?`).run("bad")).toThrow();
 }
 
-it("upgrades an old isolated SQLite file before index creation and reopens idempotently", async () => {
+it("preserves an old isolated SQLite auth schema and reopens fail-closed pending explicit upgrade", async () => {
 	// Arrange
 	const directory = mkdtempSync(join(tmpdir(), "codemem-start-code-"));
 	const path = join(directory, "old.sqlite");
 	const old = new Database(path);
 	oldDatabase(old);
 	const before = old.prepare(`SELECT * FROM ${TABLES[0]}`).get() as Record<string, unknown>;
+	const schema = old.prepare(`PRAGMA table_info(${TABLES[0]})`).all();
 	old.close();
 	let store: BetterSqliteCoordinatorStore | undefined;
 	try {
 		// Act
 		store = new BetterSqliteCoordinatorStore(path);
 		// Assert
-		assertUpgrade(store.db, before);
-		const schema = store.db.prepare(`PRAGMA table_info(${TABLES[0]})`).all();
+		expect(store.db.prepare(`SELECT * FROM ${TABLES[0]}`).all()).toEqual([before]);
+		expect(store.db.prepare(`PRAGMA table_info(${TABLES[0]})`).all()).toEqual(schema);
+		await expect(
+			store.startAuthBrowserTransaction(materials(), browserConfig),
+		).rejects.toBeInstanceOf(CoordinatorAuthSchemaUpgradeRequiredError);
 		expect(
 			store.db
 				.prepare(`SELECT 1 FROM pragma_table_info('${TABLES[0]}') WHERE name = 'authority_kind'`)
@@ -493,7 +497,10 @@ it("upgrades an old isolated SQLite file before index creation and reopens idemp
 		await store.close();
 		store = new BetterSqliteCoordinatorStore(path);
 		expect(store.db.prepare(`PRAGMA table_info(${TABLES[0]})`).all()).toEqual(schema);
-		assertUpgrade(store.db, before);
+		expect(store.db.prepare(`SELECT * FROM ${TABLES[0]}`).all()).toEqual([before]);
+		await expect(
+			store.startAuthBrowserTransaction(materials(), browserConfig),
+		).rejects.toBeInstanceOf(CoordinatorAuthSchemaUpgradeRequiredError);
 	} finally {
 		await store?.close();
 		rmSync(directory, { recursive: true, force: true });

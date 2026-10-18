@@ -10,7 +10,7 @@ it("native D1 device claim advances, rejects a changed key, and cancels/recreate
 	const request = { authority: { kind: "device_claim" as const, identityId: input.identityId }, signer: input.signer, attemptId: "attempt-a", runtimeVerifierHash: "b".repeat(64), browserStartHash: "e".repeat(64), loopbackRedirect: "http://127.0.0.1:4567/codemem/auth/complete" };
 	const browserConfig = { ...config, redirectUri: "https://coordinator.example.test/auth/callback" };
 	const transaction = { purpose: "link" as const, attemptId: request.attemptId, browserStartHash: request.browserStartHash, stateHash: "3".repeat(64), binderHash: "4".repeat(64), nonce: "n".repeat(43), pkceVerifier: "p".repeat(43) };
-	const tables = (await env.COORDINATOR_DB.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT IN ('_cf_METADATA','coordinator_auth_link_attempts','coordinator_auth_browser_transactions') ORDER BY name").all<{ name: string }>()).results;
+	const tables = (await env.COORDINATOR_DB.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT IN ('_cf_METADATA','sqlite_sequence','coordinator_auth_link_attempts','coordinator_auth_browser_transactions') ORDER BY name").all<{ name: string }>()).results;
 	const snapshot = async () => Promise.all(tables.map(async ({ name }) => (await env.COORDINATOR_DB.prepare(`SELECT * FROM "${name}"`).all()).results));
 	const before = await snapshot();
 	// Act / Assert: trusted metadata, no Google network verification or finalization.

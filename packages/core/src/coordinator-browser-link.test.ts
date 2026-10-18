@@ -116,19 +116,19 @@ async function setup(
 		confirmAuthLinkAttempt: vi.fn(f.store.confirmAuthLinkAttempt.bind(f.store)),
 		failAuthLinkAttempt: vi.fn(f.store.failAuthLinkAttempt.bind(f.store)),
 	};
-	const legacy = {
+	const forbidden = {
 		claimAuthLinkAttempt: vi.fn(() => {
 			throw new Error("Legacy claim forbidden");
 		}),
-		redeemAuthLinkSession: vi.fn(() => {
-			throw new Error("Legacy redeem forbidden");
+		redeemAuthLinkSessionWithBrowserTransaction: vi.fn(() => {
+			throw new Error("Session redemption forbidden during confirmation");
 		}),
 	};
 	const discoveryCalls = oidc.fetch.mock.calls.length;
 	const link = createCoordinatorBrowserLinkHandlers({
 		config,
 		csrfKey,
-		store: { ...operations, ...legacy },
+		store: { ...operations, ...forbidden },
 		limiter,
 	});
 	if (!link.ok) throw new Error("Link setup failed");
@@ -164,7 +164,7 @@ async function setup(
 		scope,
 		limiter,
 		operations,
-		legacy,
+		forbidden,
 		callbackStore,
 		handlers: link.handlers,
 		link,
@@ -358,7 +358,7 @@ describe.each(["SQLite", "D1"] as const)("%s bound browser link", (backend) => {
 			).toBe(true);
 			expect(callback.response.headers.getSetCookie()).toEqual([]);
 			expect(authority(f)).toEqual(before);
-			for (const spy of Object.values(f.legacy)) expect(spy).not.toHaveBeenCalled();
+			for (const spy of Object.values(f.forbidden)) expect(spy).not.toHaveBeenCalled();
 			expect(rows(f)[0]).toMatchObject({
 				state: "oidc_verified",
 				account_subject: "opaque-subject-a",

@@ -1,4 +1,5 @@
 import { describe, expect } from "vitest";
+import { failAuthStatementRun } from "./coordinator-auth-fault-test-fixture.js";
 import {
 	advance,
 	authorize,
@@ -33,7 +34,7 @@ function registerSuccess(test: SessionTest) {
 		await linked(f);
 		const before = grants(f);
 		// Act
-		const result = await f.store.redeemAuthLinkSession(redeemInput(), f.cfg);
+		const result = await f.store.redeemAuthLinkSessionWithBrowserTransaction(redeemInput(), f.cfg);
 		const retry = await f.store.finalizeAuthLinkAttempt(finalize(), f.cfg);
 		// Assert
 		expectIssued(result, f);
@@ -59,10 +60,10 @@ function registerSuccess(test: SessionTest) {
 		async (hash, { fixture: f }) => {
 			// Arrange
 			await linked(f);
-			await f.store.redeemAuthLinkSession(redeemInput(), f.cfg);
+			await f.store.redeemAuthLinkSessionWithBrowserTransaction(redeemInput(), f.cfg);
 			const before = sessionRows(f);
 			// Act
-			const replay = await f.store.redeemAuthLinkSession(
+			const replay = await f.store.redeemAuthLinkSessionWithBrowserTransaction(
 				{ ...redeemInput(), credentialHash: hash },
 				f.cfg,
 			);
@@ -84,8 +85,8 @@ function registerSuccess(test: SessionTest) {
 		await linked(f);
 		// Act
 		const results = await Promise.all([
-			f.store.redeemAuthLinkSession(redeemInput(), f.cfg),
-			f.store.redeemAuthLinkSession(
+			f.store.redeemAuthLinkSessionWithBrowserTransaction(redeemInput(), f.cfg),
+			f.store.redeemAuthLinkSessionWithBrowserTransaction(
 				{ ...redeemInput(), credentialHash: otherCredentialHash },
 				f.cfg,
 			),
@@ -100,7 +101,7 @@ function registerSuccess(test: SessionTest) {
 		await linked(f);
 		f.db.function("changes", () => 0);
 		// Act
-		const result = await f.store.redeemAuthLinkSession(redeemInput(), f.cfg);
+		const result = await f.store.redeemAuthLinkSessionWithBrowserTransaction(redeemInput(), f.cfg);
 		// Assert
 		expectIssued(result, f);
 		expect(sessionRows(f).map((rows) => rows.length)).toEqual([1, 1]);
@@ -116,7 +117,10 @@ function registerDeadlines(test: SessionTest) {
 			f.now += offset;
 			const before = snapshot(f);
 			// Act
-			const result = await f.store.redeemAuthLinkSession(redeemInput(), f.cfg);
+			const result = await f.store.redeemAuthLinkSessionWithBrowserTransaction(
+				redeemInput(),
+				f.cfg,
+			);
 			// Assert
 			if (offset < REDEEM_WINDOW) {
 				expectIssued(result, f);
@@ -137,7 +141,10 @@ function registerDeadlines(test: SessionTest) {
 			await f.store.finalizeAuthLinkAttempt(finalize(), f.cfg);
 			f.now += offset;
 			// Act
-			const result = await f.store.redeemAuthLinkSession(redeemInput(), f.cfg);
+			const result = await f.store.redeemAuthLinkSessionWithBrowserTransaction(
+				redeemInput(),
+				f.cfg,
+			);
 			// Assert
 			if (offset < 30_000) {
 				expectIssued(result, f);
@@ -153,7 +160,7 @@ function registerDeadlines(test: SessionTest) {
 		f.now -= 1;
 		const before = snapshot(f);
 		// Act
-		const result = await f.store.redeemAuthLinkSession(redeemInput(), f.cfg);
+		const result = await f.store.redeemAuthLinkSessionWithBrowserTransaction(redeemInput(), f.cfg);
 		// Assert
 		expectRejected(result, "attempt_unavailable");
 		expect(snapshot(f)).toEqual(before);
@@ -174,7 +181,7 @@ function registerDenials(test: SessionTest) {
 			if (change === "missing-attempt") input.attemptId = "missing";
 			const before = snapshot(f);
 			// Act
-			const result = await f.store.redeemAuthLinkSession(input, f.cfg);
+			const result = await f.store.redeemAuthLinkSessionWithBrowserTransaction(input, f.cfg);
 			// Assert
 			expectRejected(result, "attempt_unavailable");
 			expect(snapshot(f)).toEqual(before);
@@ -190,7 +197,10 @@ function registerDenials(test: SessionTest) {
 		await linked(f);
 		const before = snapshot(f);
 		// Act
-		const result = await f.store.redeemAuthLinkSession(redeemInput(), { ...f.cfg, ...change });
+		const result = await f.store.redeemAuthLinkSessionWithBrowserTransaction(redeemInput(), {
+			...f.cfg,
+			...change,
+		});
 		// Assert
 		expectRejected(result, "auth_config_changed");
 		expect(snapshot(f)).toEqual(before);
@@ -204,17 +214,16 @@ function registerDenials(test: SessionTest) {
 			const before = snapshot(f);
 			const target =
 				fault === "session-insert"
-					? "BEFORE INSERT ON coordinator_auth_sessions"
-					: "BEFORE UPDATE OF state ON coordinator_auth_link_attempts WHEN NEW.state = 'session_redeemed'";
-			f.db.exec(
-				`CREATE TRIGGER fixture_session_fault ${target} BEGIN SELECT RAISE(ABORT, 'fixture-private-backend-detail'); END`,
-			);
+					? "INSERT INTO coordinator_auth_sessions"
+					: "UPDATE coordinator_auth_link_attempts";
+			const restore = failAuthStatementRun(f.db, target);
 			// Act
-			const result = f.store.redeemAuthLinkSession(redeemInput(), f.cfg);
+			const result = f.store.redeemAuthLinkSessionWithBrowserTransaction(redeemInput(), f.cfg);
 			// Assert
 			await expect(result).rejects.toThrow(/^auth_session_persistence_error$/);
 			expect(snapshot(f)).toEqual(before);
 			expect(sessionRows(f)).toEqual([[], []]);
+			restore();
 		},
 	);
 }

@@ -10,13 +10,16 @@ import {
 import { AUTH_CONTROLLER_SCHEMA_SQL } from "./coordinator-auth-controller.js";
 import { COORDINATOR_AUTH_DEVICE_CLAIM_SCHEMA_STATEMENTS as proof } from "./coordinator-auth-device-claim-schema.js";
 import {
+	AUTH_SCHEMA_V2_READINESS_SQL as AUTH_SCHEMA_READINESS_SQL,
+	AUTH_SCHEMA_V2_READY_COUNT as AUTH_SCHEMA_READY_COUNT,
+} from "./coordinator-auth-lifecycle-predecessor.js";
+import {
 	AUTH_LINK_AUTHORITY_CUTOVER_SQL,
 	AUTH_LINK_AUTHORITY_CUTOVER_STATEMENTS,
 	AUTH_LINK_AUTHORITY_UPGRADE_SQL,
 	upgradeAuthLinkAuthoritySchema,
 } from "./coordinator-auth-link-authority-upgrade.js";
 import { LEGACY_INLINE_AUTH_LINK_SCHEMA_SQL } from "./coordinator-auth-link-legacy-inline-test-fixture.js";
-import { AUTH_SCHEMA_READINESS_SQL, AUTH_SCHEMA_READY_COUNT } from "./coordinator-auth-schema.js";
 
 const LEGACY_LINK_SCHEMA_SQL = [
 	"0017_add_auth_account_links.sql",

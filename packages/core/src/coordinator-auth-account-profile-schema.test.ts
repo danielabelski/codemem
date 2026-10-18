@@ -4,6 +4,9 @@ import Database, { type Database as SqliteDatabase } from "better-sqlite3";
 import { describe, expect, it } from "vitest";
 import { connectCoordinator } from "./better-sqlite-coordinator-store.js";
 import { AUTH_ACCOUNT_PROFILE_SCHEMA_SQL } from "./coordinator-auth-account-profile-contract.js";
+import { AUTH_LIFECYCLE_ACCOUNT_PROFILE_TABLE_SQL } from "./coordinator-auth-lifecycle-profile-schema.js";
+import { upgradeAuthLifecycleSchema } from "./coordinator-auth-lifecycle-upgrade-sqlite.js";
+import { frozenV2Database } from "./coordinator-auth-lifecycle-upgrade-test-fixture.js";
 
 const TABLE = "coordinator_auth_account_profiles";
 const worker = join(import.meta.dirname, "../../cloudflare-coordinator-worker");
@@ -52,22 +55,22 @@ function insert(db: SqliteDatabase, changes: Record<string, unknown> = {}) {
 	).run(...Object.values(row));
 }
 
-function setup(source: "constant" | "migration" | "Worker" | "SQLite") {
+function setup(source: "constant" | "migration" | "Worker predecessor" | "SQLite") {
 	if (source === "SQLite") return connectCoordinator(":memory:");
+	if (source === "Worker predecessor") return frozenV2Database("migrations");
 	const db = new Database(":memory:");
 	let sql = AUTH_ACCOUNT_PROFILE_SCHEMA_SQL;
 	if (source !== "constant") {
-		const filename =
-			source === "Worker" ? "schema.sql" : "migrations/0021_add_auth_account_profiles.sql";
+		const filename = "migrations/0021_add_auth_account_profiles.sql";
 		sql = readFileSync(join(worker, filename), "utf8");
 	}
 	db.exec(sql);
 	return db;
 }
 
-it("constant, SQLite, fresh Worker and migration match definitions, columns and indexes", () => {
+it("frozen V2 constant, Worker predecessor snapshot and migration match definitions, columns and indexes", () => {
 	// Arrange
-	const sources = ["constant", "migration", "Worker", "SQLite"] as const;
+	const sources = ["constant", "migration", "Worker predecessor"] as const;
 	const databases = sources.map(setup);
 	try {
 		// Act
@@ -93,6 +96,29 @@ it("constant, SQLite, fresh Worker and migration match definitions, columns and 
 		);
 	} finally {
 		for (const db of databases) db.close();
+	}
+});
+
+it("current SQLite profile storage matches V3 definitions and explicit predecessor upgrade", () => {
+	// Arrange
+	const reference = new Database(":memory:");
+	reference.exec(AUTH_LIFECYCLE_ACCOUNT_PROFILE_TABLE_SQL);
+	const current = connectCoordinator(":memory:");
+	const currentWorker = new Database(":memory:");
+	currentWorker.exec(readFileSync(join(worker, "schema.sql"), "utf8"));
+	const migrated = frozenV2Database();
+	try {
+		// Act
+		upgradeAuthLifecycleSchema(migrated);
+		// Assert
+		expect(shape(current)).toEqual(shape(reference));
+		expect(shape(currentWorker)).toEqual(shape(reference));
+		expect(shape(migrated)).toEqual(shape(reference));
+	} finally {
+		reference.close();
+		current.close();
+		currentWorker.close();
+		migrated.close();
 	}
 });
 
@@ -122,7 +148,7 @@ it("migration applied twice preserves existing display rows and adds no other ta
 	}
 });
 
-function registerChecks(source: "constant" | "migration" | "Worker" | "SQLite") {
+function registerChecks(source: "constant" | "migration" | "Worker predecessor" | "SQLite") {
 	it.each([
 		{ display_name: "" },
 		{ display_name: "x".repeat(257) },
@@ -174,7 +200,7 @@ function registerChecks(source: "constant" | "migration" | "Worker" | "SQLite") 
 	});
 }
 
-describe.each(["constant", "migration", "Worker", "SQLite"] as const)(
+describe.each(["constant", "migration", "Worker predecessor", "SQLite"] as const)(
 	"%s profile schema checks",
 	registerChecks,
 );

@@ -26,7 +26,7 @@ afterEach(() => {
 		vi.restoreAllMocks();
 	}
 });
-async function setup(legacy = false) {
+async function setup(unrelatedCommitment = false) {
 	const config = {
 		enabled: true,
 		coordinatorId: crypto.randomUUID(),
@@ -62,7 +62,7 @@ async function setup(legacy = false) {
 		signer: review,
 		runtimeVerifierHash: hash(randomBytes(32)),
 		loopbackRedirect: "http://127.0.0.1:80/codemem/auth/complete",
-		...(legacy ? {} : { browserStartHash: hash(Buffer.from(startCode, "base64url")) }),
+		browserStartHash: unrelatedCommitment ? hash("unrelated-fixture-commitment") : hash(Buffer.from(startCode, "base64url")),
 	};
 	expect(await store.createAuthLinkAttempt(attempt, config)).toMatchObject({ kind: "created" });
 	const oidc = oidcFixture({ issuer: config.issuer });
@@ -194,11 +194,11 @@ it("native D1 GET/POST feeds actual OIDC consume and existing callback/confirmat
 	}
 });
 
-it.each(["wrong", "legacy"])(
+it.each(["wrong", "unrelated-commitment"])(
 	"native D1 %s start proof cannot claim even with its own valid browser CSRF",
 	async (fault) => {
 		// Arrange
-		const f = await setup(fault === "legacy");
+		const f = await setup(fault === "unrelated-commitment");
 		const c = await form(
 			f,
 			fault === "wrong" ? randomBytes(32).toString("base64url") : f.startCode,

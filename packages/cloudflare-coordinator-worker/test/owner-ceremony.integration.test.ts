@@ -69,21 +69,16 @@ test.for(["active", "retained"] as const)("native D1 enforces %s capacity and pr
 	expect((await f.api.start(f.start, "transport-a")).kind).toBe("started");
 	const cap = mode === "active" ? 1000 : AUTH_LINK_MAX_UNFINISHED_PER_COORDINATOR;
 	const state = mode === "active" ? "pending" : "failed";
-	// Skip the quadratic fixture-seeding scan, then restore the exact trigger before admission.
+	// Retain the production pin guard throughout fixture construction and admission.
 	const triggerQuery = { sql: "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='owner_enrollment_pins_insert'", values: [] };
 	const trigger = await backend.first<{ sql: string }>(triggerQuery);
 	if (!trigger) throw new Error("Missing owner pin trigger");
-	await exec("DROP TRIGGER owner_enrollment_pins_insert");
-	try {
-		await exec(`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < ?)
+	await exec(`WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < ?)
 	INSERT INTO coordinator_owner_enrollment_attempts (coordinator_id,attempt_id,purpose,origin,device_id,public_key,key_id,fingerprint,
 	issuer,auth_config_revision,loopback_redirect,browser_start_hash,state,created_at_ms,expires_at_ms)
 	SELECT a.coordinator_id,'capacity-'||n.i,a.purpose,a.origin,'capacity-device-'||n.i,a.public_key,a.key_id,a.fingerprint,
 	a.issuer,a.auth_config_revision,CASE WHEN ?='pending' THEN a.loopback_redirect ELSE NULL END,
 	printf('%064x',n.i),?,a.created_at_ms,a.expires_at_ms FROM coordinator_owner_enrollment_attempts a,n WHERE a.attempt_id='attempt-a'`, cap - 2, state, state);
-	} finally {
-		await exec(trigger.sql);
-	}
 	expect(await backend.first(triggerQuery)).toEqual(trigger);
 	const next = { ...f.start, attemptId: "last-slot", browserStartCode: Buffer.alloc(32, 10).toString("base64url") };
 	next.signature = await f.key.sign(ownerEnrollmentStartMessage(next, { ...config, origin: ORIGIN }));
@@ -295,9 +290,6 @@ test("native D1 rejects callback-only finalization and one-use confirmation repl
 
 const drift = {
 	link: `UPDATE coordinator_auth_account_links SET revoked_at_ms = ${NOW} WHERE coordinator_id = 'coordinator-a' AND link_id = 'link-a'`,
-	// Activation-only: replace this V2 mutation with a separate V3 immutable-storage
-	// rejection case. A blocked UPDATE must never stand in for an account change.
-	account: "UPDATE coordinator_auth_account_links SET subject = 'other-subject'",
 	grant:
 		"UPDATE coordinator_identity_group_grants SET revision = revision + 1 WHERE group_id = 'group-a'",
 	group: "UPDATE groups SET archived_at = 'archived' WHERE group_id = 'group-a'",
@@ -319,6 +311,18 @@ test.for(
 	// Assert
 	expect(result).toEqual(unavailable);
 	expect(await snapshot()).toEqual(before);
+});
+
+test.for(["confirm", "finalize"] as const)("native D1 rejects account birth mutation before %s without invalidating the retained proof", async (stage, { ceremony: f }) => {
+	// Arrange: a fully verified or confirmed ceremony still pins the original account.
+	const c = stage === "finalize" ? await confirmed(f) : { ...(await verified(f)), input: undefined };
+	const before = await snapshot();
+	// Act: birth mutation is denied by storage, not mistaken for a successful account change.
+	await expect(exec("UPDATE coordinator_auth_account_links SET subject = 'other-subject'")).rejects.toThrow(/auth_account_link_immutable/);
+	// Assert: intact evidence still permits the legitimate continuation.
+	expect(await snapshot()).toEqual(before);
+	const result = c.input ? await f.api.finalize(c.input) : await f.api.confirm(c.request(), "browser-a", c.callback.confirmation.confirmationHash);
+	expect(result).toMatchObject({ kind: stage === "finalize" ? "finalized" : "confirmed" });
 });
 
 test.for(["secret", "signature", "key", "confirmation"])(

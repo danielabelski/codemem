@@ -1,4 +1,5 @@
 import { expect, it } from "vitest";
+import { startBrowserProof } from "./coordinator-auth-browser-proof-test-fixtures.js";
 import type { CoordinatorAuthLinkStore } from "./coordinator-auth-link-contract.js";
 import { NOW, TTL } from "./coordinator-auth-link-test-fixtures.js";
 import { review } from "./coordinator-auth-store-test-fixtures.js";
@@ -25,7 +26,11 @@ export const linkRevocationTables = [
 	"groups",
 ] as const;
 export type LinkRevocationFixture = RevocationFixture & { now: number };
-type Gate = (query: string, boundary: "read" | "captured" | "write") => Promise<void>;
+type ExecutionFault = { failExecution: true };
+type Gate = (
+	query: string,
+	boundary: "read" | "captured" | "write",
+) => Promise<undefined | ExecutionFault>;
 type Guarded = (f: LinkRevocationFixture, gate: Gate) => CoordinatorAuthLinkStore;
 export function linkRevocationHarness(
 	fixture: (use: (f: LinkRevocationFixture) => Promise<void>) => Promise<void>,
@@ -91,24 +96,20 @@ async function authorize(f: LinkRevocationFixture) {
 }
 async function confirmed(f: LinkRevocationFixture, i: Inputs) {
 	expect(await f.store.createAuthLinkAttempt(i.start, i.cfg)).toMatchObject({ kind: "created" });
-	const material = {
-		stateHash: "1".repeat(64),
-		binderHash: "2".repeat(64),
-		nonce: "n".repeat(43),
-		pkceVerifier: "p".repeat(43),
-	};
-	expect(
-		await f.store.startAuthBrowserTransaction(
-			{
-				...material,
-				purpose: "link",
-				attemptId: i.start.attemptId,
-				browserStartHash: i.start.browserStartHash,
-			},
-			i.cfg,
-		),
-	).toMatchObject({ kind: "started" });
-	const consumed = await f.store.consumeAuthBrowserTransaction(material, i.cfg);
+	const materials = await startBrowserProof(
+		{ store: f.store, cfg: i.cfg },
+		{
+			attemptId: i.start.attemptId,
+			browserTransactionHash: i.browser.browserTransactionHash,
+			browserStartHash: i.start.browserStartHash,
+		},
+	);
+	const consumed = await f.store.consumeAuthBrowserTransaction(materials, i.cfg);
+	expect(consumed).toMatchObject({
+		kind: "consumed",
+		purpose: "link",
+		attemptId: i.start.attemptId,
+	});
 	if (consumed.kind !== "consumed") throw new Error("Missing bound revocation fixture proof");
 	i.browser.browserTransactionHash = consumed.browserTransactionHash;
 	i.confirm.browserTransactionHash = consumed.browserTransactionHash;
@@ -334,6 +335,9 @@ function registerHistory(test: Test) {
 
 // Forward actual native statements and batches, never simulate affected-row receipts.
 export function authLinkGuardedD1(db: D1DatabaseLike, gate: Gate, clock: () => number) {
+	// Valid SQL that fails during execution, after earlier batch writes have run.
+	// This works in SQLite and native D1 without adding an unexpected schema object.
+	const executionFailure = () => db.prepare("SELECT json_extract('fixture SQL failure', '$')");
 	const originals = new WeakMap<
 		D1PreparedStatementLike,
 		{ statement: D1PreparedStatementLike; query: string }
@@ -350,7 +354,8 @@ export function authLinkGuardedD1(db: D1DatabaseLike, gate: Gate, clock: () => n
 			all: async <T>() => statement.all<T>(),
 			raw: async <T>() => statement.raw<T>(),
 			run: async () => {
-				await gate(query, "write");
+				const fault = await gate(query, "write");
+				if (fault?.failExecution) return executionFailure().run();
 				return statement.run();
 			},
 		};
@@ -366,9 +371,13 @@ export function authLinkGuardedD1(db: D1DatabaseLike, gate: Gate, clock: () => n
 					if (!original) throw new Error("Unknown auth-link fixture statement");
 					return original;
 				});
-				for (const statement of actual) await gate(statement.query, "write");
+				const execution = [];
+				for (const statement of actual) {
+					const fault = await gate(statement.query, "write");
+					execution.push(fault?.failExecution ? executionFailure() : statement.statement);
+				}
 				if (!db.batch) throw new Error("Auth-link fixture requires atomic batch");
-				return db.batch(actual.map((entry) => entry.statement));
+				return db.batch(execution);
 			},
 		},
 		{ authClock: clock },
@@ -400,7 +409,7 @@ export function registerAuthLinkAtomicGuards(test: Test, guarded: Guarded) {
 	}
 	registerDrift(test, guarded);
 	registerCapture(test, guarded);
-	registerRollback(test);
+	registerRollback(test, guarded);
 	registerUnknownReceipt(test, guarded);
 }
 function registerUnknownReceipt(test: Test, guarded: Guarded) {
@@ -549,7 +558,7 @@ function registerCapture(test: Test, guarded: Guarded) {
 		});
 	}
 }
-function registerRollback(test: Test) {
+function registerRollback(test: Test, guarded: Guarded) {
 	for (const table of ["coordinator_auth_account_links", "coordinator_auth_link_audit_log"]) {
 		test(`${table} SQL failure rolls back consuming UPDATE and every account-link effect`, async ({
 			fixture: f,
@@ -557,21 +566,25 @@ function registerRollback(test: Test) {
 			// Arrange: fail the actual later statement after the consuming UPDATE ran.
 			const i = await prepare(f, "consume");
 			const before = await effects(f);
-			const trigger = `fixture_link_failure_${table}`;
-			await f.exec(
-				`CREATE TRIGGER ${trigger} BEFORE INSERT ON ${table} BEGIN SELECT RAISE(ABORT, 'fixture SQL failure'); END`,
-			);
+			let reached = false;
+			let consumingWritePrepared = false;
+			const failing = guarded(f, async (query, boundary) => {
+				if (boundary !== "write") return;
+				if (query.startsWith("UPDATE coordinator_auth_link_attempts"))
+					consumingWritePrepared = true;
+				if (!query.startsWith(`INSERT INTO ${table}`)) return;
+				reached = true;
+				return { failExecution: true };
+			});
 			// Act
-			try {
-				await expect(f.store.finalizeAuthLinkAttempt(i.final, i.cfg)).rejects.toThrow(
-					"auth_link_persistence_error",
-				);
-			} finally {
-				await f.exec(`DROP TRIGGER ${trigger}`);
-			}
+			await expect(failing.finalizeAuthLinkAttempt(i.final, i.cfg)).rejects.toThrow(
+				/^auth_link_persistence_error$/,
+			);
 			const after = await effects(f);
 			const valid = await f.store.finalizeAuthLinkAttempt(i.final, i.cfg);
 			// Assert: neither proof is consumed on rollback; a subsequent valid call succeeds.
+			expect(reached).toBe(true);
+			expect(consumingWritePrepared).toBe(true);
 			expect(after).toEqual(before);
 			expect(valid.kind).toBe("applied");
 		});

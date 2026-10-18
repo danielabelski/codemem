@@ -3,7 +3,8 @@ import { afterEach, beforeEach, expect, it } from "vitest";
 import { AUTH_LINK_AUTHORITY_UPGRADE_SQL, AUTH_LINK_AUTHORITY_CUTOVER_STATEMENTS } from "../../core/src/coordinator-auth-link-authority-upgrade.js";
 import { AUTH_LINK_SCHEMA_SQL } from "../../core/src/coordinator-auth-link-contract.js";
 import { COORDINATOR_AUTH_DEVICE_CLAIM_SCHEMA_STATEMENTS as proof } from "../../core/src/coordinator-auth-device-claim-schema.js";
-import { AUTH_SCHEMA_READINESS_SQL, AUTH_SCHEMA_READY_COUNT } from "../../core/src/coordinator-auth-schema.js";
+import { AUTH_SCHEMA_V2_READINESS_SQL as AUTH_SCHEMA_READINESS_SQL, AUTH_SCHEMA_V2_READY_COUNT as AUTH_SCHEMA_READY_COUNT } from "../../core/src/coordinator-auth-lifecycle-predecessor.js";
+import { restoreFrozenAuthPredecessor } from "./frozen-auth-predecessor-fixture.js";
 import {
 	legacyLinkAuthorityRowsSql,
 	linkAuthorityDefinitionsSql,
@@ -52,6 +53,7 @@ it("rolls back all swaps when proof installation fails, then commits the exact c
 });
 
 beforeEach(async () => {
+	await restoreFrozenAuthPredecessor();
 	// Freeze the legacy input at the actual pre-authority migrations, not the
 	// current fresh DDL installed by the shared test setup.
 	await batch(linkAuthorityTables.map((table) => `DROP TABLE ${table};`).join("\n"));

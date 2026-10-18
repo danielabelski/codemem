@@ -7,6 +7,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { readD1Migrations } from "@cloudflare/vitest-pool-workers";
 import { AUTH_LINK_AUTHORITY_CUTOVER_STATEMENTS } from "@codemem/core";
+import { installEmptyNativeCurrentAuth } from "./current-auth-schema-fixture.mjs";
 import {
 	ownerHandoffClient,
 	ownerBrowserStart,
@@ -31,7 +32,8 @@ async function loadHelpers(t) {
 	const bundle = await build({
 		stdin: {
 			contents: `
-export { ownerStartFixture, seedOwnerCallbackAuthority, browserForm, config, ORIGIN, proof } from './coordinator-owner-enrollment-start-test-fixtures.ts';
+export { ownerStartFixture, seedOwnerCallbackAuthority } from './coordinator-owner-enrollment-historical-test-fixture.ts';
+export { browserForm, config, ORIGIN, proof } from './coordinator-owner-enrollment-start-test-fixtures.ts';
 export { commitPendingKey } from './coordinator-owner-enrollment-commit-test-fixtures.ts';
 export { createCoordinatorOwnerEnrollment, ownerEnrollmentStartMessage } from './owner-enrollment-start.ts';
 export { createCoordinatorOwnerEnrollmentHttp } from './coordinator-owner-enrollment-http.ts';
@@ -51,6 +53,7 @@ export { NOW } from './coordinator-auth-link-test-fixtures.ts';`,
 		platform: "node",
 		format: "cjs",
 		target: "node24",
+		define: { "import.meta.url": JSON.stringify(new URL("../../core/src/index.ts", import.meta.url).href) },
 		plugins: [
 			{
 				name: "fixture-only-dependencies",
@@ -111,11 +114,21 @@ async function storage(t, h, kind) {
 	for (const migration of migrations)
 		await db.batch(migration.queries.map((sql) => db.prepare(sql)));
 	await db.batch(AUTH_LINK_AUTHORITY_CUTOVER_STATEMENTS.map((sql) => db.prepare(sql)));
+	await installEmptyNativeCurrentAuth(db);
 	await db.prepare(h.COORDINATOR_OWNER_ENROLLMENT_AUDIT_SCHEMA_SQL).run();
 	// Copy only existing synthetic account/grant authority, never an owner attempt or device.
 	for (const table of [
 		"groups",
+		"coordinator_auth_link_attempts",
+		"coordinator_auth_browser_transactions",
+		"coordinator_auth_device_claims",
+		"coordinator_auth_account_associations",
 		"coordinator_auth_account_links",
+		"coordinator_auth_link_audit_log",
+		"coordinator_auth_link_profiles",
+		"coordinator_auth_account_profiles",
+		"coordinator_auth_session_receipts",
+		"coordinator_auth_sessions",
 		"coordinator_identity_group_grants",
 	]) {
 		for (const row of sqlite.rows(table)) {

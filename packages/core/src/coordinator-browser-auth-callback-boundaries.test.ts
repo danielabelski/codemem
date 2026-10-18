@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TABLE } from "./coordinator-auth-browser-transaction-test-fixtures.js";
 import { renderAuthBrowserNotice } from "./coordinator-auth-browser-view.js";
-import { advance, authorize, NOW } from "./coordinator-auth-link-test-fixtures.js";
+import { advance, attempt, authorize, NOW } from "./coordinator-auth-link-test-fixtures.js";
 import { linked } from "./coordinator-auth-session-test-fixtures.js";
 import { setupStore } from "./coordinator-auth-store-test-fixtures.js";
 import {
@@ -232,6 +232,7 @@ describe("callback factory capabilities are inert, narrow and captured before di
 				"retireAuthBrowserTransactions",
 				"maintainAuthBrowserTransactions",
 				"redeemAuthLinkSession",
+				"redeemAuthLinkSessionWithBrowserTransaction",
 				"signOutAuthSession",
 			])
 				Object.defineProperty(store, name, { get: trap });
@@ -517,6 +518,7 @@ async function linkCeremony(f: Harness) {
 			{
 				purpose: "link",
 				attemptId: "attempt-a",
+				browserStartHash: attempt().browserStartHash,
 				binderHash: txn.cookieHash,
 				stateHash: await hash(begun.request.material.state),
 				nonce: begun.request.material.nonce,

@@ -9,6 +9,7 @@ import {
 	TABLE,
 	transactionRows,
 } from "./coordinator-auth-browser-transaction-test-fixtures.js";
+import { failAuthStatementRun } from "./coordinator-auth-fault-test-fixture.js";
 import type { AuthLinkBackend } from "./coordinator-auth-link.js";
 import {
 	attempt,
@@ -53,7 +54,12 @@ function allData(f: LinkFixture) {
 async function startLink(f: LinkFixture) {
 	await authorize(f);
 	await f.store.createAuthLinkAttempt(attempt(), f.cfg);
-	const input = { ...materials(), purpose: "link" as const, attemptId: "attempt-a" };
+	const input = {
+		...materials(),
+		purpose: "link" as const,
+		attemptId: "attempt-a",
+		browserStartHash: attempt().browserStartHash,
+	};
 	expect((await f.store.startAuthBrowserTransaction(input, config)).kind).toBe("started");
 	return input;
 }
@@ -427,7 +433,12 @@ function registerLimits(test: Test) {
 			f.cfg,
 		);
 		await f.store.startAuthBrowserTransaction(
-			{ ...materials(2), purpose: "link", attemptId: "attempt-b" },
+			{
+				...materials(2),
+				purpose: "link",
+				attemptId: "attempt-b",
+				browserStartHash: attempt({ attemptId: "attempt-b" }).browserStartHash,
+			},
 			config,
 		);
 		seed(f, 1);
@@ -586,9 +597,7 @@ function registerFaults(test: Test) {
 		async (stage, { fixture: f }) => {
 			// Arrange
 			seed(f, 2);
-			f.db.exec(
-				`CREATE TRIGGER abort_retirement BEFORE UPDATE ON ${TABLE} WHEN OLD.state_hash = '${hash(20002)}' BEGIN SELECT RAISE(ABORT, 'private-nonce-provider-marker'); END`,
-			);
+			const restore = failAuthStatementRun(f.db, `UPDATE ${TABLE}`);
 			const before = allData(f);
 			// Act
 			const operation =
@@ -599,6 +608,7 @@ function registerFaults(test: Test) {
 			await expect(operation).rejects.toThrow(/^auth_browser_transaction_persistence_/);
 			await expect(operation).rejects.not.toThrow("private-nonce-provider-marker");
 			expect(allData(f)).toEqual(before);
+			restore();
 		},
 	);
 	test("native zero changes reports no retirement authority and cancellation uses durable readback", async ({

@@ -561,7 +561,7 @@ describe("lifecycle display-only storage", () => {
 	});
 });
 
-it("leaves current initialization inert and frozen V2 readiness at ten", () => {
+it("fresh initialization installs lifecycle browser/profile storage and fences frozen V2", () => {
 	// Arrange
 	const db = connectCoordinator(":memory:");
 	databases.push(db);
@@ -569,13 +569,15 @@ it("leaves current initialization inert and frozen V2 readiness at ten", () => {
 	const ready = db.prepare(AUTH_SCHEMA_V2_READINESS_SQL).get();
 	// Assert
 	expect(AUTH_SCHEMA_V2_READY_COUNT).toBe(10);
-	expect(ready).toEqual({ ready: 10 });
-	expect(db.prepare("SELECT name FROM sqlite_master WHERE name = ?").all(refresh)).toEqual([]);
+	expect(ready).toEqual({ ready: AUTH_SCHEMA_V2_READY_COUNT - 1 });
+	expect(db.prepare("SELECT name FROM sqlite_master WHERE name = ?").all(refresh)).toEqual([
+		{ name: refresh },
+	]);
 	expect(
 		db
 			.prepare(`SELECT name FROM pragma_table_info('${browser}') WHERE name = 'browser_sequence'`)
 			.all(),
-	).toEqual([]);
+	).toEqual([{ name: "browser_sequence" }]);
 	for (const table of [signin, linkProfile])
 		expect(
 			db
@@ -583,5 +585,9 @@ it("leaves current initialization inert and frozen V2 readiness at ten", () => {
 					"SELECT name FROM pragma_table_info(?) WHERE name IN ('source_order','source_purpose')",
 				)
 				.all(table),
-		).toEqual([]);
+		).toEqual(
+			table === signin
+				? [{ name: "source_order" }]
+				: [{ name: "source_order" }, { name: "source_purpose" }],
+		);
 });

@@ -14,6 +14,18 @@ function fixtureHash(key: string) {
 	return createHash("sha256").update(`codemem-test-browser:${key}`).digest("hex");
 }
 
+/** Fix only the synchronous server hash draw; never changes the submitted proof. */
+export function withBrowserHash<T>(hash: string, start: () => T): T {
+	const entropy = vi
+		.spyOn(globalThis.crypto, "getRandomValues")
+		.mockReturnValueOnce(Uint8Array.from(Buffer.from(hash, "hex")));
+	try {
+		return start();
+	} finally {
+		entropy.mockRestore();
+	}
+}
+
 /** Synthetic persistence proof, not a provider token or an OIDC signature fixture. */
 export async function startBrowserProof(
 	f: BrowserProofFixture,
@@ -31,29 +43,24 @@ export async function startBrowserProof(
 	if (input.attemptId === undefined) {
 		startInput = { ...materials, purpose: "signin" };
 	} else {
+		if (input.browserStartHash === undefined)
+			throw new Error("Link proof fixture requires its start commitment");
 		startInput = {
 			...materials,
 			purpose: "link",
 			attemptId: input.attemptId,
-			browserStartHash: input.browserStartHash ?? fixtureHash(`browser-start:${input.attemptId}`),
+			browserStartHash: input.browserStartHash,
 		};
 	}
-	// Transaction creation draws its hash before its first await; pin only that draw.
-	const entropy = vi
-		.spyOn(globalThis.crypto, "getRandomValues")
-		.mockReturnValueOnce(Uint8Array.from(Buffer.from(input.browserTransactionHash, "hex")));
-	let started: ReturnType<typeof f.store.startAuthBrowserTransaction>;
-	try {
-		started = f.store.startAuthBrowserTransaction(startInput, config);
-	} finally {
-		entropy.mockRestore();
-	}
+	const started = withBrowserHash(input.browserTransactionHash, () =>
+		f.store.startAuthBrowserTransaction(startInput, config),
+	);
 	expect(await started).toMatchObject({ kind: "started" });
 	return materials;
 }
 
 export function browserProofConfig(f: Pick<LinkFixture, "cfg">): CoordinatorAuthBrowserConfig {
-	return { ...f.cfg, redirectUri: "https://coordinator.example.test/auth/callback" };
+	return { ...f.cfg };
 }
 
 export async function consumeSigninProof(

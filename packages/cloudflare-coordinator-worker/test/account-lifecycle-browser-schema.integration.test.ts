@@ -3,6 +3,7 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { AUTH_LIFECYCLE_BROWSER_TRANSACTION_TABLE_SQL, AUTH_LIFECYCLE_BROWSER_TRANSACTION_INDEX_STATEMENTS, AUTH_LIFECYCLE_BROWSER_SEQUENCE_GUARD_STATEMENTS } from "../../core/src/coordinator-auth-lifecycle-browser-schema.js";
 import { AUTH_LIFECYCLE_ACCOUNT_PROFILE_TABLE_SQL, AUTH_LIFECYCLE_LINK_PROFILE_TABLE_SQL, AUTH_LINK_PROFILE_REFRESH_TABLE_SQL } from "../../core/src/coordinator-auth-lifecycle-profile-schema.js";
 import { AUTH_SCHEMA_V2_READINESS_SQL } from "../../core/src/coordinator-auth-lifecycle-predecessor.js";
+import { restoreFrozenAuthPredecessor } from "./frozen-auth-predecessor-fixture.js";
 
 const db = env.COORDINATOR_DB;
 const browser = "coordinator_auth_browser_transactions";
@@ -14,6 +15,7 @@ function insert(table: string, row: Record<string, unknown>, mode: "INSERT" | "I
 	return db.prepare(`${mode} INTO ${table} (${columns.join(",")}) VALUES (${columns.map(() => "?").join(",")})`).bind(...columns.map((key) => row[key])).run();
 }
 beforeEach(async () => {
+	await restoreFrozenAuthPredecessor();
 	vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("network forbidden"));
 	// Only isolated Miniflare fixtures change; trigger bodies remain whole statements.
 	for (const table of [browser, "coordinator_auth_account_profiles", "coordinator_auth_link_profiles", refresh]) await db.prepare(`DROP TABLE IF EXISTS ${table}`).run();

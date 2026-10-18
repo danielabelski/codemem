@@ -8,6 +8,10 @@ import {
 	TABLE,
 	transactionRows,
 } from "./coordinator-auth-browser-transaction-test-fixtures.js";
+import {
+	AUTH_LIFECYCLE_BROWSER_TRANSACTION_INDEX_STATEMENTS,
+	AUTH_LIFECYCLE_BROWSER_TRANSACTION_TABLE_SQL,
+} from "./coordinator-auth-lifecycle-browser-schema.js";
 import { backendTest, NOW } from "./coordinator-auth-link-test-fixtures.js";
 import type { Backend } from "./coordinator-auth-store-test-fixtures.js";
 
@@ -33,7 +37,8 @@ for (const backend of ["SQLite", "D1"] as const satisfies readonly Backend[]) {
 			// Arrange
 			const reference = new Database(":memory:");
 			try {
-				reference.exec(AUTH_BROWSER_TXN_SCHEMA_SQL);
+				reference.exec(AUTH_LIFECYCLE_BROWSER_TRANSACTION_TABLE_SQL);
+				for (const sql of AUTH_LIFECYCLE_BROWSER_TRANSACTION_INDEX_STATEMENTS) reference.exec(sql);
 				// Act
 				const actual = schema(f.db);
 				const expected = schema(reference);

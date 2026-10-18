@@ -4,6 +4,7 @@ import {
 	browserProofConfig,
 	startBrowserProof,
 } from "./coordinator-auth-browser-proof-test-fixtures.js";
+import type { CoordinatorAuthBrowserConfig } from "./coordinator-auth-browser-transaction-contract.js";
 
 export {
 	browserProofConfig,
@@ -12,7 +13,6 @@ export {
 } from "./coordinator-auth-browser-proof-test-fixtures.js";
 
 import type {
-	CoordinatorAuthLinkConfig as Config,
 	CoordinatorAuthLinkCreateInput as CreateInput,
 	CoordinatorAuthLinkFinalizeInput as FinalizeInput,
 	CoordinatorAuthLinkRequester as Requester,
@@ -34,13 +34,14 @@ export const TABLES = [
 	"coordinator_auth_account_links",
 	"coordinator_auth_link_audit_log",
 ] as const;
-export type LinkFixture = Fixture & { now: number; cfg: Config };
+export type LinkFixture = Fixture & { now: number; cfg: CoordinatorAuthBrowserConfig };
 export type Test = ReturnType<typeof backendTest>;
-export const cfg: Config = {
+export const cfg: CoordinatorAuthBrowserConfig = {
 	coordinatorId: "coordinator-a",
 	issuer: "https://accounts.example.test",
 	revision: "a".repeat(64),
 	enabled: true,
+	redirectUri: "https://coordinator.example.test/auth/callback",
 };
 export const signer = {
 	groupId: "group-a",
@@ -96,6 +97,13 @@ export function rows(f: Fixture, table: (typeof TABLES)[number]) {
 
 export function snapshot(f: Fixture) {
 	return TABLES.map((table) => rows(f, table));
+}
+
+export function browserSequence(f: Fixture): number {
+	const row = f.db
+		.prepare("SELECT seq FROM sqlite_sequence WHERE name = 'coordinator_auth_browser_transactions'")
+		.get() as { seq: number } | undefined;
+	return row?.seq ?? 0;
 }
 
 export function setIdentity(f: Fixture, identity: string | null) {

@@ -1,4 +1,4 @@
-import { describe, expect } from "vitest";
+import { describe, expect, vi } from "vitest";
 import {
 	materials,
 	transactionRows,
@@ -37,7 +37,7 @@ function pendingAttempt() {
 type Test = ReturnType<typeof backendTest>;
 function registerAdvance(test: Test) {
 	test.for(["browser_claimed", "oidc_verified", "confirmed", "finalized"])(
-		"advance to %s retains consumed matching V2 browser evidence",
+		"advance to %s retains consumed matching sequenced browser evidence",
 		async (state, { fixture: f }) => {
 			// Arrange: the provider claims below are trusted synthetic store inputs, not JWTs.
 			await authorize(f);
@@ -77,7 +77,7 @@ function registerAdvance(test: Test) {
 				expires_at_ms: source.expires_at_ms,
 			});
 			expect(Number(browser.consumed_at_ms)).toBeLessThan(Number(browser.expires_at_ms));
-			expect(browser).not.toHaveProperty("browser_sequence");
+			expect(browser.browser_sequence).toBeGreaterThan(0);
 			expect(sessionRows(f)).toEqual([[], []]);
 		},
 	);
@@ -227,12 +227,20 @@ function registerSessions(test: Test) {
 		// Arrange: assert the existing receipt-first insertion order at the session boundary.
 		await linked(f);
 		const authority = grants(f);
-		f.db.exec(`CREATE TRIGGER fixture_receipt_first BEFORE INSERT ON coordinator_auth_sessions
-			WHEN NOT EXISTS (SELECT 1 FROM coordinator_auth_session_receipts r
-			 WHERE r.coordinator_id = NEW.coordinator_id AND r.browser_transaction_hash = NEW.browser_transaction_hash)
-			BEGIN SELECT RAISE(ABORT, 'fixture_missing_receipt'); END`);
+		const prepare = f.db.prepare.bind(f.db);
+		const spy = vi.spyOn(f.db, "prepare").mockImplementation((sql) => {
+			const statement = prepare(sql);
+			if (sql.startsWith("INSERT INTO coordinator_auth_sessions")) {
+				const run = statement.run.bind(statement);
+				vi.spyOn(statement, "run").mockImplementation((...values) => {
+					expect(prepare("SELECT * FROM coordinator_auth_session_receipts").all()).toHaveLength(1);
+					return run(...values);
+				});
+			}
+			return statement;
+		});
 		// Act
-		const result = await f.store.redeemAuthLinkSession(redeemInput(), f.cfg);
+		const result = await f.store.redeemAuthLinkSessionWithBrowserTransaction(redeemInput(), f.cfg);
 		// Assert
 		expectIssued(result, f);
 		expect(sessionRows(f).map((values) => values.length)).toEqual([1, 1]);
@@ -241,6 +249,7 @@ function registerSessions(test: Test) {
 			source: "link_redeem",
 		});
 		expect(grants(f)).toEqual(authority);
+		spy.mockRestore();
 	});
 
 	test("a caller-selected wrong redemption hash stays wrong despite valid fixture proof", async ({
@@ -251,7 +260,7 @@ function registerSessions(test: Test) {
 		const before = transactionRows(f);
 		const input = { ...redeemInput(), browserTransactionHash: "0".repeat(64) };
 		// Act
-		const result = await f.store.redeemAuthLinkSession(input, f.cfg);
+		const result = await f.store.redeemAuthLinkSessionWithBrowserTransaction(input, f.cfg);
 		// Assert
 		expectRejected(result, "attempt_unavailable");
 		expect(input.browserTransactionHash).toBe("0".repeat(64));

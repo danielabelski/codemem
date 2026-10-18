@@ -1,8 +1,10 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { BetterSqliteCoordinatorStore } from "./better-sqlite-coordinator-store.js";
+import { AUTH_CONTROLLER_SCHEMA_SQL } from "./coordinator-auth-controller.js";
+import { frozenCallerDatabase } from "./coordinator-auth-lifecycle-upgrade-test-fixture.js";
 import type { CoordinatorAuthLinkCreateInput as CreateInput } from "./coordinator-auth-link-contract.js";
 import {
 	advance,
@@ -22,12 +24,15 @@ import {
 	type Test,
 	TTL,
 } from "./coordinator-auth-link-test-fixtures.js";
+import { CoordinatorAuthSchemaUpgradeRequiredError } from "./coordinator-auth-schema.js";
 import {
 	type Backend,
 	enroll,
 	review,
 	setupStore,
+	sqliteD1,
 } from "./coordinator-auth-store-test-fixtures.js";
+import { D1CoordinatorStore } from "./d1-coordinator-store.js";
 
 function registerCreationTests(test: Test) {
 	test.for([null, "identity-a"])(
@@ -265,31 +270,48 @@ it.each(
 	}
 });
 
-it("SQLite existing-file upgrade adds empty link storage without changing review authority", async () => {
+it("SQLite existing-file open refuses optional auth upgrade without changing review authority", async () => {
 	// Arrange: only this disposable database represents a pre-link installation.
 	const directory = mkdtempSync(join(tmpdir(), "auth-link-upgrade-"));
 	const path = join(directory, "coordinator.sqlite");
-	let store = new BetterSqliteCoordinatorStore(path, { authClock: () => NOW });
+	const legacy = frozenCallerDatabase();
+	legacy.exec(AUTH_CONTROLLER_SCHEMA_SQL);
+	const legacyStore = new D1CoordinatorStore(sqliteD1(legacy), { authClock: () => NOW });
+	await enroll(legacyStore);
+	await legacyStore.createAuthControllerAttestation(review());
+	const enrollment = legacy.prepare("SELECT * FROM enrolled_devices").all();
+	const controllers = legacy
+		.prepare("SELECT * FROM coordinator_auth_controller_attestations")
+		.all();
+	const authBefore = legacy
+		.prepare(
+			"SELECT type,name,sql FROM sqlite_master WHERE instr(tbl_name,'coordinator_auth_')=1 ORDER BY type,name",
+		)
+		.all();
+	writeFileSync(path, legacy.serialize());
+	legacy.close();
+	let store: BetterSqliteCoordinatorStore | undefined;
 	try {
-		await enroll(store);
-		await store.createAuthControllerAttestation(review());
-		const enrollment = store.db.prepare("SELECT * FROM enrolled_devices").all();
-		const controllers = store.db
-			.prepare("SELECT * FROM coordinator_auth_controller_attestations")
-			.all();
-		for (const table of [...TABLES].reverse()) store.db.exec(`DROP TABLE ${table}`);
-		await store.close();
 		// Act
 		store = new BetterSqliteCoordinatorStore(path, { authClock: () => NOW });
 		// Assert
-		expect(snapshot({ store, db: store.db })).toEqual([[], [], []]);
+		expect(
+			store.db
+				.prepare(
+					"SELECT type,name,sql FROM sqlite_master WHERE instr(tbl_name,'coordinator_auth_')=1 ORDER BY type,name",
+				)
+				.all(),
+		).toEqual(authBefore);
 		expect(store.db.prepare("SELECT * FROM enrolled_devices").all()).toEqual(enrollment);
 		expect(
 			store.db.prepare("SELECT * FROM coordinator_auth_controller_attestations").all(),
 		).toEqual(controllers);
-		expect(await store.createAuthLinkAttempt(attempt(), cfg)).toMatchObject({ kind: "created" });
+		await expect(store.createAuthLinkAttempt(attempt(), cfg)).rejects.toBeInstanceOf(
+			CoordinatorAuthSchemaUpgradeRequiredError,
+		);
+		await store.createGroup("ordinary-sync-still-available");
 	} finally {
-		if (store.db.open) await store.close();
+		if (store?.db.open) await store.close();
 		rmSync(directory, { recursive: true, force: true });
 	}
 });

@@ -7,6 +7,7 @@ import {
 	TABLE,
 	transactionRows,
 } from "./coordinator-auth-browser-transaction-test-fixtures.js";
+import { failAuthStatementRun } from "./coordinator-auth-fault-test-fixture.js";
 import {
 	browserProofConfig,
 	consumeSigninProof,
@@ -428,7 +429,7 @@ function registerBudget(test: SessionTest) {
 	}) => {
 		// Arrange
 		await linked(f);
-		await f.store.redeemAuthLinkSession(redeemInput(), f.cfg);
+		await f.store.redeemAuthLinkSessionWithBrowserTransaction(redeemInput(), f.cfg);
 		await fill(f, 9);
 		const input = await ready(f);
 		const before = { sessions: sessionRows(f), grants: grants(f) };
@@ -575,8 +576,9 @@ function registerAtomicity(test: SessionTest) {
 			await linked(f);
 			if (change === "fill-cap") await fill(f, 9);
 			const input = await ready(f);
+			const lastSlot = change === "fill-cap" ? await ready(f, 2) : undefined;
 			const ops = capability(f, {
-				beforeBatch(sql) {
+				async beforeBatch(sql) {
 					expect(sql).toHaveLength(2);
 					expect(sql[0]).toMatch(
 						/INSERT INTO coordinator_auth_session_receipts[\s\S]*SELECT[\s\S]*coordinator_auth_browser_transactions[\s\S]*COUNT\(\*\)/,
@@ -588,9 +590,10 @@ function registerAtomicity(test: SessionTest) {
 						f.db.exec(
 							`UPDATE ${TABLE} SET state = 'expired', claim_token = NULL, consumed_at_ms = NULL`,
 						);
-					if (change === "fill-cap")
-						f.db.exec(
-							`INSERT INTO coordinator_auth_sessions SELECT coordinator_id, 'last-slot', '${hash(800)}', '${hash(801)}', link_id, identity_id, issuer, subject, auth_config_revision, created_at_ms, expires_at_ms, revoked_at_ms FROM coordinator_auth_sessions LIMIT 1`,
+					if (lastSlot)
+						expectIssued(
+							await f.store.signInWithConsumedBrowserTransaction(lastSlot, browserConfig),
+							f,
 						);
 				},
 			});
@@ -643,15 +646,13 @@ function registerPersistenceFaults(test: SessionTest) {
 			// Arrange
 			await linked(f);
 			const input = await ready(f);
+			let restore = () => {};
 			if (change === "duplicate-credential")
 				await f.store.signInWithConsumedBrowserTransaction(
 					{ ...signInInput(f), credentialHash: input.credentialHash },
 					browserProofConfig(f),
 				);
-			else
-				f.db.exec(
-					"CREATE TRIGGER fixture_consumed_fault BEFORE INSERT ON coordinator_auth_sessions BEGIN SELECT RAISE(ABORT, 'fixture-private-token-callback-claims'); END",
-				);
+			else restore = failAuthStatementRun(f.db, "INSERT INTO coordinator_auth_sessions");
 			const before = {
 				sessions: sessionRows(f),
 				grants: grants(f),
@@ -666,6 +667,7 @@ function registerPersistenceFaults(test: SessionTest) {
 				grants: grants(f),
 				transactions: transactionRows(f),
 			}).toEqual(before);
+			restore();
 		},
 	);
 	test("receipt read failure after commit is redacted and replay never recovers credentials", async ({

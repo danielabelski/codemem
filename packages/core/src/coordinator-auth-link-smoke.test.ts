@@ -1,4 +1,6 @@
 import { describe, expect, it } from "vitest";
+import { startBrowserProof } from "./coordinator-auth-browser-proof-test-fixtures.js";
+import { failAuthStatementRun } from "./coordinator-auth-fault-test-fixture.js";
 import type {
 	CoordinatorAuthLinkConfig,
 	CoordinatorAuthLinkFinalizeInput,
@@ -47,11 +49,25 @@ async function confirmedFlow({ store }: Fixture) {
 			attemptId: input.attemptId,
 			signer,
 			runtimeVerifierHash: input.runtimeVerifierHash,
+			browserStartHash: "e".repeat(64),
 			loopbackRedirect: "http://127.0.0.1:4567/codemem/auth/complete",
 		},
 		cfgMeta,
 	);
-	const claimed = await store.claimAuthLinkAttempt(browser, cfgMeta);
+	const browserConfig = {
+		...cfgMeta,
+		redirectUri: "https://coordinator.example.test/auth/callback",
+	};
+	const material = await startBrowserProof(
+		{ store, cfg: browserConfig },
+		{
+			attemptId: input.attemptId,
+			browserTransactionHash: browser.browserTransactionHash,
+			browserStartHash: "e".repeat(64),
+		},
+		browserConfig,
+	);
+	const claimed = await store.consumeAuthBrowserTransaction(material, browserConfig);
 	const account = { issuer: cfgMeta.issuer, subject: "opaque-subject-a" };
 	const verified = await store.recordAuthLinkOidcVerified({ ...browser, account }, cfgMeta);
 	const confirmed = await store.confirmAuthLinkAttempt(
@@ -59,7 +75,7 @@ async function confirmedFlow({ store }: Fixture) {
 		cfgMeta,
 	);
 	expect(created).toMatchObject({ kind: "created", status: { ...metadata, state: "pending" } });
-	expect(claimed).toEqual({ kind: "applied", status: { ...metadata, state: "browser_claimed" } });
+	expect(claimed).toMatchObject({ kind: "consumed", purpose: "link", ...browser });
 	expect(verified).toEqual({
 		kind: "applied",
 		status: { ...metadata, state: "oidc_verified" },
@@ -110,9 +126,10 @@ for (const backend of ["SQLite", "D1"] as const satisfies readonly Backend[]) {
 		test("rolls back an aborted audit insert and permits a clean retry", async ({ fixture }) => {
 			// Arrange: fail only this fixture's audit write, after link insertion.
 			const { cfg, input, metadata, enrollment } = await confirmedFlow(fixture);
-			fixture.db.exec(`CREATE TEMP TRIGGER smoke_fail_audit BEFORE INSERT ON coordinator_auth_link_audit_log
-				WHEN NEW.coordinator_id = 'coordinator-a' AND NEW.attempt_id = 'attempt-a'
-				BEGIN SELECT RAISE(ABORT, 'smoke_audit_failure'); END`);
+			const restore = failAuthStatementRun(
+				fixture.db,
+				"INSERT INTO coordinator_auth_link_audit_log",
+			);
 			// Act
 			const failed = fixture.store.finalizeAuthLinkAttempt(input, cfg);
 			// Assert: the failed transaction consumes nothing.
@@ -123,7 +140,7 @@ for (const backend of ["SQLite", "D1"] as const satisfies readonly Backend[]) {
 			expect(fixture.db.prepare("SELECT * FROM coordinator_auth_account_links").all()).toEqual([]);
 			expect(fixture.db.prepare("SELECT * FROM coordinator_auth_link_audit_log").all()).toEqual([]);
 			// Arrange / Act: remove the injected fault and retry the same commitments.
-			fixture.db.exec("DROP TRIGGER smoke_fail_audit");
+			restore();
 			const retry = await fixture.store.finalizeAuthLinkAttempt(input, cfg);
 			// Assert
 			expect(retry).toEqual({ kind: "applied", status: { ...metadata, state: "finalized" } });

@@ -3,6 +3,8 @@ import { browserProofConfig, consumeSigninProof } from "../../core/src/coordinat
 import { randomUUID } from "node:crypto";
 import { D1CoordinatorStore } from "@codemem/core/internal/cloudflare-coordinator";
 import { afterEach, expect, it } from "vitest";
+import { consumeNativeLinkProof } from "./native-auth-proof-fixture.js";
+import { disposeNativeAuthFixture } from "./owner-ceremony-test-fixtures.js";
 import { CANONICAL_PUBLIC_KEY } from "../../core/src/coordinator-ed25519-key-id-test-fixtures.js";
 
 const NOW = 1_791_028_800_000;
@@ -18,11 +20,9 @@ const owned: { coordinatorId: string; groupId: string }[] = [];
 const tables = "link_profiles account_profiles sessions session_receipts link_audit_log account_links link_attempts controller_attestations".split(" ");
 
 afterEach(async () => {
+	await disposeNativeAuthFixture();
 	for (const f of owned.splice(0)) {
 		await env.COORDINATOR_DB.batch([
-			...tables.map((name) => env.COORDINATOR_DB.prepare(
-				`DELETE FROM coordinator_auth_${name} WHERE coordinator_id = ?`,
-			).bind(f.coordinatorId)),
 			env.COORDINATOR_DB.prepare("DELETE FROM enrolled_devices WHERE group_id = ?").bind(f.groupId),
 			env.COORDINATOR_DB.prepare("DELETE FROM groups WHERE group_id = ?").bind(f.groupId),
 		]);
@@ -39,13 +39,14 @@ async function fixture() {
 		publicKey: CANONICAL_PUBLIC_KEY, fingerprint: hash(), evidenceDigest: hash(),
 	};
 	owned.push(review);
-	const cfg = { coordinatorId: review.coordinatorId, issuer: "https://accounts.example.test", revision: "a".repeat(64), enabled: true };
+	const cfg = { coordinatorId: review.coordinatorId, issuer: "https://accounts.example.test", revision: "a".repeat(64), enabled: true, redirectUri: "https://app.example.test/callback" };
 	const start = {
 		authority: { kind: "controller_attestation" as const }, attemptId: randomUUID(),
 		signer: review, runtimeVerifierHash: hash(),
+		browserStartHash: hash(),
 		loopbackRedirect: "http://127.0.0.1:4567/codemem/auth/complete",
 	};
-	const browser = { attemptId: start.attemptId, browserTransactionHash: hash() };
+	const browser = { attemptId: start.attemptId, browserTransactionHash: hash(), binderHash: "" };
 	const account = { issuer: cfg.issuer, subject: "synthetic-subject" };
 	const confirm = { ...browser, completionSecretHash: hash() };
 	const proof = { ...review, ...start, completionSecretHash: confirm.completionSecretHash, purpose: "coordinator-account-link-v1" as const };
@@ -53,7 +54,7 @@ async function fixture() {
 	await store.enrollDevice(review.groupId, { ...review, identityId: null });
 	expect(await store.createAuthControllerAttestation(review)).toMatchObject({ kind: "created" });
 	expect(await store.createAuthLinkAttempt(start, cfg)).toMatchObject({ kind: "created" });
-	expect(await store.claimAuthLinkAttempt(browser, cfg)).toMatchObject({ kind: "applied" });
+	await consumeNativeLinkProof({ store, cfg }, start, browser);
 	return { store, time, cfg, review, browser, account, confirm, proof };
 }
 type Fixture = Awaited<ReturnType<typeof fixture>>;

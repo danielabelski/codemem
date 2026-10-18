@@ -9,6 +9,7 @@ import {
 	TABLE,
 	transactionRows,
 } from "./coordinator-auth-browser-transaction-test-fixtures.js";
+import { skipAuthStatementRun } from "./coordinator-auth-fault-test-fixture.js";
 import {
 	advance,
 	attempt,
@@ -238,6 +239,7 @@ function registerLinkAtomicityTests(test: Test) {
 			...materials(value),
 			purpose: "link" as const,
 			attemptId: "attempt-a",
+			browserStartHash: attempt().browserStartHash,
 		}));
 		// Act
 		const results = await Promise.all(
@@ -249,7 +251,12 @@ function registerLinkAtomicityTests(test: Test) {
 		const beforeRetry = transactionRows(f);
 		const attemptsBeforeRetry = snapshot(f);
 		const retry = await f.store.startAuthBrowserTransaction(
-			{ ...materials(3), purpose: "link", attemptId: "attempt-a" },
+			{
+				...materials(3),
+				purpose: "link",
+				attemptId: "attempt-a",
+				browserStartHash: attempt().browserStartHash,
+			},
 			config,
 		);
 		// Assert
@@ -311,20 +318,27 @@ function registerLinkAtomicityTests(test: Test) {
 		// Arrange
 		await authorize(f);
 		await f.store.createAuthLinkAttempt(attempt(), f.cfg);
-		f.db.exec(
-			"CREATE TRIGGER ignore_browser_claim BEFORE UPDATE ON coordinator_auth_link_attempts WHEN NEW.state = 'browser_claimed' BEGIN SELECT RAISE(IGNORE); END",
-		);
+		const restore = skipAuthStatementRun(f.db, "UPDATE coordinator_auth_link_attempts");
 		const before = snapshot(f);
 		// Act
 		const result = f.store.startAuthBrowserTransaction(
-			{ ...materials(), purpose: "link", attemptId: "attempt-a" },
+			{
+				...materials(),
+				purpose: "link",
+				attemptId: "attempt-a",
+				browserStartHash: attempt().browserStartHash,
+			},
 			config,
 		);
 		// Assert
 		await expect(result).rejects.toThrow(/^auth_browser_transaction_persistence_/);
 		expect(transactionRows(f)).toEqual([]);
 		expect(snapshot(f)).toEqual(before);
+		restore();
 	});
+}
+
+function registerBrowserReuseTest(test: Test) {
 	test("burned proof cannot claim a second link attempt", async ({ fixture: f }) => {
 		// Arrange
 		await authorize(f);
@@ -333,13 +347,22 @@ function registerLinkAtomicityTests(test: Test) {
 			attempt({ attemptId: "attempt-b", runtimeVerifierHash: hash(100) }),
 			f.cfg,
 		);
-		const input = { ...materials(), purpose: "link" as const, attemptId: "attempt-a" };
+		const input = {
+			...materials(),
+			purpose: "link" as const,
+			attemptId: "attempt-a",
+			browserStartHash: attempt().browserStartHash,
+		};
 		await f.store.startAuthBrowserTransaction(input, config);
 		const before = snapshot(f);
 		const transactions = transactionRows(f);
 		// Act
 		const result = await f.store.startAuthBrowserTransaction(
-			{ ...input, attemptId: "attempt-b" },
+			{
+				...input,
+				attemptId: "attempt-b",
+				browserStartHash: attempt({ attemptId: "attempt-b" }).browserStartHash,
+			},
 			config,
 		);
 		// Assert
@@ -358,7 +381,12 @@ function registerLinkTests(test: Test) {
 		await f.store.createAuthLinkAttempt(attempt(), f.cfg);
 		f.now += 1000;
 		const before = snapshot(f);
-		const input = { ...materials(), purpose: "link" as const, attemptId: "attempt-a" };
+		const input = {
+			...materials(),
+			purpose: "link" as const,
+			attemptId: "attempt-a",
+			browserStartHash: attempt().browserStartHash,
+		};
 		// Act
 		const result = await f.store.startAuthBrowserTransaction(input, config);
 		const resolved = await f.store.resolveAuthLinkBrowserTransaction(input, config);
@@ -388,7 +416,12 @@ function registerLinkTests(test: Test) {
 			const before = snapshot(f);
 			// Act
 			const result = await f.store.startAuthBrowserTransaction(
-				{ ...materials(), purpose: "link", attemptId: "attempt-a" },
+				{
+					...materials(),
+					purpose: "link",
+					attemptId: "attempt-a",
+					browserStartHash: attempt().browserStartHash,
+				},
 				config,
 			);
 			// Assert
@@ -403,7 +436,12 @@ function registerLinkTests(test: Test) {
 		// Arrange
 		await authorize(f);
 		await f.store.createAuthLinkAttempt(attempt(), f.cfg);
-		const input = { ...materials(), purpose: "link" as const, attemptId: "attempt-a" };
+		const input = {
+			...materials(),
+			purpose: "link" as const,
+			attemptId: "attempt-a",
+			browserStartHash: attempt().browserStartHash,
+		};
 		await f.store.startAuthBrowserTransaction(input, config);
 		const browserTransactionHash = transactionRows(f)[0].browser_transaction_hash as string;
 		const proof = { attemptId: input.attemptId, browserTransactionHash };
@@ -440,7 +478,12 @@ function registerLinkTests(test: Test) {
 		// Arrange
 		await authorize(f);
 		await f.store.createAuthLinkAttempt(attempt(), f.cfg);
-		const input = { ...materials(), purpose: "link" as const, attemptId: "attempt-a" };
+		const input = {
+			...materials(),
+			purpose: "link" as const,
+			attemptId: "attempt-a",
+			browserStartHash: attempt().browserStartHash,
+		};
 		await f.store.startAuthBrowserTransaction(input, config);
 		// Act
 		const wrong = await f.store.resolveAuthLinkBrowserTransaction(
@@ -536,7 +579,12 @@ function registerAdmissionTests(test: Test) {
 		await f.store.createAuthLinkAttempt(attempt(), f.cfg);
 		// Act
 		const result = await f.store.startAuthBrowserTransaction(
-			{ ...materials(), purpose: "link", attemptId: "attempt-a" },
+			{
+				...materials(),
+				purpose: "link",
+				attemptId: "attempt-a",
+				browserStartHash: attempt().browserStartHash,
+			},
 			config,
 		);
 		// Assert
@@ -765,7 +813,12 @@ function registerCorruptionTests(test: Test) {
 			// Arrange: bypass constraints only on this test's isolated in-memory database.
 			await authorize(f);
 			await f.store.createAuthLinkAttempt(attempt(), f.cfg);
-			const input = { ...materials(), purpose: "link" as const, attemptId: "attempt-a" };
+			const input = {
+				...materials(),
+				purpose: "link" as const,
+				attemptId: "attempt-a",
+				browserStartHash: attempt().browserStartHash,
+			};
 			await f.store.startAuthBrowserTransaction(input, config);
 			f.db.exec("PRAGMA ignore_check_constraints = ON");
 			try {
@@ -793,6 +846,7 @@ for (const backend of ["SQLite", "D1"] as const satisfies readonly Backend[]) {
 		registerConsumeTests(test);
 		registerLinkTests(test);
 		registerLinkAtomicityTests(test);
+		registerBrowserReuseTest(test);
 		registerAdmissionTests(test);
 		registerMaintenanceTests(test);
 		registerValidationTests(test);

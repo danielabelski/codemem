@@ -25,7 +25,7 @@ function authority(f: LinkFixture) {
 		.all() as { name: string }[];
 	return tables
 		.filter(({ name }) => !excluded.includes(name))
-		.map(({ name }) => [name, f.db.prepare(`SELECT * FROM "${name}"`).all()]);
+		.map(({ name }) => [name, f.db.prepare(`SELECT * FROM "${name}"`).all()] as const);
 }
 async function guarded(f: LinkFixture) {
 	await sessions.linked(f);
@@ -44,7 +44,7 @@ async function guarded(f: LinkFixture) {
 	const before = authority(f);
 	sessions.expectIssued(await f.store.signInWithConsumedBrowserTransaction(input, cfg), f);
 	expect(authority(f)).toEqual(before);
-	expect(sessions.sessionRows(f)[0][0]).toMatchObject({ source: "signin", purge_eligible: 1 });
+	expect(sessions.sessionRows(f)[0]?.[0]).toMatchObject({ source: "signin", purge_eligible: 1 });
 	return { cfg, input, before, createdAt: f.now };
 }
 async function purge(f: LinkFixture) {
@@ -89,13 +89,31 @@ for (const backend of ["SQLite", "D1"] as const) {
 		test("legacy signin receipts stay spent after 64h", async ({ fixture: f }) => {
 			// Arrange: issue normally, then model older history with retained receipt metadata.
 			await sessions.linked(f);
-			const before = authority(f);
 			const input = {
 				...sessions.signInInput(f),
 				browserTransactionHash: legacyHash,
 				credentialHash,
 			};
+			const beforeProof = authority(f);
+			const previousSequences = f.db.prepare("SELECT * FROM sqlite_sequence").all() as {
+				name: string;
+				seq: number;
+			}[];
 			await consumeSigninProof(f, input.browserTransactionHash);
+			// A newly started proof advances sqlite_sequence; issuance and cleanup must not.
+			const before = authority(f);
+			expect(before).toEqual(
+				beforeProof.map(([table, rows]) =>
+					table === "sqlite_sequence"
+						? [
+								table,
+								previousSequences.map((row) =>
+									row.name === browser.TABLE ? { ...row, seq: row.seq + 1 } : row,
+								),
+							]
+						: [table, rows],
+				),
+			);
 			sessions.expectIssued(
 				await f.store.signInWithConsumedBrowserTransaction(input, browserProofConfig(f)),
 				f,
@@ -106,7 +124,7 @@ for (const backend of ["SQLite", "D1"] as const) {
 				)
 				.run(f.cfg.coordinatorId, input.browserTransactionHash);
 			const rows = sessions.sessionRows(f);
-			expect(rows[0][0]).toMatchObject({ source: "signin", purge_eligible: 0 });
+			expect(rows[0]?.[0]).toMatchObject({ source: "signin", purge_eligible: 0 });
 			f.now += RETENTION * 2;
 			// Act
 			const cleanup = await purge(f);

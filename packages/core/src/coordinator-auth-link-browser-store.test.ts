@@ -1,4 +1,5 @@
 import { describe, expect, vi } from "vitest";
+import { materials } from "./coordinator-auth-browser-transaction-test-fixtures.js";
 import type { CoordinatorAuthLinkRequester as Requester } from "./coordinator-auth-link-contract.js";
 import {
 	advance,
@@ -18,6 +19,7 @@ import {
 	signer,
 	snapshot,
 	stages,
+	startBrowserProof,
 	status,
 	TABLES,
 	type Test,
@@ -113,9 +115,20 @@ function registerBoundaryTests(test: Test) {
 			const before = snapshot(f);
 			f.now = NOW + TTL + offset;
 			// Act
-			const result = await transition(f, stage);
+			const result =
+				stage === "claim"
+					? await f.store.startAuthBrowserTransaction(
+							{
+								...materials(),
+								purpose: "link",
+								attemptId: "attempt-a",
+								browserStartHash: attempt().browserStartHash,
+							},
+							f.cfg,
+						)
+					: await transition(f, stage);
 			// Assert: deadline equality is expired, with no renewal or consume.
-			if (offset < 0) expect(result.kind).toBe("applied");
+			if (offset < 0) expect(result.kind).toBe(stage === "claim" ? "started" : "applied");
 			else {
 				expectRejected(result, "attempt_expired");
 				expect(snapshot(f)).toEqual(before);
@@ -277,53 +290,65 @@ function registerOidcValidationTests(test: Test) {
 }
 
 function registerClaimTests(test: Test) {
-	test("one competing browser owns the attempt and exact claim retry retains it", async ({
+	test("one competing browser owns the attempt and only its binder resolves the retained claim", async ({
 		fixture: f,
 	}) => {
 		// Arrange
 		await authorize(f);
 		await advance(f, "pending");
-		const hashes = [browserHash, "e".repeat(64)];
+		const inputs = [1, 2].map((id) => ({
+			...materials(id),
+			purpose: "link" as const,
+			attemptId: "attempt-a",
+			browserStartHash: attempt().browserStartHash,
+		}));
 		// Act
 		const results = await Promise.all(
-			hashes.map((hash) =>
-				f.store.claimAuthLinkAttempt(
-					{ attemptId: "attempt-a", browserTransactionHash: hash },
-					f.cfg,
-				),
-			),
+			inputs.map((input) => f.store.startAuthBrowserTransaction(input, f.cfg)),
 		);
-		const winner = results.findIndex((result) => result.kind === "applied");
-		const retry = await f.store.claimAuthLinkAttempt(
-			{ attemptId: "attempt-a", browserTransactionHash: hashes[winner] },
-			f.cfg,
-		);
+		const winner = results.findIndex((result) => result.kind === "started");
+		const resolved = await f.store.resolveAuthLinkBrowserTransaction(inputs[winner], f.cfg);
+		const denied = await f.store.resolveAuthLinkBrowserTransaction(inputs[1 - winner], f.cfg);
 		// Assert
-		expect(results.filter((result) => result.kind === "applied")).toEqual([
-			{ kind: "applied", status: status("browser_claimed") },
+		expect(results.filter((result) => result.kind === "started")).toEqual([
+			{ kind: "started", expiresAtMs: NOW + TTL },
 		]);
 		expectRejected(results[1 - winner], "attempt_unavailable");
-		expect(retry).toEqual({ kind: "existing", status: status("browser_claimed") });
-		expect(rows(f, TABLES[0])[0].browser_transaction_hash).toBe(hashes[winner]);
+		expect(resolved).toEqual({
+			browserTransactionHash: rows(f, TABLES[0])[0].browser_transaction_hash,
+		});
+		expect(denied).toBeNull();
 	});
 	test("browser commitment reused across attempts is a conflict, not new ownership", async ({
 		fixture: f,
 	}) => {
 		// Arrange
 		await authorize(f);
-		await advance(f, "browser_claimed");
+		const creation = attempt();
+		await f.store.createAuthLinkAttempt(creation, f.cfg);
+		const material = await startBrowserProof(f, {
+			attemptId: creation.attemptId,
+			browserTransactionHash: browserHash,
+			browserStartHash: creation.browserStartHash,
+		});
+		expect((await f.store.consumeAuthBrowserTransaction(material, f.cfg)).kind).toBe("consumed");
 		await f.store.createAuthLinkAttempt(
 			attempt({ attemptId: "attempt-b", runtimeVerifierHash: "1".repeat(64) }),
 			f.cfg,
 		);
 		const before = snapshot(f);
 		// Act
-		const result = await f.store.claimAuthLinkAttempt(
-			{ attemptId: "attempt-b", browserTransactionHash: browserHash },
+		const result = await f.store.startAuthBrowserTransaction(
+			{
+				...material,
+				purpose: "link",
+				attemptId: "attempt-b",
+				browserStartHash: attempt({ attemptId: "attempt-b" }).browserStartHash,
+			},
 			f.cfg,
 		);
 		// Assert
-		expectRejected(result, "attempt_conflict");
+		expectRejected(result, "transaction_conflict");
 		expect(snapshot(f)).toEqual(before);
 	});
 }

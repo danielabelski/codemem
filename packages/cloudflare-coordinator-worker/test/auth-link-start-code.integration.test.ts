@@ -105,8 +105,9 @@ it("native D1 rejects omitted, wrong and malformed proof without orphan SDK rows
 		f.cfg,
 	);
 	// Assert
-	for (const result of [missing, wrong, blind, wrongNamespace, wrongAttempt])
+	for (const result of [wrong, blind, wrongNamespace, wrongAttempt])
 		expect(result).toEqual({ kind: "rejected", error: "attempt_unavailable" });
+	expect(missing).toEqual({ kind: "rejected", error: "invalid_input" });
 	expect(invalid).toEqual({ kind: "rejected", error: "invalid_input" });
 	expect(await rows(f, attemptTable)).toEqual(before);
 	expect(await rows(f)).toEqual([]);
@@ -173,34 +174,17 @@ it("native D1 competing protected starts claim once and preserve only the origin
 	expect(await grants(f)).toEqual([[], [], [], []]);
 });
 
-it("native D1 legacy NULL rows accept old trusted paths but never accept supplied code", async () => {
+it("native D1 rejects current creation without a start commitment and preserves a valid retry", async () => {
 	// Arrange
-	const f = await fixture(false);
-	const direct = await fixture(false);
+	const f = await fixture();
+	const { browserStartHash: _hash, ...unbound } = { ...f.create, attemptId: crypto.randomUUID(), runtimeVerifierHash: hash() };
 	const before = await rows(f, attemptTable);
-	const { browserStartHash: _hash, ...legacyStart } = f.start;
 	// Act
-	const denied = await f.store.startAuthBrowserTransaction(f.start, f.cfg);
-	const afterDenied = await rows(f, attemptTable);
-	const orphanRows = await rows(f);
-	const accepted = await f.store.startAuthBrowserTransaction(legacyStart, f.cfg);
-	const claimed = await direct.store.claimAuthLinkAttempt(
-		{ attemptId: direct.create.attemptId, browserTransactionHash: hash() },
-		direct.cfg,
-	);
+	const denied = await f.store.createAuthLinkAttempt(unbound, f.cfg);
 	// Assert
-	expect(denied).toEqual({ kind: "rejected", error: "attempt_unavailable" });
-	expect(afterDenied).toEqual(before);
-	expect(orphanRows).toEqual([]);
-	expect(accepted).toEqual({ kind: "started", expiresAtMs: NOW + TTL });
-	expect(claimed).toEqual({
-		kind: "applied",
-		status: {
-			attemptId: direct.create.attemptId,
-			state: "browser_claimed",
-			expiresAtMs: NOW + TTL,
-		},
-	});
-	expect((await rows(f, attemptTable))[0].browser_start_hash).toBeNull();
+	expect(denied).toEqual({ kind: "rejected", error: "invalid_input" });
+	expect(await rows(f, attemptTable)).toEqual(before);
+	expect(await rows(f)).toEqual([]);
+	expect(await f.store.createAuthLinkAttempt({ ...unbound, browserStartHash: hash() }, f.cfg)).toMatchObject({ kind: "created" });
 	expect(await grants(f)).toEqual([[], [], [], []]);
 });

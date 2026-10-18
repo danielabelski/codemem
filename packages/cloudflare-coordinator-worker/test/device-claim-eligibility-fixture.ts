@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { authLifecycleFirstLinkStatements } from "../../core/src/coordinator-auth-lifecycle-first-link.js";
 import { CANONICAL_PUBLIC_KEY, EXPECTED_KEY_ID } from "../../core/src/coordinator-ed25519-key-id-test-fixtures.js";
 
 export const NOW = 1_791_028_800_000;
@@ -101,19 +102,20 @@ export function controllerLinkEvidenceSql(changes: {
 		...changes,
 	};
 	const genesis = genesisEvidence(pins);
-	// Activation seam: add association reservation, generation=1 and the browser
-	// sequence floor here only when the installed schema and runtime become V3.
-	const link = insertEvidence("coordinator_auth_account_links", {
-		coordinator_id: config.coordinatorId, link_id: pins.linkId, issuer: config.issuer,
-		subject: pins.subject, identity_id: pins.identityId, attempt_id: pins.attemptId,
-		controller_attestation_id: genesis.controller, auth_config_revision: config.revision,
-		created_at_ms: NOW, revoked_at_ms: null, authority_kind: pins.authority, device_claim_id: null,
-	});
+	const firstLink = authLifecycleFirstLinkStatements({ coordinatorId: config.coordinatorId,
+		issuer: config.issuer, authConfigRevision: config.revision, attemptId: pins.attemptId,
+		linkId: pins.linkId, now: NOW }).map(({ sql, values }) => {
+		let index = 0;
+		return sql.replaceAll("?", () => {
+			const value = values[index++];
+			return typeof value === "number" ? String(value) : `'${String(value).replaceAll("'", "''")}'`;
+		}) + ";";
+	}).join("\n");
 	const audit = insertEvidence("coordinator_auth_link_audit_log", {
 		...genesis.common, link_id: pins.linkId, attempt_id: pins.attemptId,
 		action: "link_created", device_claim_id: null, created_at_ms: NOW,
 	});
-	return `${genesis.sql}\n${link}\n${audit}`;
+	return `${genesis.sql}\n${firstLink}\n${audit}`;
 }
 
 export const seedClaimSql = deviceClaimEvidenceSql();

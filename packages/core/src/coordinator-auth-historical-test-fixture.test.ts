@@ -22,6 +22,7 @@ import { AUTH_SCHEMA_V2_READINESS_SQL } from "./coordinator-auth-lifecycle-prede
 import { upgradeAuthLifecycleSchema } from "./coordinator-auth-lifecycle-upgrade-sqlite.js";
 import { columns, rawAuthSnapshot } from "./coordinator-auth-lifecycle-upgrade-test-fixture.js";
 import { authDeviceClaimProvenanceSql } from "./coordinator-auth-link-provenance.js";
+import { CoordinatorAuthSchemaUpgradeRequiredError } from "./coordinator-auth-schema.js";
 import { sqliteD1 } from "./coordinator-auth-store-test-fixtures.js";
 import { ed25519KeyIdForRevocation } from "./coordinator-ed25519-key-id-compat.js";
 import { D1CoordinatorStore } from "./d1-coordinator-store.js";
@@ -96,11 +97,12 @@ it.each([
 
 describe("explicit historical account bundles", () => {
 	it.each(["controller_attestation", "device_claim"] as const)(
-		"retains coherent %s session/profile evidence for current V2 readers",
+		"explicitly upgrades coherent %s evidence for current V3 readers",
 		async (authority) => {
 			// Arrange: reader-only synthetic history, not Google or enrollment authorization.
 			const db = memory();
 			const p = prepareHistoricalAccountDatabase(db, { authority, session });
+			upgradeAuthLifecycleSchema(db);
 			const store = new D1CoordinatorStore(sqliteD1(db), { authClock: () => p.bornAtMs + 20 });
 			const before = rawAuthSnapshot(db);
 			// Act
@@ -117,7 +119,7 @@ describe("explicit historical account bundles", () => {
 			});
 			expect(rawAuthSnapshot(db)).toEqual(before);
 			expect(await store.readAuthSession("8".repeat(64), p.config)).toBeNull();
-			expect(db.prepare(AUTH_SCHEMA_V2_READINESS_SQL).get()).toEqual({ ready: 10 });
+			expect(db.prepare(AUTH_SCHEMA_V2_READINESS_SQL).get()).toEqual({ ready: 9 });
 			expect(p.keyId).toBe(await ed25519KeyIdForRevocation(p.publicKey));
 			expect(p.fingerprint).toBe(createHash("sha256").update(p.publicKey).digest("hex"));
 			expect(
@@ -132,7 +134,7 @@ describe("explicit historical account bundles", () => {
 			});
 		},
 	);
-	it("seeds a historical SQLite file before opening the current store", async () => {
+	it("seeds and explicitly upgrades a historical SQLite file before opening the current store", async () => {
 		// Arrange
 		const directory = mkdtempSync(join(tmpdir(), "historical-account-test-"));
 		directories.push(directory);
@@ -143,16 +145,17 @@ describe("explicit historical account bundles", () => {
 		try {
 			p = prepareHistoricalAccountDatabase(seed, { authority: "device_claim", session });
 			expect(seed.prepare(AUTH_SCHEMA_V2_READINESS_SQL).get()).toEqual({ ready: 10 });
+			upgradeAuthLifecycleSchema(seed);
 			before = accountAuthState(seed);
 		} finally {
 			seed.close();
 		}
-		// Act: constructor observes existing V2 history; it did not create that history.
+		// Act: constructor observes already upgraded history; it must not migrate on open.
 		const store = new BetterSqliteCoordinatorStore(path, { authClock: () => p.bornAtMs + 20 });
 		databases.push(store.db);
 		const result = await store.readAuthSessionAccount(credentialHash, p.config);
 		// Assert
-		expect(store.db.prepare(AUTH_SCHEMA_V2_READINESS_SQL).get()).toEqual({ ready: 10 });
+		expect(store.db.prepare(AUTH_SCHEMA_V2_READINESS_SQL).get()).toEqual({ ready: 9 });
 		expect(accountAuthState(store.db)).toEqual(before);
 		expect(result?.profile).toEqual(profile);
 		expect(result?.session.account).toEqual(p.account);
@@ -167,6 +170,7 @@ describe("explicit historical account bundles", () => {
 			authority: "device_claim",
 			session: { ...session, revision: "b".repeat(64) },
 		});
+		upgradeAuthLifecycleSchema(db);
 		const store = new D1CoordinatorStore(sqliteD1(db), { authClock: () => p.bornAtMs + 20 });
 		// Act
 		const current = await store.readAuthSession(credentialHash, {
@@ -185,6 +189,7 @@ describe("explicit historical account bundles", () => {
 		// Arrange
 		const db = memory();
 		const p = prepareHistoricalAccountDatabase(db, { authority: "controller_attestation" });
+		upgradeAuthLifecycleSchema(db);
 		const store = new D1CoordinatorStore(sqliteD1(db));
 		// Act
 		const missing = await store.readAuthSession(credentialHash, p.config);
@@ -235,13 +240,45 @@ it.each(["SQLite", "D1"] as const)(
 			expect(result?.profile).toEqual(profile);
 			expect(f.history.session?.createdAtMs).toBe(now);
 			expect(wrongIssuer).toBeNull();
-			expect(f.db.prepare(AUTH_SCHEMA_V2_READINESS_SQL).get()).toEqual({ ready: 10 });
+			expect(f.db.prepare(AUTH_SCHEMA_V2_READINESS_SQL).get()).toEqual({ ready: 9 });
+			expect(f.db.prepare(AUTH_LIFECYCLE_CURRENT_READINESS_SQL).get()).toEqual({
+				ready: AUTH_LIFECYCLE_CURRENT_READY_COUNT,
+			});
 			expect(rawAuthSnapshot(f.db)).toEqual(before);
 		} finally {
 			f.close();
 		}
 	},
 );
+
+it("opens populated V2 history without auth mutation and requires explicit upgrade while ordinary access works", async () => {
+	// Arrange: unlike a fresh auth database, this file already contains retained account evidence.
+	const directory = mkdtempSync(join(tmpdir(), "historical-v2-open-"));
+	directories.push(directory);
+	const path = join(directory, "fixture.sqlite");
+	const seed = new Database(path);
+	let before: ReturnType<typeof accountAuthState>;
+	let config: ReturnType<typeof prepareHistoricalAccountDatabase>["config"];
+	try {
+		config = prepareHistoricalAccountDatabase(seed, { authority: "device_claim", session }).config;
+		before = accountAuthState(seed);
+	} finally {
+		seed.close();
+	}
+	// Act
+	const store = new BetterSqliteCoordinatorStore(path);
+	databases.push(store.db);
+	await store.createGroup("device-sync-remains-available");
+	// Assert
+	await expect(store.readAuthSession(credentialHash, config)).rejects.toBeInstanceOf(
+		CoordinatorAuthSchemaUpgradeRequiredError,
+	);
+	expect(store.db.prepare(AUTH_SCHEMA_V2_READINESS_SQL).get()).toEqual({ ready: 10 });
+	expect(accountAuthState(store.db)).toEqual(before);
+	expect((await store.listGroups()).map(({ group_id }) => group_id)).toContain(
+		"device-sync-remains-available",
+	);
+});
 
 describe("deliberately inconsistent historical facts", () => {
 	it.each([
@@ -262,6 +299,7 @@ describe("deliberately inconsistent historical facts", () => {
 				defect,
 				session,
 			});
+			upgradeAuthLifecycleSchema(db);
 			const store = new D1CoordinatorStore(sqliteD1(db), { authClock: () => p.bornAtMs + 20 });
 			const before = rawAuthSnapshot(db);
 			// Act

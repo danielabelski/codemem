@@ -1,7 +1,6 @@
 import { readdirSync, readFileSync } from "node:fs";
 import Database, { type Database as SqliteDatabase } from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
-import { connectCoordinator } from "./better-sqlite-coordinator-store.js";
 import {
 	AUTH_LIFECYCLE_CURRENT_READINESS_SQL,
 	AUTH_LIFECYCLE_CURRENT_READY_COUNT,
@@ -10,6 +9,7 @@ import { authLifecycleFirstLinkStatements } from "./coordinator-auth-lifecycle-f
 import { AUTH_LIFECYCLE_FRESH_SCHEMA_STATEMENTS as AUTH_LIFECYCLE_CURRENT_SCHEMA_STATEMENTS } from "./coordinator-auth-lifecycle-fresh-schema.js";
 import { AUTH_SCHEMA_V2_READINESS_SQL } from "./coordinator-auth-lifecycle-predecessor.js";
 import { upgradeAuthLifecycleSchema } from "./coordinator-auth-lifecycle-upgrade-sqlite.js";
+import { frozenV2Database } from "./coordinator-auth-lifecycle-upgrade-test-fixture.js";
 import { AUTH_LINK_AUTHORITY_CUTOVER_SQL } from "./coordinator-auth-link-authority-upgrade.js";
 
 const links = "coordinator_auth_account_links";
@@ -71,7 +71,7 @@ function fresh() {
 }
 function old(source: "inline" | "migrations") {
 	if (source === "inline") {
-		const db = connectCoordinator(":memory:");
+		const db = frozenV2Database();
 		databases.push(db);
 		return db;
 	}
@@ -141,7 +141,7 @@ function seedBrowser(
 	});
 }
 
-describe("unused V3 schema and readiness leaves", () => {
+describe("current V3 schema and readiness", () => {
 	it("initializes V3 auth from nothing without invoking an existing-store upgrader", () => {
 		// Arrange
 		const db = memory();

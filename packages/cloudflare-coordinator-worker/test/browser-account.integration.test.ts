@@ -1,5 +1,6 @@
 import { env, exports } from "cloudflare:workers";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { consumeNativeLinkProof } from "./native-auth-proof-fixture.js";
 import { createCoordinatorBrowserAccount } from "../../core/src/coordinator-browser-account.js";
 import { createCoordinatorBrowserAuthCallback } from "../../core/src/coordinator-browser-auth-callback.js";
 import {
@@ -88,15 +89,16 @@ async function setup() {
 		attemptId: crypto.randomUUID(),
 		signer: review,
 		runtimeVerifierHash: "d".repeat(64),
+		browserStartHash: "8".repeat(64),
 		loopbackRedirect: "http://127.0.0.1:4567/codemem/auth/complete",
 	};
 	await store.createGroup(review.groupId, "Fixture group");
 	await store.enrollDevice(review.groupId, { ...review, identityId: null });
 	expect(await store.createAuthControllerAttestation(review)).toMatchObject({ kind: "created" });
 	expect(await store.createAuthLinkAttempt(start, config)).toMatchObject({ kind: "created" });
-	const browser = { attemptId: start.attemptId, browserTransactionHash: "e".repeat(64) };
+	const browser = { attemptId: start.attemptId, browserTransactionHash: "e".repeat(64), binderHash: "" };
 	const confirm = { ...browser, completionSecretHash: "f".repeat(64) };
-	expect(await store.claimAuthLinkAttempt(browser, config)).toMatchObject({ kind: "applied" });
+	await consumeNativeLinkProof({ store, cfg: config }, start, browser);
 	expect(
 		await store.recordAuthLinkOidcVerified(
 			{ ...browser, account: { issuer: config.issuer, subject: "fixture-subject" } },

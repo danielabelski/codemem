@@ -3,6 +3,9 @@ import { join } from "node:path";
 import Database, { type Database as SqliteDatabase } from "better-sqlite3";
 import { describe, expect, it } from "vitest";
 import { connectCoordinator } from "./better-sqlite-coordinator-store.js";
+import { prepareHistoricalAccountDatabase } from "./coordinator-auth-historical-test-fixture.js";
+import { upgradeAuthLifecycleSchema } from "./coordinator-auth-lifecycle-upgrade-sqlite.js";
+import { frozenV2Database } from "./coordinator-auth-lifecycle-upgrade-test-fixture.js";
 import {
 	AUTH_LINK_REDEEM_WINDOW_MS,
 	AUTH_SESSION_SCHEMA_SQL,
@@ -14,14 +17,9 @@ const SESSION_TTL = AUTH_SESSION_TTL_MS;
 
 type Backend = "SQLite" | "D1";
 function setup(backend: Backend) {
-	if (backend === "SQLite") return connectCoordinator(":memory:");
+	if (backend === "D1") return frozenV2Database("migrations");
 	const db = new Database(":memory:");
-	db.exec(
-		readFileSync(
-			join(import.meta.dirname, "../../cloudflare-coordinator-worker/schema.sql"),
-			"utf8",
-		),
-	);
+	db.exec(AUTH_SESSION_SCHEMA_SQL);
 	return db;
 }
 function schema(db: SqliteDatabase, table: (typeof SESSION_TABLES)[number]) {
@@ -104,7 +102,7 @@ function insertReceipt(db: SqliteDatabase, changes: Record<string, unknown> = {}
 	).run(...Object.values(row));
 }
 function registerParity(backend: Backend) {
-	it("fresh schemas, migration and exported SQL agree on only the two additive empty tables", () => {
+	it("frozen V2 table-only schemas, migration and exported SQL agree on the two additive tables", () => {
 		// Arrange
 		const db = setup(backend);
 		const peer = setup(backend === "SQLite" ? "D1" : "SQLite");
@@ -334,6 +332,59 @@ function registerBackend(backend: Backend) {
 	registerChecks(backend);
 }
 describe.each(["SQLite", "D1"] as const)(
-	"%s auth-session schema (D1 is SQLite-backed)",
+	"%s frozen V2 session table constraints (no current admission guards)",
 	registerBackend,
+);
+
+it.each(["controller_attestation", "device_claim"] as const)(
+	"current %s session constraints run behind complete V3 admission evidence",
+	(authority) => {
+		// Arrange: retain a legitimate receipt, but no session, before guard installation.
+		const db = new Database(":memory:");
+		const fresh = connectCoordinator(":memory:");
+		const currentWorker = new Database(":memory:");
+		currentWorker.exec(
+			readFileSync(
+				join(import.meta.dirname, "../../cloudflare-coordinator-worker/schema.sql"),
+				"utf8",
+			),
+		);
+		try {
+			prepareHistoricalAccountDatabase(db, {
+				authority,
+				session: { credentialHash: "a".repeat(64) },
+			});
+			const row = db.prepare("SELECT * FROM coordinator_auth_sessions").get() as Record<
+				string,
+				unknown
+			>;
+			db.exec("DELETE FROM coordinator_auth_sessions");
+			upgradeAuthLifecycleSchema(db);
+			const guards = (database: SqliteDatabase) =>
+				database
+					.prepare(
+						"SELECT name,sql FROM sqlite_master WHERE type='trigger' AND tbl_name IN ('coordinator_auth_sessions','coordinator_auth_session_receipts') ORDER BY name",
+					)
+					.all();
+			expect(guards(fresh)).toEqual(guards(db));
+			expect(guards(currentWorker)).toEqual(guards(fresh));
+			expect(guards(fresh)).not.toEqual([]);
+			for (const table of SESSION_TABLES) {
+				expect(schema(fresh, table)).toEqual(schema(db, table));
+				expect(schema(currentWorker, table)).toEqual(schema(fresh, table));
+			}
+			// Act
+			const badExpiry = () =>
+				insertSession(db, { ...row, expires_at_ms: Number(row.expires_at_ms) + 1 });
+			// Assert: admission is otherwise valid, so this reaches the table CHECK.
+			expect(badExpiry).toThrow(/CHECK constraint failed/);
+			expect(db.prepare("SELECT * FROM coordinator_auth_sessions").all()).toEqual([]);
+			insertSession(db, row);
+			expect(db.prepare("SELECT * FROM coordinator_auth_sessions").all()).toEqual([row]);
+		} finally {
+			db.close();
+			fresh.close();
+			currentWorker.close();
+		}
+	},
 );

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFile } from "node:fs/promises";
 import { randomBytes } from "node:crypto";
 import { createServer } from "node:http";
 import { createRequire } from "node:module";
@@ -6,12 +7,39 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { readD1Migrations } from "@cloudflare/vitest-pool-workers";
 import { AUTH_LINK_AUTHORITY_CUTOVER_STATEMENTS } from "@codemem/core";
+import { installEmptyNativeCurrentAuth, upgradeNativeCurrentAuth, AUTH_LIFECYCLE_CURRENT_DEFINITIONS, AUTH_LIFECYCLE_FRESH_SCHEMA_STATEMENTS, AUTH_LIFECYCLE_CURRENT_READINESS_SQL, AUTH_LIFECYCLE_CURRENT_READY_COUNT, AUTH_SCHEMA_V2_READINESS_SQL } from "./current-auth-schema-fixture.mjs";
 
 const require = createRequire(new URL("../package.json", import.meta.url));
 const runtimeRequire = createRequire(require.resolve("wrangler/package.json"));
 const { Miniflare, convertV4MiniflareOptions } = runtimeRequire("miniflare");
 const { build } = runtimeRequire("esbuild");
 const ORIGIN = "https://app.example.test";
+test("Worker fresh auth snapshot exactly matches current definitions and fences old binaries", async (t) => {
+	// Arrange: actual checked-in root and independent current fresh definitions.
+	const coreRequire = createRequire(new URL("../../core/package.json", import.meta.url));
+	const Database = coreRequire("better-sqlite3");
+	const root = new Database(":memory:");
+	const fresh = new Database(":memory:");
+	t.after(() => { root.close(); fresh.close(); });
+	root.exec(await readFile(new URL("../schema.sql", import.meta.url), "utf8"));
+	for (const sql of AUTH_LIFECYCLE_FRESH_SCHEMA_STATEMENTS) fresh.exec(sql);
+	const inventory = db => AUTH_LIFECYCLE_CURRENT_DEFINITIONS.map(({ type, name }) => db.prepare("SELECT type,name,sql FROM sqlite_master WHERE type=? AND name=?").get(type, name));
+	// Act
+	const actual = inventory(root);
+	// Assert: compare exact stored SQL, not only columns or a readiness counter.
+	assert.deepEqual(actual, inventory(fresh));
+	assert.equal(actual.length, 58);
+	assert.equal(AUTH_LIFECYCLE_CURRENT_READY_COUNT, 61);
+	assert.ok(Buffer.byteLength(AUTH_LIFECYCLE_CURRENT_READINESS_SQL) < 100000);
+	for (const db of [root, fresh]) {
+		assert.deepEqual(db.prepare(AUTH_LIFECYCLE_CURRENT_READINESS_SQL).get(), { ready: AUTH_LIFECYCLE_CURRENT_READY_COUNT });
+		assert.deepEqual(db.prepare(AUTH_SCHEMA_V2_READINESS_SQL).get(), { ready: 9 });
+	}
+	// Negative control: an unreviewed dependency must invalidate the same root.
+	root.exec("CREATE INDEX native_unknown_auth_index ON coordinator_auth_account_links(subject)");
+	assert.notDeepEqual(root.prepare(AUTH_LIFECYCLE_CURRENT_READINESS_SQL).get(), { ready: AUTH_LIFECYCLE_CURRENT_READY_COUNT });
+});
+
 test("legacy D1 refuses optional auth before discovery and recovers after the explicit atomic cutover", async (t) => {
 	const f = await harness(t, { legacyAuth: true });
 	for (const path of ["/auth/sign-in"]) {
@@ -34,6 +62,9 @@ test("legacy D1 refuses optional auth before discovery and recovers after the ex
 	assert.equal(ordinary.status, 400);
 	assert.equal(JSON.parse(ordinary.body).error, "group_id_required");
 	await f.db.batch(AUTH_LINK_AUTHORITY_CUTOVER_STATEMENTS.map((sql) => f.db.prepare(sql)));
+	// The authority-only V2 cutover is still fenced by the current runtime.
+	assert.equal((await f.request("/auth/sign-in")).status, 503);
+	await upgradeNativeCurrentAuth(f.db);
 	assert.equal((await f.request("/auth/sign-in")).status, 200);
 });
 // Test-only HTTP URL rewrite exercises Worker request contexts, not browser HTTPS/Secure cookies.
@@ -128,7 +159,10 @@ export default { async fetch(request, env) {
 	for (const migration of migrations) {
 		await db.batch(migration.queries.map((sql) => db.prepare(sql)));
 	}
-	if (!legacyAuth) await db.batch(AUTH_LINK_AUTHORITY_CUTOVER_STATEMENTS.map((sql) => db.prepare(sql)));
+	if (!legacyAuth) {
+		await db.batch(AUTH_LINK_AUTHORITY_CUTOVER_STATEMENTS.map((sql) => db.prepare(sql)));
+		await installEmptyNativeCurrentAuth(db);
+	}
 	const base = await mf.ready;
 	const request = async (path, init) => {
 		const response = await fetch(new URL(path, base), { ...init, redirect: "manual" });

@@ -3,8 +3,10 @@ import { browserProofConfig, consumeSigninProof } from "../../core/src/coordinat
 import { randomUUID } from "node:crypto";
 import { D1CoordinatorStore } from "@codemem/core/internal/cloudflare-coordinator";
 import { afterEach, expect, it } from "vitest";
+import { consumeNativeLinkProof } from "./native-auth-proof-fixture.js";
+import { disposeNativeAuthFixture } from "./owner-ceremony-test-fixtures.js";
 
-type Config = Parameters<D1CoordinatorStore["createAuthLinkAttempt"]>[1];
+type Config = Parameters<D1CoordinatorStore["redeemAuthLinkSessionWithBrowserTransaction"]>[1];
 type Review = Parameters<D1CoordinatorStore["createAuthControllerAttestation"]>[0];
 type Fixture = Awaited<ReturnType<typeof fixture>>;
 const NOW = 1790899200000;
@@ -26,13 +28,9 @@ function hash() {
 }
 
 afterEach(async () => {
+	await disposeNativeAuthFixture();
 	for (const review of owned.splice(0)) {
 		await env.COORDINATOR_DB.batch([
-			...[...otherTables, attempts].map((table) =>
-				env.COORDINATOR_DB.prepare(`DELETE FROM ${table} WHERE coordinator_id = ?`).bind(
-					review.coordinatorId,
-				),
-			),
 			env.COORDINATOR_DB.prepare("DELETE FROM enrolled_devices WHERE group_id = ?").bind(
 				review.groupId,
 			),
@@ -62,6 +60,7 @@ async function fixture(overrides: Partial<Review> = {}) {
 		issuer: "https://accounts.example.test",
 		revision: "a".repeat(64),
 		enabled: true,
+		redirectUri: "https://app.example.test/callback",
 	};
 	const signer = {
 		groupId: review.groupId,
@@ -74,9 +73,10 @@ async function fixture(overrides: Partial<Review> = {}) {
 		attemptId: randomUUID(),
 		signer,
 		runtimeVerifierHash: hash(),
+		browserStartHash: hash(),
 		loopbackRedirect: "http://127.0.0.1:4567/codemem/auth/complete",
 	};
-	const browser = { attemptId: start.attemptId, browserTransactionHash: hash() };
+	const browser = { attemptId: start.attemptId, browserTransactionHash: hash(), binderHash: "" };
 	const confirm = { ...browser, completionSecretHash: hash() };
 	const account = { issuer: cfg.issuer, subject: "fixture-subject" };
 	const finalize = {
@@ -122,7 +122,7 @@ async function snapshot(f: Fixture, options: { includeAttempts?: boolean } = {})
 
 async function advance(f: Fixture, stage: "verified" | "confirmed" | "finalized" | "redeemed") {
 	expect(await f.store.createAuthLinkAttempt(f.start, f.cfg)).toMatchObject({ kind: "created" });
-	expect(await f.store.claimAuthLinkAttempt(f.browser, f.cfg)).toMatchObject({ kind: "applied" });
+	await consumeNativeLinkProof(f, f.start, f.browser);
 	expect(
 		await f.store.recordAuthLinkOidcVerified({ ...f.browser, account: f.account }, f.cfg),
 	).toMatchObject({ kind: "applied" });
@@ -134,7 +134,7 @@ async function advance(f: Fixture, stage: "verified" | "confirmed" | "finalized"
 	});
 	if (stage === "redeemed") {
 		expect(
-			await f.store.redeemAuthLinkSession({ ...f.browser, credentialHash: hash() }, f.cfg),
+			await f.store.redeemAuthLinkSessionWithBrowserTransaction({ ...f.browser, credentialHash: hash() }, f.cfg),
 		).toMatchObject({ kind: "issued" });
 	}
 }
@@ -159,6 +159,7 @@ it("atomically caps concurrent device creates, preserves retry TTL and prioritiz
 		...f.start,
 		attemptId: randomUUID(),
 		runtimeVerifierHash: hash(),
+		browserStartHash: hash(),
 	}));
 	// Act: real D1 serializes guarded INSERT SELECTs, not a mock quota counter.
 	const results = await Promise.all(
@@ -198,7 +199,7 @@ it("atomically caps concurrent device creates, preserves retry TTL and prioritiz
 	const actorResults = await Promise.all(
 		[a, a, b, b].map((device) =>
 			device.store.createAuthLinkAttempt(
-				{ ...device.start, attemptId: randomUUID(), runtimeVerifierHash: hash() },
+				{ ...device.start, attemptId: randomUUID(), runtimeVerifierHash: hash(), browserStartHash: hash() },
 				device.cfg,
 			),
 		),
@@ -362,6 +363,7 @@ it("maintains forty legacy rows in capped D1 batches without deleting or writing
 		...seed,
 		attempt_id: randomUUID(),
 		runtime_verifier_hash: hash(),
+		browser_start_hash: hash(),
 	}));
 	await env.COORDINATOR_DB.batch(
 		seeded.map((row) =>

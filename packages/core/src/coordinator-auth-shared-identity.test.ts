@@ -12,6 +12,7 @@ import { browserConfig, materials } from "./coordinator-auth-browser-transaction
 import {
 	attempt,
 	backendTest,
+	browserSequence,
 	completionHash,
 	finalize,
 	type LinkFixture,
@@ -87,7 +88,13 @@ function snapshot(f: LinkFixture, options: { stableOnly?: boolean } = {}) {
 		.all() as { name: string }[];
 	return tables
 		.filter(({ name }) => !options.stableOnly || !name.startsWith("coordinator_auth_"))
-		.map(({ name }) => [name, f.db.prepare(`SELECT * FROM "${name}"`).all()]);
+		.map(({ name }) => {
+			const sql =
+				options.stableOnly && name === "sqlite_sequence"
+					? "SELECT * FROM sqlite_sequence WHERE name <> 'coordinator_auth_browser_transactions'"
+					: `SELECT * FROM "${name}"`;
+			return [name, f.db.prepare(sql).all()];
+		});
 }
 async function confirmed(f: LinkFixture) {
 	expect(await f.store.createAuthLinkAttempt(request(), f.cfg)).toMatchObject({ kind: "created" });
@@ -258,6 +265,19 @@ function seedHistoricalPeerLink(f: LinkFixture) {
 			string | number | null
 		>;
 		const columns = Object.keys(row);
+		if (table === "account_links") {
+			f.db
+				.prepare(`INSERT INTO coordinator_auth_account_associations
+			 (coordinator_id,issuer,subject,identity_id,first_link_id,created_at_ms) VALUES (?,?,?,?,?,?)`)
+				.run(
+					f.cfg.coordinatorId,
+					row.issuer,
+					overrides.subject,
+					overrides.identity_id,
+					overrides.link_id,
+					row.created_at_ms,
+				);
+		}
 		const values = columns.map((key) =>
 			Object.hasOwn(overrides, key) ? overrides[key] : row[key],
 		);
@@ -266,6 +286,24 @@ function seedHistoricalPeerLink(f: LinkFixture) {
 			VALUES (${columns.map(() => "?").join(",")})`)
 			.run(...values);
 	}
+	const source = f.db
+		.prepare("SELECT * FROM coordinator_auth_browser_transactions WHERE attempt_id='attempt-a'")
+		.get() as Record<string, string | number | null>;
+	const { browser_sequence: _sequence, ...material } = source;
+	const browser = {
+		...material,
+		attempt_id: overrides.attempt_id,
+		browser_transaction_hash: overrides.browser_transaction_hash,
+		state_hash: "5".repeat(64),
+		binder_hash: "6".repeat(64),
+		claim_token: "7".repeat(64),
+	};
+	const columns = Object.keys(browser);
+	f.db
+		.prepare(
+			`INSERT INTO coordinator_auth_browser_transactions (${columns.join(",")}) VALUES (${columns.map(() => "?").join(",")})`,
+		)
+		.run(...Object.values(browser));
 }
 
 afterEach(() => vi.restoreAllMocks());
@@ -296,6 +334,7 @@ for (const backend of ["SQLite", "D1"] as const) {
 			);
 		const before = snapshot(f);
 		const stable = snapshot(f, { stableOnly: true });
+		const sequenceBefore = browserSequence(f);
 		// Act / Assert: readiness and status are read-only, then use the browser-start proof path.
 		expect(await f.store.readAuthDeviceClaimReadiness(input, f.cfg)).toEqual(eligible);
 		expect(
@@ -331,6 +370,7 @@ for (const backend of ["SQLite", "D1"] as const) {
 			expect.objectContaining({ ...source, action: "link_created" }),
 		]);
 		expect(snapshot(f, { stableOnly: true })).toEqual(stable);
+		expect(browserSequence(f)).toBe(sequenceBefore + 1);
 	});
 	test.for(invalidEvidence)(
 		`${backend} rejects %s without writes or account disclosure`,
@@ -488,7 +528,9 @@ for (const backend of ["SQLite", "D1"] as const) {
 			await f.store.readAccountLinkStatus(peer, f.cfg, { identityId: input.identityId }),
 		).toMatchObject({ account: null, identityId: null, authority: null });
 		f.db.exec("DELETE FROM coordinator_device_revocations");
-		f.db.exec("UPDATE coordinator_auth_account_links SET revoked_at_ms=1");
+		f.db
+			.prepare("UPDATE coordinator_auth_account_links SET revoked_at_ms=? WHERE coordinator_id=?")
+			.run(f.now, f.cfg.coordinatorId);
 		expect(
 			await f.store.readAccountLinkStatus(peer, f.cfg, { identityId: input.identityId }),
 		).toMatchObject({ state: "revoked", account: null });

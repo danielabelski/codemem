@@ -1,5 +1,4 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { upgradeAuthLifecycleSchema } from "./coordinator-auth-lifecycle-upgrade-sqlite.js";
 import type { AuthLinkBackend } from "./coordinator-auth-link.js";
 import { authDeviceClaimProvenanceSql } from "./coordinator-auth-link-provenance.js";
 import { consumeSigninProof, NOW } from "./coordinator-auth-link-test-fixtures.js";
@@ -379,7 +378,6 @@ it.each([
 	"UPDATE coordinator_auth_account_links SET controller_attestation_id = 'changed-controller'",
 ])("V3 storage rejects the impossible callback birth race: %s", (mutation) => {
 	// Arrange: this is storage-only; never run the V2 owner reader through a V3 readiness gate.
-	upgradeAuthLifecycleSchema(f.db);
 	const before = ownerCallbackAuthority(f);
 	// Act
 	const mutate = () => f.db.exec(mutation);

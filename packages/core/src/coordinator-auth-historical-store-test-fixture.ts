@@ -9,6 +9,7 @@ import {
 	type HistoricalAccountPins,
 	prepareHistoricalAccountDatabase,
 } from "./coordinator-auth-historical-test-fixture.js";
+import { upgradeAuthLifecycleSchema } from "./coordinator-auth-lifecycle-upgrade-sqlite.js";
 import {
 	type Backend,
 	type Fixture,
@@ -79,8 +80,7 @@ export function setupHistoricalStore(
 		const history = prepareHistoricalAccountDatabase(db, options.history);
 		// Caller tables are explicit; neither excluded owner storage nor future auth DDL is replayed.
 		for (const name of callerMigrations) db.exec(readFileSync(new URL(name, migrations), "utf8"));
-		// Atomic V3 activation: explicitly call upgradeAuthLifecycleSchema(db) here,
-		// after seeding and before either current store opens. V2 intentionally stays V2 now.
+		upgradeAuthLifecycleSchema(db);
 		let store: Store;
 		if (backend === "SQLite") {
 			db.close();

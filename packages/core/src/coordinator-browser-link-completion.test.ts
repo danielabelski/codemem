@@ -81,13 +81,15 @@ async function existingSessionFixture(
 		expectedIdentityId: controller.identityId,
 	});
 	expect(await f.store.createAuthLinkAttempt(created, config)).toMatchObject({ kind: "created" });
-	const materials = await startBrowserProof(
+	const material = await startBrowserProof(
 		{ ...f, cfg: config },
 		{ ...browser, browserStartHash: created.browserStartHash },
 		config,
 	);
-	expect(await f.store.consumeAuthBrowserTransaction(materials, config)).toMatchObject({
+	expect(await f.store.consumeAuthBrowserTransaction(material, config)).toMatchObject({
 		kind: "consumed",
+		purpose: "link",
+		...browser,
 	});
 	expect(await f.store.recordAuthLinkOidcVerified({ ...browser, account }, config)).toMatchObject({
 		kind: "applied",
@@ -768,7 +770,7 @@ it("does not clear a pending ceremony even with a genuinely live SESSION", async
 });
 
 describe.each(["SQLite", "D1"] as const)("%s live SESSION completion consumption", (backend) => {
-	it.each(["browser replay", "bound redemption", "legacy redemption"] as const)(
+	it.each(["browser replay", "bound redemption"] as const)(
 		"preserves the current SID and rejects subsequent %s",
 		async (path) => {
 			// Arrange
@@ -821,15 +823,12 @@ describe.each(["SQLite", "D1"] as const)("%s live SESSION completion consumption
 				expect.soft(replay.response.headers.getSetCookie()).toEqual([]);
 				expect.soft(replay.response.headers.get("cache-control")).toBe("no-store");
 			} else {
-				if (path === "bound redemption") {
-					const redeemed = await f.store.redeemAuthLinkSessionWithBrowserTransaction(
-						redemption,
-						f.config,
-					);
-					expect.soft(redeemed).toMatchObject({ kind: "rejected" });
-				} else {
-					expect("redeemAuthLinkSession" in f.store).toBe(false);
-				}
+				const redeemed = await f.store.redeemAuthLinkSessionWithBrowserTransaction(
+					redemption,
+					f.config,
+				);
+				// Assert
+				expect.soft(redeemed).toMatchObject({ kind: "rejected" });
 			}
 			expect.soft(authority(f)).toEqual(before);
 		},

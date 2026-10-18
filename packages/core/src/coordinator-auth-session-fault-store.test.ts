@@ -1,4 +1,5 @@
 import { describe, expect, vi } from "vitest";
+import { skipAuthStatementRun } from "./coordinator-auth-fault-test-fixture.js";
 import {
 	browserProofConfig,
 	expectRejected,
@@ -37,7 +38,7 @@ function registerPersistence(test: SessionTest) {
 				// Act
 				const result =
 					operation === "redeem"
-						? f.store.redeemAuthLinkSession(redeemInput(), f.cfg)
+						? f.store.redeemAuthLinkSessionWithBrowserTransaction(redeemInput(), f.cfg)
 						: f.store.signInWithConsumedBrowserTransaction(signInInput(f), browserProofConfig(f));
 				// Assert
 				await expect(result).rejects.toThrow(/^auth_session_persistence_error$/);
@@ -49,7 +50,7 @@ function registerPersistence(test: SessionTest) {
 			// Act: a lost response cannot turn into credential recovery.
 			const retry =
 				operation === "redeem"
-					? await f.store.redeemAuthLinkSession(
+					? await f.store.redeemAuthLinkSessionWithBrowserTransaction(
 							{ ...redeemInput(), credentialHash: otherCredentialHash },
 							f.cfg,
 						)
@@ -87,9 +88,7 @@ function registerPersistence(test: SessionTest) {
 	}) => {
 		// Arrange
 		await linked(f);
-		f.db.exec(
-			"CREATE TRIGGER fixture_incomplete BEFORE INSERT ON coordinator_auth_sessions BEGIN SELECT RAISE(IGNORE); END",
-		);
+		const restore = skipAuthStatementRun(f.db, "INSERT INTO coordinator_auth_sessions");
 		// Act
 		const result = f.store.signInWithConsumedBrowserTransaction(
 			signInInput(f),
@@ -98,6 +97,7 @@ function registerPersistence(test: SessionTest) {
 		// Assert
 		await expect(result).rejects.toThrow(/^auth_session_persistence_incomplete$/);
 		expect(sessionRows(f)[1]).toEqual([]);
+		restore();
 	});
 	test("normal sign-in succeeds even when changes scalar always reports zero", async ({
 		fixture: f,

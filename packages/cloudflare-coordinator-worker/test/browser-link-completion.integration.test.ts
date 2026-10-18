@@ -66,6 +66,7 @@ async function setup() {
 		attemptId: crypto.randomUUID(),
 		signer: review,
 		runtimeVerifierHash: "d".repeat(64),
+		browserStartHash: "8".repeat(64),
 		loopbackRedirect: "http://127.0.0.1:80/codemem/auth/complete",
 	};
 	expect(await store.createAuthLinkAttempt(attempt, config)).toMatchObject({ kind: "created" });
@@ -84,6 +85,7 @@ async function setup() {
 			{
 				purpose: "link",
 				attemptId: attempt.attemptId,
+				browserStartHash: attempt.browserStartHash,
 				stateHash: createHash("sha256").update(authorization.material.state).digest("hex"),
 				binderHash: parsed.cookieHash,
 				nonce: authorization.material.nonce,
@@ -380,7 +382,7 @@ it("native D1 rejects wrong origin/proof and defers pending completion despite a
 	const attemptId = crypto.randomUUID();
 	expect(
 		await f.store.createAuthLinkAttempt(
-			{ ...f.attempt, attemptId, runtimeVerifierHash: "9".repeat(64) },
+			{ ...f.attempt, attemptId, runtimeVerifierHash: "9".repeat(64), browserStartHash: "7".repeat(64) },
 			f.config,
 		),
 	).toMatchObject({ kind: "created" });
@@ -392,6 +394,7 @@ it("native D1 rejects wrong origin/proof and defers pending completion despite a
 		pkceVerifier: "p".repeat(43),
 		purpose: "link" as const,
 		attemptId,
+		browserStartHash: "7".repeat(64),
 	};
 	expect(await f.store.startAuthBrowserTransaction(material, f.config)).toMatchObject({
 		kind: "started",
@@ -435,7 +438,7 @@ it("native D1 rejects wrong origin/proof and defers pending completion despite a
 	expect(await authority(f)).toEqual(before);
 });
 
-it.each(["browser replay", "bound redemption", "legacy redemption"] as const)(
+it.each(["browser replay", "bound redemption", "wrong-binder redemption"] as const)(
 	"native D1 preserves the current SID and rejects subsequent %s",
 	async (path) => {
 		// Arrange: real finalized fake-Google ceremony and an independently issued live session.
@@ -489,14 +492,14 @@ it.each(["browser replay", "bound redemption", "legacy redemption"] as const)(
 			expect.soft(replay.response.status).toBe(403);
 			expect.soft(replay.response.headers.getSetCookie()).toEqual([]);
 		} else {
-			let redeemed: Awaited<ReturnType<typeof f.store.redeemAuthLinkSession>>;
+			let redeemed: Awaited<ReturnType<typeof f.store.redeemAuthLinkSessionWithBrowserTransaction>>;
 			if (path === "bound redemption") {
 				redeemed = await f.stores[1].redeemAuthLinkSessionWithBrowserTransaction(
 					redemption,
 					f.config,
 				);
 			} else {
-				redeemed = await f.stores[1].redeemAuthLinkSession(redemption, f.config);
+				redeemed = await f.stores[1].redeemAuthLinkSessionWithBrowserTransaction({ ...redemption, binderHash: "0".repeat(64) }, f.config);
 			}
 			// Assert
 			expect.soft(redeemed).toMatchObject({ kind: "rejected" });

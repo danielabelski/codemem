@@ -3,8 +3,14 @@ import { join } from "node:path";
 import Database, { type Database as SqliteDatabase } from "better-sqlite3";
 import { describe, expect, it } from "vitest";
 import { connectCoordinator } from "./better-sqlite-coordinator-store.js";
+import {
+	AUTH_LIFECYCLE_CURRENT_READINESS_SQL,
+	AUTH_LIFECYCLE_CURRENT_READY_COUNT,
+} from "./coordinator-auth-lifecycle-current-readiness.js";
+import { AUTH_SCHEMA_V2_READINESS_SQL } from "./coordinator-auth-lifecycle-predecessor.js";
+import { upgradeAuthLifecycleSchema } from "./coordinator-auth-lifecycle-upgrade-sqlite.js";
+import { frozenV2Database } from "./coordinator-auth-lifecycle-upgrade-test-fixture.js";
 import { upgradeAuthLinkAuthoritySchema } from "./coordinator-auth-link-authority-upgrade.js";
-import { AUTH_LINK_SCHEMA_SQL } from "./coordinator-auth-link-contract.js";
 
 // Foundation coverage uses only schema initialization and existing one-argument constructors.
 const TABLES = [
@@ -96,7 +102,7 @@ function seedReviewedEnrollment(db: SqliteDatabase) {
 }
 
 function registerBackend(backend: Backend) {
-	it("fresh SQLite and Worker schema agree on columns, CHECKs and full unique indexes", () => {
+	it("fresh SQLite and the current Worker snapshot agree on V3 columns and indexes", () => {
 		// Arrange
 		const db = setupSchema(backend);
 		const peer = setupSchema(backend === "SQLite" ? "D1" : "SQLite");
@@ -137,26 +143,35 @@ function registerBackend(backend: Backend) {
 					columns: ["coordinator_id", "state", "expires_at_ms"].map((name) => ({ name })),
 				},
 			]);
-			for (const table of actual)
+			for (const table of [actual[0], actual[2]])
 				expect(table.indexes.every((index) => index.partial === 0)).toBe(true);
 			expect(actual[1].indexes).toEqual(
 				expect.arrayContaining([
 					{
 						columns: [{ name: "coordinator_id" }, { name: "issuer" }, { name: "subject" }],
+						partial: 1,
+					},
+					{ columns: [{ name: "coordinator_id" }, { name: "identity_id" }], partial: 1 },
+					{ columns: [{ name: "coordinator_id" }, { name: "attempt_id" }], partial: 0 },
+					{ columns: [{ name: "coordinator_id" }, { name: "link_id" }], partial: 0 },
+					{
+						columns: [{ name: "coordinator_id" }, { name: "identity_id" }, { name: "generation" }],
 						partial: 0,
 					},
-					{ columns: [{ name: "coordinator_id" }, { name: "identity_id" }], partial: 0 },
-					{ columns: [{ name: "coordinator_id" }, { name: "attempt_id" }], partial: 0 },
 				]),
 			);
+			expect(db.prepare(AUTH_LIFECYCLE_CURRENT_READINESS_SQL).get()).toEqual({
+				ready: AUTH_LIFECYCLE_CURRENT_READY_COUNT,
+			});
 		} finally {
 			db.close();
 			peer.close();
 		}
 	});
-	it("legacy migrations plus the explicit authority upgrade match fresh-install link storage", () => {
+	it("explicit legacy authority cutover followed by lifecycle upgrade matches current link storage", () => {
 		// Arrange: explicit SQL seeds an existing review; no account-link operations are imported.
-		const db = setupSchema(backend);
+		const db = frozenV2Database(backend === "SQLite" ? "inline" : "migrations");
+		const current = connectCoordinator(":memory:");
 		try {
 			seedReviewedEnrollment(db);
 			const before = TABLES.map((table) => schema(db, table));
@@ -175,12 +190,18 @@ function registerBackend(backend: Backend) {
 			db.exec(indexesMigration);
 			db.exec(browserStartMigration);
 			upgradeAuthLinkAuthoritySchema(db);
-			const migrated = TABLES.map((table) => schema(db, table));
-			for (const table of [...TABLES].reverse()) db.exec(`DROP TABLE ${table}`);
-			db.exec(AUTH_LINK_SCHEMA_SQL);
-			// Assert
-			expect(migrated).toEqual(before);
+			// Assert: the protected authority cutover still produces V2, not current readiness.
 			expect(TABLES.map((table) => schema(db, table))).toEqual(before);
+			expect(db.prepare(AUTH_SCHEMA_V2_READINESS_SQL).get()).toEqual({ ready: 10 });
+			// Act: lifecycle migration is a separate, explicit operation.
+			upgradeAuthLifecycleSchema(db);
+			// Assert
+			expect(TABLES.map((table) => schema(db, table))).toEqual(
+				TABLES.map((table) => schema(current, table)),
+			);
+			expect(db.prepare(AUTH_LIFECYCLE_CURRENT_READINESS_SQL).get()).toEqual({
+				ready: AUTH_LIFECYCLE_CURRENT_READY_COUNT,
+			});
 			expect(TABLES.map((table) => db.prepare(`SELECT * FROM ${table}`).all())).toEqual([
 				[],
 				[],
@@ -192,6 +213,7 @@ function registerBackend(backend: Backend) {
 			expect(db.prepare("SELECT * FROM enrolled_devices").all()).toEqual(enrollment);
 		} finally {
 			db.close();
+			current.close();
 		}
 	});
 }
