@@ -23,7 +23,11 @@ export interface CoordinatorAuthBrowserTransactionConsumeInput {
 	stateHash: string;
 	binderHash: string;
 }
-export type CoordinatorAuthBrowserTransactionPurpose = "signin" | "link" | "owner_enroll";
+export type CoordinatorAuthBrowserTransactionPurpose =
+	| "signin"
+	| "link"
+	| "owner_enroll"
+	| "link_change";
 /** Server-only routing hint, never authorization or consumption evidence. */
 export interface CoordinatorAuthBrowserTransactionPurposeStore {
 	readAuthBrowserTransactionPurpose(

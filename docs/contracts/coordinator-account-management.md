@@ -1,6 +1,6 @@
 # Coordinator account-management lifecycle contract
 
-**Status:** Proposed V3 contract. No routes, schema migration, UI, provider configuration, or deployment is authorized or implemented by this document.
+**Status:** Approved V3 implementation contract. Local implementation and tests do not authorize a migration run, provider configuration, real account actions, route publication, or deployment.
 
 ## Purpose and current boundary
 
@@ -168,9 +168,9 @@ The lifecycle adds no operator role and does not manufacture an administrative r
 
 Admin security revocation remains an independent administrative action. It can block the lifecycle; lifecycle requests cannot reverse it. A disconnect is an account-holder action on one live generation, not a recovery or ownership-transfer mechanism.
 
-## Future routes and request constraints
+## Routes and request constraints
 
-These are V3 planned routes, not current endpoints:
+These V3 routes mount only behind the configured browser-auth adapter and current-schema readiness. Their implementation does not authorize deployment:
 
 | Caller | Route |
 | --- | --- |
@@ -198,6 +198,10 @@ Request bodies and signed fields must use the existing request-size limits and c
 Create accepts only `disconnect` or `refresh`; no target link, generation, Google subject, role, or authority field comes from the caller. Status never returns private browser URLs, verifier material, or completion secrets.
 
 ## Viewer contract
+
+The local Viewer retains the `/api/account/link-status` and `/api/account/link-operations` endpoints and the version-1 envelope. It exposes `remote.profile`, not `remote.account`, and server-derived `actions: {connect, disconnect, refresh}`, not `canLink`. Every operation and start request carries its immutable `intent`; start requests still pin only group, context, authority, and coordinator, never a target link or generation. Both management intents use `/auth/link-change/start`; connect uses `/auth/link/start`.
+
+The backend uses one process-local operation registry for all three intents, including its busy slot, stale-context checks, private-URL delivery limit, cancellation, and retained uncertain outcomes. The management runtime calls the signed change endpoints and acknowledges the held loopback page only after its own proof-bearing finalization returns `completed`. It neither redeems nor replaces an ordinary website session.
 
 The future account page uses one account card: name, verified email, and photo are primary when available. It shows an honest missing-profile state with **Refresh profile**. Technical identifiers and coordinator URLs are collapsed diagnostics, not primary content. **Unlink Google account** appears only for a linked account and **Link Google account** only for an unlinked or disconnected account.
 

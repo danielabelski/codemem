@@ -12,6 +12,10 @@ import {
 import { isAuthControllerId } from "./coordinator-auth-controller.js";
 import type { CoordinatorAuthLinkAuthorityKind } from "./coordinator-auth-link-authority.js";
 import {
+	AUTH_LINK_CHANGE_PURPOSE,
+	type CoordinatorAuthLinkChangeStatus,
+} from "./coordinator-auth-link-change-contract.js";
+import {
 	AUTH_LINK_ATTEMPT_TTL_MS,
 	AUTH_LINK_PURPOSE,
 	type CoordinatorAuthLinkStatus,
@@ -25,6 +29,7 @@ import { DEFAULT_TIME_WINDOW_S } from "./sync-auth-constants.js";
 import { loadPrivateKey } from "./sync-identity.js";
 
 export interface LinkCoordinatorAccountOptions {
+	intent?: "connect";
 	dbPath: string;
 	keysDir?: string;
 	groupId: string;
@@ -43,6 +48,21 @@ export interface LinkCoordinatorAccountResult {
 	identityId: string;
 	attemptId: string;
 	state: "finalized" | "session_redeemed";
+}
+export type ChangeCoordinatorAccountResult = Omit<LinkCoordinatorAccountResult, "state"> & {
+	state: "completed";
+};
+type AccountCeremonyResult = LinkCoordinatorAccountResult | ChangeCoordinatorAccountResult;
+export type ChangeCoordinatorAccountOptions = Omit<
+	LinkCoordinatorAccountOptions,
+	"expectedAuthority" | "intent"
+> & { intent: "disconnect" | "refresh"; expectedAuthority?: never };
+type AccountCeremonyOptions = LinkCoordinatorAccountOptions | ChangeCoordinatorAccountOptions;
+function isChange(options: AccountCeremonyOptions): options is ChangeCoordinatorAccountOptions {
+	return options.intent === "disconnect" || options.intent === "refresh";
+}
+function creationPath(runtime: Runtime): string {
+	return isChange(runtime.options) ? "/v1/auth/link-changes" : "/v1/auth/link-attempts";
 }
 type Failure =
 	| "invalid_options"
@@ -89,7 +109,7 @@ function failure(code: Failure): CoordinatorAccountLinkError {
 	return new CoordinatorAccountLinkError(code);
 }
 async function assertCurrentContext(
-	options: LinkCoordinatorAccountOptions,
+	options: AccountCeremonyOptions,
 	signal: AbortSignal,
 ): Promise<void> {
 	if (signal.aborted) throw failure("link_stopped");
@@ -117,7 +137,7 @@ async function assertCurrentContext(
 	}
 	throw failure("context_changed");
 }
-function readDeviceWithKey(options: LinkCoordinatorAccountOptions): CoordinatorDeviceLocalEvidence {
+function readDeviceWithKey(options: AccountCeremonyOptions): CoordinatorDeviceLocalEvidence {
 	try {
 		const device = readAccountLinkDevice(options.dbPath);
 		if (!loadPrivateKey(options.keysDir, undefined, device.deviceId))
@@ -128,7 +148,7 @@ function readDeviceWithKey(options: LinkCoordinatorAccountOptions): CoordinatorD
 	}
 }
 interface Runtime {
-	options: LinkCoordinatorAccountOptions;
+	options: AccountCeremonyOptions;
 	origin: string;
 	device: CoordinatorDeviceLocalEvidence;
 	attemptId: string;
@@ -227,8 +247,7 @@ async function request(
 	const signal = options.cancellation ? timeout : AbortSignal.any([timeout, runtime.signal]);
 	try {
 		// Once dispatched, a lost create reply may leave an attempt requiring cancellation.
-		if (options.method === "POST" && options.path === "/v1/auth/link-attempts")
-			runtime.created = true;
+		if (options.method === "POST" && options.path === creationPath(runtime)) runtime.created = true;
 		const response = await (runtime.options.fetch ?? globalThis.fetch)(url, {
 			method: options.method,
 			headers: { ...headers, "Content-Type": "application/json" },
@@ -257,16 +276,25 @@ const STATES = new Set([
 	"session_redeemed",
 	"expired",
 	"failed",
+	"completed",
 ]);
 const CLOCK_SKEW_MS = DEFAULT_TIME_WINDOW_S * 1000;
-function readStatus(data: Record<string, unknown>, runtime: Runtime): CoordinatorAuthLinkStatus {
+function readStatus(
+	data: Record<string, unknown>,
+	runtime: Runtime,
+): CoordinatorAuthLinkStatus | CoordinatorAuthLinkChangeStatus {
 	const value = data.status;
 	if (!value || typeof value !== "object" || Array.isArray(value))
 		throw failure("invalid_response");
 	const status = value as Record<string, unknown>;
 	const now = Date.now();
 	if (
-		Object.keys(status).length !== 3 ||
+		Object.keys(status).length !== (isChange(runtime.options) ? 4 : 3) ||
+		(isChange(runtime.options) &&
+			(status.intent !== runtime.options.intent ||
+				status.state === "finalized" ||
+				status.state === "session_redeemed")) ||
+		(!isChange(runtime.options) && status.state === "completed") ||
 		status.attemptId !== runtime.attemptId ||
 		typeof status.state !== "string" ||
 		!STATES.has(status.state) ||
@@ -277,10 +305,10 @@ function readStatus(data: Record<string, unknown>, runtime: Runtime): Coordinato
 		(runtime.expiresAtMs !== undefined && runtime.expiresAtMs !== status.expiresAtMs)
 	)
 		throw failure("invalid_response");
-	return status as unknown as CoordinatorAuthLinkStatus;
+	return status as unknown as CoordinatorAuthLinkStatus | CoordinatorAuthLinkChangeStatus;
 }
 function attemptPath(runtime: Runtime): string {
-	return `/v1/auth/link-attempts/${encodeURIComponent(runtime.attemptId)}`;
+	return `${creationPath(runtime)}/${encodeURIComponent(runtime.attemptId)}`;
 }
 interface Pin {
 	coordinatorId: string;
@@ -294,7 +322,9 @@ async function createAttempt(
 	const body = {
 		group_id: runtime.options.groupId,
 		identity_id: runtime.options.expectedIdentityId,
-		authority: runtime.options.expectedAuthority,
+		...(isChange(runtime.options)
+			? { intent: runtime.options.intent }
+			: { authority: runtime.options.expectedAuthority }),
 		attempt_id: runtime.attemptId,
 		runtime_verifier_hash: await hashCoordinatorAuthProofBytes32(verifier),
 		browser_start_hash: await hashCoordinatorAuthProofBytes32(startCode),
@@ -303,17 +333,17 @@ async function createAttempt(
 	await assertCurrentContext(runtime.options, runtime.signal);
 	const reply = await request(runtime, {
 		method: "POST",
-		path: "/v1/auth/link-attempts",
+		path: creationPath(runtime),
 		body,
 		failureCodes: CREATE_FAILURE_CODES,
 	});
 	const status = readStatus(reply, runtime);
 	if (
-		Object.keys(reply).length !== 4 ||
+		Object.keys(reply).length !== (isChange(runtime.options) ? 3 : 4) ||
 		status.state !== "pending" ||
 		!isAuthControllerId(reply.coordinator_id) ||
 		!isAuthControllerId(reply.identity_id) ||
-		reply.authority !== runtime.options.expectedAuthority
+		(!isChange(runtime.options) && reply.authority !== runtime.options.expectedAuthority)
 	)
 		throw failure("invalid_response");
 	if (
@@ -331,14 +361,14 @@ async function finalize(
 	pin: Pin,
 	verifier: Uint8Array,
 	completion: string,
-): Promise<LinkCoordinatorAccountResult> {
+): Promise<AccountCeremonyResult> {
 	await assertCurrentContext(runtime.options, runtime.signal);
 	const reply = await request(runtime, {
 		method: "POST",
 		path: `${attemptPath(runtime)}/finalize`,
 		failureCodes: FINALIZE_FAILURE_CODES,
 		body: {
-			purpose: AUTH_LINK_PURPOSE,
+			purpose: isChange(runtime.options) ? AUTH_LINK_CHANGE_PURPOSE : AUTH_LINK_PURPOSE,
 			coordinator_id: pin.coordinatorId,
 			identity_id: pin.identityId,
 			attempt_id: runtime.attemptId,
@@ -350,14 +380,26 @@ async function finalize(
 		},
 	});
 	const status = readStatus(reply, runtime);
-	if (status.state !== "finalized" && status.state !== "session_redeemed")
+	if (
+		status.state !== "finalized" &&
+		status.state !== "session_redeemed" &&
+		status.state !== "completed"
+	)
 		throw failure("invalid_response");
 	runtime.succeeded = true;
 	return { ...pin, attemptId: runtime.attemptId, state: status.state };
 }
-function readyToFinalize(status: CoordinatorAuthLinkStatus, finalRequests: number): boolean {
+function readyToFinalize(
+	status: CoordinatorAuthLinkStatus | CoordinatorAuthLinkChangeStatus,
+	finalRequests: number,
+): boolean {
 	if (status.state === "confirmed") return true;
-	return finalRequests > 0 && (status.state === "finalized" || status.state === "session_redeemed");
+	return (
+		finalRequests > 0 &&
+		(status.state === "finalized" ||
+			status.state === "session_redeemed" ||
+			status.state === "completed")
+	);
 }
 function retryFinalization(error: unknown, finalRequests: number): boolean {
 	return (
@@ -370,7 +412,7 @@ async function waitForFinalization(
 	runtime: Runtime,
 	pin: Pin,
 	verifier: Uint8Array,
-): Promise<LinkCoordinatorAccountResult> {
+): Promise<AccountCeremonyResult> {
 	let completion: string | undefined;
 	let receiverFailed = false;
 	let finalRequests = 0;
@@ -413,9 +455,8 @@ async function cancelAttempt(runtime: Runtime): Promise<void> {
 			cancellation: true,
 		});
 		// Cancellation may return an expired attempt, but only a failed response confirms cancellation.
-		const status = reply.status as Record<string, unknown> | undefined;
-		if (!status || status.attemptId !== runtime.attemptId || status.state !== "failed")
-			throw failure("cancellation_unconfirmed");
+		const status = readStatus(reply, runtime);
+		if (status.state !== "failed") throw failure("cancellation_unconfirmed");
 	} catch {
 		throw failure("cancellation_unconfirmed");
 	}
@@ -424,10 +465,13 @@ async function runBrowserLink(
 	runtime: Runtime,
 	verifier: Uint8Array,
 	startCode: Uint8Array,
-): Promise<LinkCoordinatorAccountResult> {
+): Promise<AccountCeremonyResult> {
 	try {
 		const pin = await createAttempt(runtime, verifier, startCode);
-		const url = new URL("/auth/link/start", runtime.origin);
+		const url = new URL(
+			isChange(runtime.options) ? "/auth/link-change/start" : "/auth/link/start",
+			runtime.origin,
+		);
 		url.searchParams.set("attempt_id", runtime.attemptId);
 		url.searchParams.set("start_code", encodeCoordinatorAuthProof32(startCode));
 		await assertCurrentContext(runtime.options, runtime.signal);
@@ -450,10 +494,10 @@ async function runBrowserLink(
 		throw failure("link_stopped");
 	}
 }
-async function runLink(runtime: Runtime): Promise<LinkCoordinatorAccountResult> {
+async function runLink(runtime: Runtime): Promise<AccountCeremonyResult> {
 	const verifier = new Uint8Array(32);
 	const startCode = new Uint8Array(32);
-	let result: LinkCoordinatorAccountResult | undefined;
+	let result: AccountCeremonyResult | undefined;
 	let error: unknown;
 	try {
 		verifier.set(randomBytes(32));
@@ -465,7 +509,9 @@ async function runLink(runtime: Runtime): Promise<LinkCoordinatorAccountResult> 
 	verifier.fill(0);
 	startCode.fill(0);
 	try {
-		await runtime.receiver.close({ linked: runtime.succeeded });
+		await runtime.receiver.close(
+			isChange(runtime.options) ? { completed: runtime.succeeded } : { linked: runtime.succeeded },
+		);
 	} catch {
 		throw failure("receiver_close_failed");
 	}
@@ -474,15 +520,15 @@ async function runLink(runtime: Runtime): Promise<LinkCoordinatorAccountResult> 
 	return result;
 }
 /** Link only the existing device/Identity. No enrollment, local Identity adoption, or key creation. */
-export async function linkCoordinatorAccount(
-	options: LinkCoordinatorAccountOptions,
-): Promise<LinkCoordinatorAccountResult> {
+async function runAccountCeremony(options: AccountCeremonyOptions): Promise<AccountCeremonyResult> {
 	const origin = normalizeCoordinatorAccountLinkOrigin(options.coordinatorUrl);
 	if (
 		!origin ||
+		(options.intent !== undefined && options.intent !== "connect" && !isChange(options)) ||
 		!isAuthControllerId(options.groupId) ||
 		!isAuthControllerId(options.expectedIdentityId) ||
-		(options.expectedAuthority !== "controller_attestation" &&
+		(!isChange(options) &&
+			options.expectedAuthority !== "controller_attestation" &&
 			options.expectedAuthority !== "device_claim") ||
 		(options.expectedCoordinatorId !== undefined &&
 			!isAuthControllerId(options.expectedCoordinatorId)) ||
@@ -507,6 +553,7 @@ export async function linkCoordinatorAccount(
 		const receiver = await createCoordinatorAccountLinkReceiver({
 			attemptId,
 			coordinatorOrigin: origin,
+			intent: options.intent ?? "connect",
 			host: options.loopbackHost,
 			signal,
 		});
@@ -528,4 +575,21 @@ export async function linkCoordinatorAccount(
 		clearTimeout(timer);
 		controller.abort();
 	}
+}
+
+export async function linkCoordinatorAccount(
+	options: LinkCoordinatorAccountOptions,
+): Promise<LinkCoordinatorAccountResult> {
+	const result = await runAccountCeremony(options);
+	if (result.state === "completed") throw failure("invalid_response");
+	return result;
+}
+/** Fresh provider proof and the initiating device finalize the stored intent. */
+export async function changeCoordinatorAccount(
+	options: ChangeCoordinatorAccountOptions,
+): Promise<ChangeCoordinatorAccountResult> {
+	if (!isChange(options)) throw failure("invalid_options");
+	const result = await runAccountCeremony(options);
+	if (result.state !== "completed") throw failure("invalid_response");
+	return result;
 }

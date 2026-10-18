@@ -5,6 +5,7 @@ import type {
 	CoordinatorAuthBrowserTransactionStore,
 } from "./coordinator-auth-browser-transaction-contract.js";
 import { isAuthControllerId } from "./coordinator-auth-controller.js";
+import type { CoordinatorAccountManagementCapability } from "./coordinator-auth-link-change-store.js";
 import type { CoordinatorAuthLinkStore } from "./coordinator-auth-link-contract.js";
 import {
 	AUTH_SCHEMA_UPGRADE_REQUIRED,
@@ -36,6 +37,10 @@ import {
 	type CoordinatorBrowserLinkInput,
 	createCoordinatorBrowserLinkHandlers,
 } from "./coordinator-browser-link.js";
+import {
+	type CoordinatorBrowserLinkChangeHandlers,
+	createCoordinatorBrowserLinkChange,
+} from "./coordinator-browser-link-change.js";
 import {
 	type CoordinatorBrowserLinkCompletionInput,
 	createCoordinatorBrowserLinkCompletionHandlers,
@@ -97,6 +102,7 @@ export type CoordinatorBrowserAuthStore = CoordinatorBrowserAccountInput["store"
 	CoordinatorBrowserLinkCompletionInput["store"] &
 	CoordinatorBrowserLinkStartInput["store"] &
 	CoordinatorBrowserSigninStartInput["store"] &
+	CoordinatorAccountManagementCapability &
 	Partial<CoordinatorAuthBrowserTransactionPurposeStore & CoordinatorAuthSchemaStore>;
 export type CoordinatorBrowserAuthClientKey = (context: Context) => string | null;
 export interface CoordinatorBrowserAuth {
@@ -120,6 +126,9 @@ const FIXED_PATHS: Readonly<Record<string, readonly string[]>> = {
 	"/auth/link/start": ["GET", "POST"],
 	"/auth/link/confirm": ["POST"],
 	"/auth/link/cancel": ["POST"],
+	"/auth/link-change/start": ["GET", "POST"],
+	"/auth/link-change/confirm": ["POST"],
+	"/auth/link-change/cancel": ["POST"],
 	"/auth/link/complete": ["GET", "POST"],
 	"/auth/account": ["GET"],
 	"/auth/logout": ["POST"],
@@ -303,7 +312,8 @@ function admitFormSetup(
 		"transaction_attempt";
 	if (url.pathname === "/auth/logout") action = "session_logout";
 	if (url.pathname === "/auth/sign-in") action = "signin_start";
-	if (url.pathname === "/auth/link/start") action = "link_start";
+	if (url.pathname === "/auth/link/start" || url.pathname === "/auth/link-change/start")
+		action = "link_start";
 	const failure = admitBrowserFormSetup({
 		request,
 		scope: payload.settings,
@@ -388,7 +398,7 @@ export async function createCoordinatorBrowserAuth(
 		if (!payload) return Object.freeze({ ok: false, error: "browser_auth_setup_failed" });
 		const storeError = await browserAuthStoreError(store);
 		if (storeError) return Object.freeze({ ok: false, error: storeError });
-		const purposeStore = payload.ownerEnrollment ? capturePurposeStore(store) : undefined;
+		const purposeStore = capturePurposeStore(store);
 		const input = Object.freeze({
 			config: payload.config,
 			csrfKey: payload.csrfKey,
@@ -408,12 +418,14 @@ export async function createCoordinatorBrowserAuth(
 			return Object.freeze({ ok: false, error: "browser_auth_setup_failed" });
 		const signin = await createCoordinatorBrowserSigninStart(input);
 		const start = await createCoordinatorBrowserLinkStart(input);
+		const change = await createChangeAdapter(payload, store, limiter);
 		const owner = await createOwnerAdapter(payload, limiter);
 		const callback = await createCoordinatorBrowserAuthCallback({
 			...input,
 			completeLink: link.handlers.completeLink,
 			ownerCallback: owner?.handleCallback,
 			purposeStore,
+			changeCallback: change.callback,
 		});
 		const account = await createCoordinatorBrowserAccount(input);
 		if (!signin.ok || !start.ok || !callback.ok || !account.ok)
@@ -428,6 +440,7 @@ export async function createCoordinatorBrowserAuth(
 			{ path: payload.callbackPath, get: callback.handlers.callback },
 			{ path: "/auth/link/confirm", post: link.handlers.confirm },
 			{ path: "/auth/link/cancel", post: link.handlers.cancel },
+			...changeRoutes(change),
 			{
 				path: "/auth/link/complete",
 				get: completion.handlers.page,
@@ -441,6 +454,32 @@ export async function createCoordinatorBrowserAuth(
 	} catch (error) {
 		return browserAuthSetupFailure(error);
 	}
+}
+
+async function createChangeAdapter(
+	payload: EnabledPayload,
+	store: CoordinatorBrowserAuthStore,
+	limiter: InMemoryRequestRateLimiter,
+): Promise<CoordinatorBrowserLinkChangeHandlers> {
+	if (!store.accountManagement) throw new Error("auth_link_change_unavailable");
+	return createCoordinatorBrowserLinkChange({
+		config: payload.config,
+		csrfKey: payload.csrfKey,
+		oidcOptions: payload.oidcOptions,
+		limiter,
+		store: {
+			...store.accountManagement,
+			readAuthBrowserTransactionActivity: store.readAuthBrowserTransactionActivity.bind(store),
+		},
+	});
+}
+function changeRoutes(change: CoordinatorBrowserLinkChangeHandlers | undefined): Route[] {
+	if (!change) return [];
+	return [
+		{ path: "/auth/link-change/start", get: change.startPage, post: change.start },
+		{ path: "/auth/link-change/confirm", post: change.confirm },
+		{ path: "/auth/link-change/cancel", post: change.cancel },
+	];
 }
 
 function browserAuthReady(

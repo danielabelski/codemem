@@ -1,5 +1,6 @@
 import {
 	type CoordinatorAccountLinkStatusRead,
+	type CoordinatorAccountProfileV3,
 	readCoordinatorAccountLinkStatus,
 } from "@codemem/core";
 import type {
@@ -40,11 +41,11 @@ export interface AccountLinkViewV1 {
 				coordinatorId: string;
 				authority: "controller_attestation" | "device_claim" | null;
 				identityId: string | null;
-				state: "review_required" | "unlinked" | "linked" | "revoked" | "conflict";
+				state: "review_required" | "unlinked" | "disconnected" | "linked" | "revoked" | "conflict";
 				identityMatches: boolean;
-				account: { email?: string; displayName?: string; pictureUrl?: string } | null;
+				profile: CoordinatorAccountProfileV3;
 		  };
-	canLink: boolean;
+	actions: { connect: boolean; disconnect: boolean; refresh: boolean };
 	blockedReason:
 		| null
 		| "setup_incomplete"
@@ -66,7 +67,12 @@ function attachOperation(
 ): AccountLinkViewV1 {
 	const operation = view.contextId ? (registry?.forContext(view.contextId) ?? null) : null;
 	if (registry?.hasActive())
-		return { ...view, operation, canLink: false, blockedReason: "operation_active" };
+		return {
+			...view,
+			operation,
+			actions: { connect: false, disconnect: false, refresh: false },
+			blockedReason: "operation_active",
+		};
 	return { ...view, operation };
 }
 export function accountLocalView(result: LocalResult): AccountLinkViewV1 {
@@ -88,7 +94,7 @@ export function accountLocalView(result: LocalResult): AccountLinkViewV1 {
 				}
 			: null,
 		remote: { kind: "not_checked" },
-		canLink: false,
+		actions: { connect: false, disconnect: false, refresh: false },
 		blockedReason: "setup_incomplete",
 		operation: null,
 		checkedAt: new Date().toISOString(),
@@ -125,9 +131,12 @@ function applyRemote(
 			identityId: status.identityId,
 			state: status.state,
 			identityMatches,
-			account: identityMatches && status.state === "linked" ? status.account : null,
+			profile:
+				identityMatches && status.state === "linked" ? status.profile : { state: "unavailable" },
 		},
-		canLink: status.state === "unlinked" && identityMatches,
+		actions: identityMatches
+			? { ...status.actions }
+			: { connect: false, disconnect: false, refresh: false },
 		blockedReason,
 	};
 }

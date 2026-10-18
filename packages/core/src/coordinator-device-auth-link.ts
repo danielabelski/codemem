@@ -6,6 +6,7 @@ import type {
 } from "./coordinator-auth-browser-transaction-contract.js";
 import type { CoordinatorAuthControllerStore } from "./coordinator-auth-controller.js";
 import { isAuthControllerId } from "./coordinator-auth-controller.js";
+import type { CoordinatorAccountManagementCapability } from "./coordinator-auth-link-change-store.js";
 import {
 	AUTH_LINK_PURPOSE,
 	type CoordinatorAuthLinkRejected,
@@ -25,6 +26,7 @@ import {
 import type { CoordinatorEnrollment, CoordinatorStore } from "./coordinator-store-contract.js";
 
 export type CoordinatorDeviceAuthLinkStore = CoordinatorStore &
+	Partial<CoordinatorAccountManagementCapability> &
 	Partial<CoordinatorAccountLinkStatusStore> &
 	Pick<CoordinatorAuthControllerStore, "createAuthControllerAttestation"> &
 	Pick<
@@ -51,7 +53,7 @@ interface SignedRequest {
 	timestamp: string | null;
 	nonce: string | null;
 }
-interface DeviceAuthLinkDeps extends CoordinatorDeviceAuthLinkOptions {
+export interface DeviceAuthLinkDeps extends CoordinatorDeviceAuthLinkOptions {
 	authorizeRequest: (
 		store: CoordinatorDeviceAuthLinkStore,
 		request: SignedRequest,
@@ -162,9 +164,11 @@ async function applyDeviceAction(
 	config: CoordinatorAuthBrowserConfig,
 ): Promise<Response> {
 	if (action === "account_status") {
-		if (!store.readAccountLinkStatus) return c.json({ error: "auth_link_unavailable" }, 503);
+		if (!store.accountManagement) return c.json({ error: "auth_link_unavailable" }, 503);
 		return c.json(
-			await store.readAccountLinkStatus(signer, config, { identityId: String(data.identity_id) }),
+			await store.accountManagement.readAccountManagementStatus(signer, config, {
+				identityId: String(data.identity_id),
+			}),
 		);
 	}
 	if (action === "status") {
@@ -196,12 +200,13 @@ async function createDeviceAttempt(
 	config: CoordinatorAuthBrowserConfig,
 ): Promise<Response> {
 	if (!exactStrings(data, FIELDS.create)) return c.json({ error: "auth_link_invalid_input" }, 400);
-	if (!store.readAccountLinkStatus) return c.json({ error: "auth_link_unavailable" }, 503);
-	const current = await store.readAccountLinkStatus(signer, config, {
+	if (!store.accountManagement) return c.json({ error: "auth_link_unavailable" }, 503);
+	const current = await store.accountManagement.readAccountManagementStatus(signer, config, {
 		identityId: data.identity_id,
 	});
 	if (
-		(current.state !== "unlinked" && current.state !== "linked") ||
+		(current.state !== "unlinked" && current.state !== "disconnected") ||
+		!current.actions.connect ||
 		current.identityId !== data.identity_id ||
 		current.authority !== data.authority
 	)

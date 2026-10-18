@@ -6,11 +6,13 @@ import {
 import type { AuthLinkBackend, AuthLinkStatement } from "./coordinator-auth-link.js";
 import type { AuthLinkAttemptAuthorityRow } from "./coordinator-auth-link-authority.js";
 import { readAuthLinkAttemptAuthority } from "./coordinator-auth-link-authority.js";
+import { authLinkContinuationSource } from "./coordinator-auth-link-continuation.js";
 import type { CoordinatorAuthLinkConfig } from "./coordinator-auth-link-contract.js";
 import { authDeviceClaimProvenanceSql } from "./coordinator-auth-link-provenance.js";
 import { ed25519KeyIdForRevocation } from "./coordinator-ed25519-key-id-compat.js";
 
 interface SourceRow extends AuthLinkAttemptAuthorityRow {
+	prior_link_id: string | null;
 	identity_id: string;
 	group_id: string;
 	device_id: string;
@@ -21,6 +23,13 @@ interface SourceRow extends AuthLinkAttemptAuthorityRow {
 	loopback_redirect: string;
 	state: string;
 	completion_secret_hash: string | null;
+}
+function pendingContinuation(row: SourceRow): boolean {
+	return (
+		row.prior_link_id !== null &&
+		row.prior_link_id !== undefined &&
+		!["finalized", "session_redeemed"].includes(row.state)
+	);
 }
 
 /** Fresh capture for one operation; the winning statement must include its SQL. */
@@ -38,6 +47,8 @@ export async function captureAuthLinkSource(
 	});
 	const authority = row && readAuthLinkAttemptAuthority(row);
 	if (!row || !authority) return { sql: "0 = 1", values: [] };
+	if (pendingContinuation(row))
+		return authLinkContinuationSource(backend, row, attemptId, config, now, alias);
 	if (authority.kind === "controller_attestation")
 		return { sql: `${alias}.authority_kind = 'controller_attestation'`, values: [] };
 	if (["finalized", "session_redeemed"].includes(row.state)) {

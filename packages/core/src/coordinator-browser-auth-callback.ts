@@ -44,6 +44,7 @@ export interface CoordinatorBrowserAuthCallbackInput {
 	completeLink: (input: CoordinatorBrowserAuthLinkCompletionInput) => Promise<Response>;
 	oidcOptions?: CoordinatorOidcOptions;
 	ownerCallback?: (request: Request, trustedClientKey: string) => Promise<Response>;
+	changeCallback?: (request: Request) => Promise<Response>;
 	purposeStore?: CoordinatorAuthBrowserTransactionPurposeStore;
 }
 export type CoordinatorBrowserAuthCallbackOutcome =
@@ -175,6 +176,7 @@ type Context = Readonly<{
 	store: CallbackStore;
 	completeLink: CoordinatorBrowserAuthCallbackInput["completeLink"];
 	ownerCallback?: CoordinatorBrowserAuthCallbackInput["ownerCallback"];
+	changeCallback?: CoordinatorBrowserAuthCallbackInput["changeCallback"];
 	readPurpose?: CoordinatorAuthBrowserTransactionPurposeStore["readAuthBrowserTransactionPurpose"];
 }>;
 
@@ -360,6 +362,8 @@ async function dispatchOwnerCallback(
 	const purpose = await context.readPurpose({ stateHash, binderHash }, context.storeConfig);
 	if (purpose === "owner_enroll" && context.ownerCallback)
 		return result(await context.ownerCallback(request, trustedClientKey), "owner_dispatched");
+	if (purpose === "link_change" && context.changeCallback)
+		return result(await context.changeCallback(request), "link_dispatched");
 	if (purpose === "signin" || purpose === "link") return null;
 	return notice(403, "transaction_unavailable");
 }
@@ -424,9 +428,11 @@ export async function createCoordinatorBrowserAuthCallback(
 		if (typeof completeLink !== "function") throw new Error();
 		const store = captureStore(ownData(input, "store"));
 		const ownerCallback = ownData(input, "ownerCallback");
+		const changeCallback = ownData(input, "changeCallback");
+		if (changeCallback !== undefined && typeof changeCallback !== "function") throw new Error();
 		let readPurpose: Context["readPurpose"];
-		if (ownerCallback !== undefined) {
-			if (typeof ownerCallback !== "function") throw new Error();
+		if (ownerCallback !== undefined || changeCallback !== undefined) {
+			if (ownerCallback !== undefined && typeof ownerCallback !== "function") throw new Error();
 			const receiver = ownData(input, "purposeStore");
 			const method = dataMethod(
 				receiver,
@@ -445,6 +451,7 @@ export async function createCoordinatorBrowserAuthCallback(
 			store,
 			completeLink: completeLink as CoordinatorBrowserAuthCallbackInput["completeLink"],
 			ownerCallback: ownerCallback as CoordinatorBrowserAuthCallbackInput["ownerCallback"],
+			changeCallback: changeCallback as CoordinatorBrowserAuthCallbackInput["changeCallback"],
 			readPurpose,
 		});
 		return Object.freeze({

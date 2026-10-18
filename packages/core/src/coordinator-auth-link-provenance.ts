@@ -3,8 +3,8 @@
  * pass a freshly derived canonical key ID; account sessions need no current key.
  * Link revocation is deliberately checked by the caller, including post-revoke audit.
  */
-export function authDeviceClaimProvenanceSql(options: {
-	link: "l" | "cl";
+export function authDeviceClaimGenesisSql(options: {
+	link: "l" | "cl" | "genesis";
 	canonicalKeyId?: "?";
 }): string {
 	// Keep provenance independent of the outer session/browser expression tree.
@@ -34,6 +34,40 @@ export function authDeviceClaimProvenanceSql(options: {
  AND ca.fingerprint = ct.fingerprint AND ca.auth_config_revision = ct.auth_config_revision AND ca.created_at_ms = ct.finalized_at_ms)
  SELECT 1 FROM committed_claim cp WHERE cp.coordinator_id = ${options.link}.coordinator_id AND cp.link_id = ${options.link}.link_id
  ${options.canonicalKeyId ? `AND cp.key_id = ${options.canonicalKeyId}` : ""})`;
+}
+
+/** Continuations reuse the original complete genesis proof. Birth revisions and
+ * the original group remain historical; the new attempt/audit pin current ones.
+ */
+export function authDeviceClaimProvenanceSql(options: {
+	link: "l" | "cl";
+	canonicalKeyId?: "?";
+}): string {
+	return `((${options.link}.generation = 1 AND ${authDeviceClaimGenesisSql(options)}) OR
+ (${options.link}.generation > 1 AND EXISTS (WITH continuation AS MATERIALIZED (
+ SELECT nl.coordinator_id,nl.link_id,d.key_id FROM coordinator_auth_account_links nl
+ JOIN coordinator_auth_link_attempts t ON t.coordinator_id = nl.coordinator_id AND t.attempt_id = nl.attempt_id AND t.link_id = nl.link_id
+ JOIN coordinator_auth_device_claims d ON d.coordinator_id = nl.coordinator_id AND d.claim_id = nl.device_claim_id
+ JOIN coordinator_auth_account_links genesis ON genesis.coordinator_id = d.coordinator_id AND genesis.device_claim_id = d.claim_id AND genesis.attempt_id = d.attempt_id AND genesis.generation = 1
+ JOIN coordinator_auth_account_links prior ON prior.coordinator_id = nl.coordinator_id AND prior.link_id = t.prior_link_id
+ JOIN coordinator_auth_link_audit_log a ON a.coordinator_id = nl.coordinator_id AND a.link_id = nl.link_id AND a.action = 'link_created'
+ WHERE nl.coordinator_id = ${options.link}.coordinator_id AND nl.link_id = ${options.link}.link_id
+ AND nl.authority_kind = 'device_claim' AND nl.controller_attestation_id IS NULL
+ AND t.authority_kind = 'device_claim' AND t.controller_attestation_id IS NULL AND t.controller_review_receipt_id IS NULL AND t.controller_revision IS NULL
+ AND t.state IN ('finalized','session_redeemed') AND t.identity_id = nl.identity_id AND t.issuer = nl.issuer
+ AND t.account_subject = nl.subject AND t.auth_config_revision = nl.auth_config_revision AND t.finalized_at_ms = nl.created_at_ms
+ AND t.browser_transaction_hash IS NOT NULL AND t.browser_start_hash IS NOT NULL AND t.runtime_verifier_hash IS NOT NULL AND t.completion_secret_hash IS NOT NULL
+ AND t.created_at_ms <= t.claimed_at_ms AND t.claimed_at_ms <= t.oidc_verified_at_ms AND t.oidc_verified_at_ms <= t.confirmed_at_ms
+ AND t.confirmed_at_ms <= t.finalized_at_ms AND t.finalized_at_ms < t.expires_at_ms
+ AND d.identity_id = t.identity_id AND d.device_id = t.device_id AND d.public_key = t.public_key AND d.fingerprint = t.fingerprint AND d.issuer = t.issuer
+ AND ${authDeviceClaimGenesisSql({ link: "genesis" })}
+ AND prior.identity_id = nl.identity_id AND prior.generation = t.prior_generation AND prior.generation = nl.generation-1
+ AND prior.ended_at_ms IS NOT NULL AND prior.end_reason = 'user_disconnected'
+ AND a.attempt_id = t.attempt_id AND a.identity_id = t.identity_id AND a.group_id = t.group_id AND a.device_id = t.device_id
+ AND a.fingerprint = t.fingerprint AND a.device_claim_id = d.claim_id AND a.authority_kind = 'device_claim' AND a.controller_attestation_id IS NULL
+ AND a.auth_config_revision = t.auth_config_revision AND a.created_at_ms = t.finalized_at_ms)
+ SELECT 1 FROM continuation cp WHERE cp.coordinator_id = ${options.link}.coordinator_id AND cp.link_id = ${options.link}.link_id
+ ${options.canonicalKeyId ? "AND cp.key_id = ?" : ""})))`;
 }
 
 /** Account management only; privileged enrollment/grant proofs remain attested-only. */

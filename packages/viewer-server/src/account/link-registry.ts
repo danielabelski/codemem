@@ -1,5 +1,9 @@
 import { randomUUID } from "node:crypto";
-import { CoordinatorAccountLinkError, linkCoordinatorAccount } from "@codemem/core";
+import {
+	CoordinatorAccountLinkError,
+	changeCoordinatorAccount,
+	linkCoordinatorAccount,
+} from "@codemem/core";
 import type { AccountContext, AccountContextReader } from "./context.js";
 
 type CoordinatorAuthLinkAuthorityKind = Parameters<
@@ -20,6 +24,7 @@ export type AccountLinkFailure =
 	| "cancellation_unconfirmed"
 	| "receiver_close_failed";
 export interface AccountLinkOperationV1 {
+	intent: "connect" | "disconnect" | "refresh";
 	operationId: string;
 	groupId: string;
 	contextId: string;
@@ -36,6 +41,7 @@ export type AccountLinkStartResult =
 	| { error: "account_shutting_down" | "account_context_changed" };
 export interface AccountLinkRegistry {
 	start(options: {
+		intent: AccountLinkOperationV1["intent"];
 		context: AccountContext;
 		expectedCoordinatorId: string;
 		expectedAuthority: CoordinatorAuthLinkAuthorityKind;
@@ -52,6 +58,7 @@ export interface AccountLinkRegistry {
 export interface AccountLinkRegistryOptions {
 	readContext: AccountContextReader;
 	link?: typeof linkCoordinatorAccount;
+	change?: typeof changeCoordinatorAccount;
 	now?: () => number;
 }
 interface Job {
@@ -121,12 +128,16 @@ function safeFailure(error: unknown): AccountLinkFailure {
 			return "request_failed";
 	}
 }
-function validBrowserUrl(value: string, origin: string): boolean {
+function validBrowserUrl(
+	value: string,
+	origin: string,
+	intent: AccountLinkOperationV1["intent"],
+): boolean {
 	try {
 		const url = new URL(value);
 		return (
 			url.origin === origin &&
-			url.pathname === "/auth/link/start" &&
+			url.pathname === (intent === "connect" ? "/auth/link/start" : "/auth/link-change/start") &&
 			!url.username &&
 			!url.password &&
 			!url.hash
@@ -201,7 +212,7 @@ class InProcessAccountLinkRegistry implements AccountLinkRegistry {
 	#browserStart(job: Job, url: string): void {
 		if (this.#shuttingDown || terminal(job) || job.controller.signal.aborted) return;
 		if (!this.#current(job.context)) job.abortFailure = "context_changed";
-		else if (!validBrowserUrl(url, job.context.coordinatorUrl))
+		else if (!validBrowserUrl(url, job.context.coordinatorUrl, job.operation.intent))
 			job.abortFailure = "invalid_response";
 		if (job.abortFailure) {
 			this.#clearUrl(job);
@@ -211,6 +222,31 @@ class InProcessAccountLinkRegistry implements AccountLinkRegistry {
 		job.url = url;
 		job.operation.state = "awaiting_browser";
 		job.operation.browserUrlAvailable = job.deliveries < 5;
+	}
+	async #invoke(
+		job: Job,
+		expectedCoordinatorId: string,
+		expectedAuthority: CoordinatorAuthLinkAuthorityKind,
+	): Promise<void> {
+		const { dbPath, keysDir, groupId, coordinatorUrl, identityId } = job.context;
+		const common = {
+			dbPath,
+			keysDir,
+			groupId,
+			coordinatorUrl,
+			expectedIdentityId: identityId,
+			expectedCoordinatorId,
+			assertCurrentContext: () => this.#current(job.context),
+			signal: job.controller.signal,
+			onBrowserStart: (url: string) => this.#browserStart(job, url),
+		};
+		if (job.operation.intent === "connect")
+			await (this.#options.link ?? linkCoordinatorAccount)({ ...common, expectedAuthority });
+		else
+			await (this.#options.change ?? changeCoordinatorAccount)({
+				...common,
+				intent: job.operation.intent,
+			});
 	}
 	async #run(
 		job: Job,
@@ -222,19 +258,7 @@ class InProcessAccountLinkRegistry implements AccountLinkRegistry {
 				this.#finish(job, "cancelled", "link_stopped");
 				return;
 			}
-			const { dbPath, keysDir, groupId, coordinatorUrl, identityId } = job.context;
-			await (this.#options.link ?? linkCoordinatorAccount)({
-				dbPath,
-				keysDir,
-				groupId,
-				coordinatorUrl,
-				expectedIdentityId: identityId,
-				expectedCoordinatorId,
-				expectedAuthority,
-				assertCurrentContext: () => this.#current(job.context),
-				signal: job.controller.signal,
-				onBrowserStart: (url) => this.#browserStart(job, url),
-			});
+			await this.#invoke(job, expectedCoordinatorId, expectedAuthority);
 			this.#finish(job, "succeeded", null);
 		} catch (error) {
 			let failure = safeFailure(error);
@@ -249,11 +273,14 @@ class InProcessAccountLinkRegistry implements AccountLinkRegistry {
 		}
 	}
 	start({
+		intent,
 		context,
 		expectedCoordinatorId,
 		expectedAuthority,
 		expectedLifecycleToken,
 	}: Parameters<AccountLinkRegistry["start"]>[0]): AccountLinkStartResult {
+		if (intent !== "connect" && intent !== "disconnect" && intent !== "refresh")
+			return { error: "account_context_changed" };
 		if (this.#shuttingDown) return { error: "account_shutting_down" };
 		const pending = this.#inProgress();
 		if (pending) return pending;
@@ -270,6 +297,7 @@ class InProcessAccountLinkRegistry implements AccountLinkRegistry {
 			abortFailure: null,
 			done: Promise.resolve(),
 			operation: {
+				intent,
 				operationId: randomUUID(),
 				groupId: context.groupId,
 				contextId: context.contextId,

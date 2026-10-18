@@ -8,7 +8,7 @@ import { decodeCoordinatorAuthProof32 } from "./coordinator-auth-proof.js";
 export interface CoordinatorAccountLinkReceiver {
 	destination: string;
 	completion: Promise<string>;
-	close(options?: { linked?: boolean }): Promise<void>;
+	close(options?: { linked?: boolean; completed?: boolean }): Promise<void>;
 }
 export interface CoordinatorOwnerEnrollmentCompletion {
 	completionSecret: string;
@@ -20,6 +20,7 @@ export interface CoordinatorOwnerEnrollmentReceiver {
 	close(): Promise<void>;
 }
 export interface CoordinatorAccountLinkReceiverOptions {
+	intent?: "connect" | "disconnect" | "refresh";
 	attemptId: string;
 	host?: "127.0.0.1" | "::1";
 	port?: number;
@@ -212,13 +213,13 @@ async function createReceiver(
 ): Promise<{
 	destination: string;
 	completion: Promise<string | CoordinatorOwnerEnrollmentCompletion>;
-	close(options?: { linked?: boolean }): Promise<void>;
+	close(options?: { linked?: boolean; completed?: boolean }): Promise<void>;
 }> {
 	if (!validOptions(options)) throw new Error("Invalid account-link receiver options.");
 	if (mode === "owner_enroll" && options.coordinatorOrigin !== undefined)
 		throw new Error("Invalid owner-enrollment receiver options.");
 	const { attemptId, signal, port = 0, host = "127.0.0.1" } = options;
-	const receipt = mode === "account_link" ? createAccountLinkReceipt() : null;
+	const receipt = mode === "account_link" ? createAccountLinkReceipt(options.intent) : null;
 	const page =
 		mode === "owner_enroll"
 			? "Your computer received the confirmation. Return to the app to finish adding the device."
@@ -260,7 +261,7 @@ async function createReceiver(
 		return {
 			destination: `http://${authority}${PATH}`,
 			completion: lifecycle.completion,
-			close(options?: { linked?: boolean }) {
+			close(options?: { linked?: boolean; completed?: boolean }) {
 				if (!closing)
 					closing = (async () => {
 						await receipt?.finish(options);

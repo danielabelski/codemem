@@ -64,6 +64,10 @@ import {
 	type AuthLinkStatement,
 } from "./coordinator-auth-link.js";
 import {
+	type CoordinatorAccountManagementStore,
+	createCoordinatorAccountManagementStore,
+} from "./coordinator-auth-link-change-store.js";
+import {
 	AUTH_LINK_BROWSER_START_COLUMN_SQL,
 	AUTH_LINK_SCHEMA_SQL,
 	type CoordinatorAuthLinkClaimInput,
@@ -836,6 +840,7 @@ export class BetterSqliteCoordinatorStore implements CoordinatorStore {
 	readonly path: string;
 	readonly db: DatabaseType;
 	private readonly authLinks: AuthLinkOperations;
+	readonly accountManagement: CoordinatorAccountManagementStore;
 	readonly assertAuthSchemaReady: () => Promise<void>;
 	private readonly accountLinkStatus: AccountLinkStatusOperations;
 	private readonly deviceRevocations: DeviceRevocationOperations;
@@ -884,6 +889,10 @@ export class BetterSqliteCoordinatorStore implements CoordinatorStore {
 		this.assertAuthSchemaReady = () => assertCoordinatorAuthSchema(rawAuthBackend);
 		const authBackend = withCoordinatorAuthSchema(rawAuthBackend);
 		this.authLinks = new AuthLinkOperations(authBackend, options.authClock);
+		this.accountManagement = createCoordinatorAccountManagementStore(
+			authBackend,
+			options.authClock,
+		);
 		this.accountLinkStatus = new AccountLinkStatusOperations(authBackend, options.authClock);
 		this.authSessions = new AuthSessionOperations(authBackend, options.authClock);
 		this.authAccountProfiles = new AuthAccountProfileOperations(authBackend, options.authClock);

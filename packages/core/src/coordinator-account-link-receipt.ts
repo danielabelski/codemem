@@ -27,10 +27,40 @@ const receipt = document.querySelector('main').dataset.receipt;
 })();`;
 const hash = (text: string) => createHash("sha256").update(text).digest("base64");
 
+function allowedReceiptRequest(
+	request: IncomingMessage,
+	authority: string,
+	token: string,
+	delivered: boolean,
+): boolean {
+	const hosts = request.rawHeaders.filter(
+		(value, index) => index % 2 === 0 && value.toLowerCase() === "host",
+	);
+	return (
+		delivered &&
+		request.method === "GET" &&
+		hosts.length === 1 &&
+		request.headers.host === authority &&
+		request.headers["x-codemem-receipt"] === token &&
+		request.headers["sec-fetch-site"] === "same-origin" &&
+		request.headers["sec-fetch-mode"] === "cors" &&
+		request.headers["transfer-encoding"] === undefined &&
+		(request.headers["content-length"] === undefined || request.headers["content-length"] === "0")
+	);
+}
+
 /** The browser may lose its opener across provider COOP isolation. Only the
  * trusted runtime can signal successful finalization to this same-origin receipt.
  */
-export function createAccountLinkReceipt() {
+export function createAccountLinkReceipt(intent: "connect" | "disconnect" | "refresh" = "connect") {
+	const management = intent !== "connect";
+	const subject = management ? "request" : "link";
+	const script = management
+		? SCRIPT.replace(".linked === true", ".completed === true").replace(
+				"Google account linked",
+				intent === "disconnect" ? "Google account unlinked" : "Account profile refreshed",
+			)
+		: SCRIPT;
 	const token = randomBytes(32).toString("base64url");
 	let delivered = false;
 	let linked = false;
@@ -39,30 +69,17 @@ export function createAccountLinkReceipt() {
 		acknowledge = resolve;
 	});
 	const headers = {
-		"Content-Security-Policy": `default-src 'none'; style-src 'sha256-${hash(COORDINATOR_AUTH_STYLE)}'; script-src 'sha256-${hash(SCRIPT)}'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'`,
+		"Content-Security-Policy": `default-src 'none'; style-src 'sha256-${hash(COORDINATOR_AUTH_STYLE)}'; script-src 'sha256-${hash(script)}'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'`,
 	};
 	return {
 		headers,
-		page: `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="referrer" content="no-referrer"><title>Finishing account link · Codemem</title><style>${COORDINATOR_AUTH_STYLE}</style></head><body><main data-receipt="${token}"><p class="brand">codemem</p><h1>Finishing account link…</h1><p>Your computer received the confirmation and is checking the link.</p><p class="receipt-status" role="status">This window will close when linking finishes. If it stays open, return to Codemem and check status.</p><p class="note">No more sign-in steps are needed here.</p></main><script>${SCRIPT}</script></body></html>`,
+		page: `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="referrer" content="no-referrer"><title>Finishing account ${subject} · Codemem</title><style>${COORDINATOR_AUTH_STYLE}</style></head><body><main data-receipt="${token}"><p class="brand">codemem</p><h1>Finishing account ${subject}…</h1><p>Your computer received the confirmation and is checking the request.</p><p class="receipt-status" role="status">This window will close when the request finishes. If it stays open, return to Codemem and check status.</p><p class="note">No more sign-in steps are needed here.</p></main><script>${script}</script></body></html>`,
 		delivered() {
 			delivered = true;
 		},
 		handle(request: IncomingMessage, response: ServerResponse, authority: string): boolean {
 			if (request.url !== RESULT_PATH) return false;
-			const hosts = request.rawHeaders.filter(
-				(value, index) => index % 2 === 0 && value.toLowerCase() === "host",
-			);
-			const allowed =
-				delivered &&
-				request.method === "GET" &&
-				hosts.length === 1 &&
-				request.headers.host === authority &&
-				request.headers["x-codemem-receipt"] === token &&
-				request.headers["sec-fetch-site"] === "same-origin" &&
-				request.headers["sec-fetch-mode"] === "cors" &&
-				request.headers["transfer-encoding"] === undefined &&
-				(request.headers["content-length"] === undefined ||
-					request.headers["content-length"] === "0");
+			const allowed = allowedReceiptRequest(request, authority, token, delivered);
 			response.writeHead(allowed ? 200 : 403, {
 				"Content-Type": "application/json",
 				"Cache-Control": "no-store",
@@ -71,11 +88,15 @@ export function createAccountLinkReceipt() {
 				"Content-Security-Policy": "default-src 'none'; frame-ancestors 'none'",
 			});
 			if (allowed && linked) response.once("finish", acknowledge);
-			response.end(JSON.stringify({ linked: allowed && linked }));
+			response.end(
+				JSON.stringify(
+					management ? { completed: allowed && linked } : { linked: allowed && linked },
+				),
+			);
 			return true;
 		},
-		async finish(options?: { linked?: boolean }): Promise<void> {
-			if (!options?.linked || !delivered) return;
+		async finish(options?: { linked?: boolean; completed?: boolean }): Promise<void> {
+			if (!(management ? options?.completed : options?.linked) || !delivered) return;
 			linked = true;
 			let timer: ReturnType<typeof setTimeout> | undefined;
 			try {

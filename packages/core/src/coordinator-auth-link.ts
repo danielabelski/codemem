@@ -8,6 +8,10 @@ import {
 } from "./coordinator-auth-device-claim-eligibility.js";
 import { readAuthLinkAttemptAuthority } from "./coordinator-auth-link-authority.js";
 import {
+	createAuthLinkContinuationAttempt,
+	finalizeAuthLinkContinuation,
+} from "./coordinator-auth-link-continuation.js";
+import {
 	AUTH_LINK_ATTEMPT_TTL_MS,
 	AUTH_LINK_CREATE_WINDOW_MS,
 	AUTH_LINK_EXPIRE_BATCH_MAX,
@@ -67,6 +71,8 @@ export interface AuthLinkBackend {
 	batch(statements: AuthLinkStatement[]): Promise<unknown>;
 }
 interface Attempt {
+	prior_link_id: string | null;
+	prior_generation: number | null;
 	authority_kind: "controller_attestation" | "device_claim";
 	coordinator_id: string;
 	attempt_id: string;
@@ -343,7 +349,8 @@ const CREATE_SQL = `INSERT INTO coordinator_auth_link_attempts (
  ${creationAdmissionSql("a")}`;
 function creationAdmissionSql(source: "a" | "p"): string {
 	return `
- AND NOT EXISTS (SELECT 1 FROM coordinator_owner_enrollment_attempts t
+  AND NOT EXISTS (SELECT 1 FROM (SELECT coordinator_id,attempt_id FROM coordinator_owner_enrollment_attempts
+ UNION ALL SELECT coordinator_id,attempt_id FROM coordinator_auth_link_change_attempts) t
   WHERE t.coordinator_id = ${source}.coordinator_id AND t.attempt_id = ?)
  AND NOT EXISTS (SELECT 1 FROM coordinator_auth_browser_transactions t
   WHERE t.coordinator_id = ${source}.coordinator_id AND t.attempt_id = ? AND t.purpose NOT IN ('signin','link'))
@@ -561,6 +568,21 @@ export class AuthLinkOperations implements CoordinatorAuthLinkStore {
 		const now = authLinkNow(this.clock);
 		const existing = await this.read(i.attemptId, c, { authority: "either" });
 		if (existing) return this.retryCreation(existing, i, s, c, now);
+		const continuation = await createAuthLinkContinuationAttempt(
+			this.backend,
+			{
+				attemptId: i.attemptId,
+				signer: s,
+				authority: i.authority,
+				runtimeVerifierHash: i.runtimeVerifierHash,
+				loopbackRedirect: i.loopbackRedirect,
+				...(i.browserStartHash ? { browserStartHash: i.browserStartHash } : {}),
+				...(i.expectedIdentityId ? { expectedIdentityId: i.expectedIdentityId } : {}),
+			},
+			c,
+			now,
+		);
+		if (continuation) return continuation;
 		if (i.authority.kind === "device_claim") return this.createDeviceAttempt(i, s, c, now);
 		return this.createAttestedAttempt(i, s, c, now);
 	}
@@ -615,6 +637,7 @@ export class AuthLinkOperations implements CoordinatorAuthLinkStore {
 	): Promise<CoordinatorAuthLinkCreateResult> {
 		if (!creationMatches(row, i, s, c) || row.state === "expired" || row.expires_at_ms <= now)
 			return rejected("attempt_conflict");
+		if (row.prior_link_id) return this.retryContinuation(row, i, c, now);
 		if (i.authority.kind === "device_claim") {
 			const captured = await this.captureDevice(i, s, c, now);
 			const active =
@@ -640,6 +663,21 @@ export class AuthLinkOperations implements CoordinatorAuthLinkStore {
 			return { kind: "existing", status: status(row, now), identityId: row.identity_id };
 		}
 		return this.createRetry(row, i, s, c, now, await this.readAuthority(i.attemptId, c));
+	}
+	private async retryContinuation(
+		row: Attempt,
+		i: CreateInput,
+		c: CoordinatorAuthLinkConfig,
+		now: number,
+	): Promise<CoordinatorAuthLinkCreateResult> {
+		const source = await this.source(i.attemptId, c, now, { currentDevice: true });
+		const active = await this.first({
+			sql: `SELECT 1 FROM coordinator_auth_link_attempts WHERE attempt_id = ? AND ${CURRENT_CONFIG} AND ${source.sql}`,
+			values: [i.attemptId, ...configValues(c), ...source.values],
+		});
+		if (!active || (await this.readOwnerReservation(i.attemptId, c)))
+			return rejected("attempt_unavailable");
+		return { kind: "existing", status: status(row, now), identityId: row.identity_id };
 	}
 	private async captureDevice(
 		i: CreateInput,
@@ -712,7 +750,8 @@ export class AuthLinkOperations implements CoordinatorAuthLinkStore {
 	}
 	private readOwnerReservation(attemptId: string, c: CoordinatorAuthLinkConfig) {
 		return this.first({
-			sql: `SELECT 1 FROM coordinator_owner_enrollment_attempts WHERE coordinator_id = ? AND attempt_id = ?
+			sql: `SELECT 1 FROM (SELECT coordinator_id,attempt_id FROM coordinator_owner_enrollment_attempts
+ UNION ALL SELECT coordinator_id,attempt_id FROM coordinator_auth_link_change_attempts) WHERE coordinator_id = ? AND attempt_id = ?
  UNION ALL SELECT 1 FROM coordinator_auth_browser_transactions WHERE coordinator_id = ? AND attempt_id = ?
  AND purpose NOT IN ('signin','link') LIMIT 1`,
 			values: [c.coordinatorId, attemptId, c.coordinatorId, attemptId],
@@ -1015,6 +1054,7 @@ export class AuthLinkOperations implements CoordinatorAuthLinkStore {
 		const now = authLinkNow(this.clock);
 		const linkId = globalThis.crypto.randomUUID();
 		const row = await this.read(i.attemptId, c, { authority: "either" });
+		if (row?.prior_link_id) return finalizeAuthLinkContinuation(this.backend, i, c, now, linkId);
 		if (row?.authority_kind === "device_claim") return this.finalizeDevice(i, c, now, linkId, row);
 		const authority = await this.readAuthority(i.attemptId, c);
 		try {

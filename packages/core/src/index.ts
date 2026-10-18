@@ -43,11 +43,14 @@ export {
 	normalizeCoordinatorAccountLinkOrigin,
 } from "./coordinator-account-link-receiver.js";
 export type {
+	ChangeCoordinatorAccountOptions,
+	ChangeCoordinatorAccountResult,
 	LinkCoordinatorAccountOptions,
 	LinkCoordinatorAccountResult,
 } from "./coordinator-account-link-runtime.js";
 export {
 	CoordinatorAccountLinkError,
+	changeCoordinatorAccount,
 	linkCoordinatorAccount,
 } from "./coordinator-account-link-runtime.js";
 export { readAccountLinkDevice } from "./coordinator-account-link-signer.js";
@@ -60,6 +63,10 @@ export type {
 	ReadCoordinatorAccountLinkStatusOptions,
 } from "./coordinator-account-link-status-client.js";
 export { readCoordinatorAccountLinkStatus } from "./coordinator-account-link-status-client.js";
+export type {
+	CoordinatorAccountLinkStatusV3,
+	CoordinatorAccountProfileV3,
+} from "./coordinator-account-management-status.js";
 export type {
 	CoordinatorAuthControllerReviewActionOptions,
 	CoordinatorConsumedTeamInvite,

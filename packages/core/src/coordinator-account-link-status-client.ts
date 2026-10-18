@@ -3,12 +3,9 @@ import {
 	readAccountLinkDevice,
 	signAccountLinkRequest,
 } from "./coordinator-account-link-signer.js";
-import { projectAccountProfileView } from "./coordinator-auth-browser-view.js";
+import { decodeCoordinatorAccountLinkStatusV3 } from "./coordinator-account-link-status-v3.js";
+import type { CoordinatorAccountLinkStatusV3 } from "./coordinator-account-management-status.js";
 import { isAuthControllerId } from "./coordinator-auth-controller.js";
-import type {
-	CoordinatorAccountLinkStatusV2,
-	CoordinatorAuthLinkAuthorityKind,
-} from "./coordinator-auth-link-authority.js";
 import type { CoordinatorDeviceLocalEvidence } from "./coordinator-device-local.js";
 
 export interface ReadCoordinatorAccountLinkStatusOptions {
@@ -21,7 +18,7 @@ export interface ReadCoordinatorAccountLinkStatusOptions {
 	fetch?: typeof globalThis.fetch;
 }
 export type CoordinatorAccountLinkStatusRead =
-	| { kind: "status"; status: CoordinatorAccountLinkStatusV2 }
+	| { kind: "status"; status: CoordinatorAccountLinkStatusV3 }
 	| { kind: "unsupported" }
 	| {
 			kind: "unavailable";
@@ -39,109 +36,6 @@ type UnavailableCode = Extract<CoordinatorAccountLinkStatusRead, { kind: "unavai
 function unavailable(code: UnavailableCode): CoordinatorAccountLinkStatusRead {
 	return { kind: "unavailable", code };
 }
-function record(value: unknown): value is Record<string, unknown> {
-	return value !== null && typeof value === "object" && !Array.isArray(value);
-}
-function authorityKind(value: unknown): value is CoordinatorAuthLinkAuthorityKind {
-	return value === "controller_attestation" || value === "device_claim";
-}
-function displayText(value: unknown, limit: number): value is string {
-	return (
-		typeof value === "string" &&
-		value.length <= limit &&
-		value.trim().length > 0 &&
-		!/[\p{Cc}\p{Cf}\p{Cs}]/u.test(value)
-	);
-}
-function accountMetadata(value: unknown): NonNullable<CoordinatorAccountLinkStatusV2["account"]> {
-	if (
-		!record(value) ||
-		Object.keys(value).some((key) => !["email", "displayName", "pictureUrl"].includes(key))
-	)
-		throw new Error("Invalid status.");
-	const account: NonNullable<CoordinatorAccountLinkStatusV2["account"]> = {};
-	if (Object.hasOwn(value, "email")) {
-		if (!displayText(value.email, 320)) throw new Error("Invalid status.");
-		account.email = value.email;
-	}
-	if (Object.hasOwn(value, "displayName")) {
-		if (!displayText(value.displayName, 256)) throw new Error("Invalid status.");
-		account.displayName = value.displayName;
-	}
-	if (Object.hasOwn(value, "pictureUrl")) {
-		const { pictureUrl } = projectAccountProfileView(value, "https://accounts.google.com");
-		if (!pictureUrl || pictureUrl !== value.pictureUrl) throw new Error("Invalid status.");
-		account.pictureUrl = pictureUrl;
-	}
-	return account;
-}
-function decodeStatus(
-	value: unknown,
-	groupId: string,
-	device: CoordinatorDeviceLocalEvidence,
-	identityId: string,
-): CoordinatorAccountLinkStatusV2 {
-	if (
-		!record(value) ||
-		Object.keys(value).length !== 9 ||
-		value.version !== 2 ||
-		!isAuthControllerId(value.coordinatorId) ||
-		value.groupId !== groupId ||
-		value.deviceId !== device.deviceId ||
-		value.fingerprint !== device.fingerprint
-	)
-		throw new Error("Invalid status.");
-	const base = {
-		version: 2 as const,
-		coordinatorId: value.coordinatorId,
-		groupId,
-		deviceId: device.deviceId,
-		fingerprint: device.fingerprint,
-	};
-	return decodeStatusState(value, base, identityId);
-}
-function decodeStatusState(
-	value: Record<string, unknown>,
-	base: Pick<
-		CoordinatorAccountLinkStatusV2,
-		"version" | "coordinatorId" | "groupId" | "deviceId" | "fingerprint"
-	>,
-	identityId: string,
-): CoordinatorAccountLinkStatusV2 {
-	if (value.state === "review_required" || value.state === "conflict") {
-		if (value.identityId !== null || value.authority !== null || value.account !== null)
-			throw new Error("Invalid status.");
-		return { ...base, identityId: null, authority: null, state: value.state, account: null };
-	}
-	if (
-		!isAuthControllerId(value.identityId) ||
-		!authorityKind(value.authority) ||
-		(value.identityId !== identityId && value.account !== null)
-	)
-		throw new Error("Invalid status.");
-	if (value.state === "linked")
-		return {
-			...base,
-			identityId: value.identityId,
-			authority: value.authority,
-			state: "linked",
-			account: value.account === null ? null : accountMetadata(value.account),
-		};
-	if (
-		(value.state !== "unlinked" && value.state !== "revoked") ||
-		(value.state === "unlinked" && value.identityId !== identityId) ||
-		value.account !== null
-	)
-		throw new Error("Invalid status.");
-	return {
-		...base,
-		identityId: value.identityId,
-		authority: value.authority,
-		state: value.state,
-		account: null,
-	};
-}
-
 /** Race even injected transports/streams that do not implement AbortSignal themselves. */
 async function abortable<T>(operation: Promise<T>, signal: AbortSignal): Promise<T> {
 	let onAbort = () => {};
@@ -248,7 +142,12 @@ async function readStatus(
 		if (signal.aborted) return unavailable("coordinator_unreachable");
 		return {
 			kind: "status",
-			status: decodeStatus(body, groupId, device, options.identityId),
+			status: decodeCoordinatorAccountLinkStatusV3(body, {
+				groupId,
+				deviceId: device.deviceId,
+				fingerprint: device.fingerprint,
+				identityId: options.identityId,
+			}),
 		};
 	} catch {
 		return unavailable(signal.aborted ? "coordinator_unreachable" : "invalid_response");

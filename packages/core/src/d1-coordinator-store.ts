@@ -40,6 +40,10 @@ import {
 	AuthLinkOperations,
 	type AuthLinkStatement,
 } from "./coordinator-auth-link.js";
+import {
+	type CoordinatorAccountManagementStore,
+	createCoordinatorAccountManagementStore,
+} from "./coordinator-auth-link-change-store.js";
 import type {
 	CoordinatorAuthLinkClaimInput,
 	CoordinatorAuthLinkConfig,
@@ -1007,6 +1011,7 @@ async function runProjectInviteBatch(
 export class D1CoordinatorStore implements CoordinatorStore {
 	readonly db: D1DatabaseLike;
 	private readonly authLinks: AuthLinkOperations;
+	readonly accountManagement: CoordinatorAccountManagementStore;
 	async assertAuthSchemaReady(): Promise<void> {
 		await assertCoordinatorAuthSchema({
 			first: <T>({ sql, values }: AuthLinkStatement) =>
@@ -1042,6 +1047,10 @@ export class D1CoordinatorStore implements CoordinatorStore {
 		);
 		const authBackend = createD1AuthLinkBackend(db);
 		this.authLinks = new AuthLinkOperations(authBackend, options.authClock);
+		this.accountManagement = createCoordinatorAccountManagementStore(
+			authBackend,
+			options.authClock,
+		);
 		this.accountLinkStatus = new AccountLinkStatusOperations(authBackend, options.authClock);
 		this.authSessions = new AuthSessionOperations(authBackend, options.authClock);
 		this.authAccountProfiles = new AuthAccountProfileOperations(authBackend, options.authClock);

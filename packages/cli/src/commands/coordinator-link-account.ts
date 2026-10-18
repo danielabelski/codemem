@@ -170,6 +170,8 @@ async function linkAccount(group: string, options: Options): Promise<void> {
 			});
 			return;
 		}
+		if (!status.authority || !status.actions.connect)
+			throw new CoordinatorAccountLinkError("review_required");
 		const snapshot = JSON.stringify(profile);
 		const result = await linkCoordinatorAccount({
 			...profile,

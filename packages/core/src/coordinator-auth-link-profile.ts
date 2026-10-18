@@ -70,7 +70,7 @@ export function promoteAuthLinkProfile(
 ): AuthLinkStatement {
 	return {
 		sql: `UPDATE coordinator_auth_link_profiles AS p SET link_id = ? WHERE p.coordinator_id = ?
- AND p.attempt_id = ? AND p.link_id IS NULL AND EXISTS (
+ AND p.attempt_id = ? AND p.link_id IS NULL AND p.source_purpose = 'link' AND EXISTS (
  SELECT 1 FROM coordinator_auth_link_attempts t JOIN coordinator_auth_account_links l
  ON l.coordinator_id = t.coordinator_id AND l.attempt_id = t.attempt_id AND l.link_id = t.link_id
  AND l.issuer = t.issuer AND l.subject = t.account_subject AND l.identity_id = t.identity_id
@@ -94,13 +94,18 @@ export function cleanAuthLinkProfiles(
 	return {
 		sql: `DELETE FROM coordinator_auth_link_profiles WHERE coordinator_id = ? AND attempt_id IN (
  SELECT p.attempt_id FROM coordinator_auth_link_profiles p WHERE p.coordinator_id = ? AND (
- (p.link_id IS NULL AND (p.issuer <> ? OR p.auth_config_revision <> ? OR NOT EXISTS (
+  (p.link_id IS NULL AND (p.issuer <> ? OR p.auth_config_revision <> ? OR NOT (
+ (p.source_purpose = 'link' AND EXISTS (
  SELECT 1 FROM coordinator_auth_link_attempts t WHERE t.coordinator_id = p.coordinator_id
- AND t.attempt_id = p.attempt_id AND t.state IN ('oidc_verified','confirmed') AND t.expires_at_ms > ?)))
+  AND t.attempt_id = p.attempt_id AND t.state IN ('oidc_verified','confirmed') AND t.expires_at_ms > ?))
+ OR (p.source_purpose = 'link_change' AND EXISTS (SELECT 1 FROM coordinator_auth_link_change_attempts t
+ WHERE t.coordinator_id = p.coordinator_id AND t.attempt_id = p.attempt_id AND t.issuer = p.issuer
+ AND t.auth_config_revision = p.auth_config_revision AND t.target_subject = p.subject
+ AND t.browser_transaction_hash = p.browser_transaction_hash AND t.state IN ('oidc_verified','confirmed') AND t.expires_at_ms > ?)))))
  OR (p.link_id IS NOT NULL AND NOT EXISTS (SELECT 1 FROM coordinator_auth_account_links l
  WHERE l.coordinator_id = p.coordinator_id AND l.link_id = p.link_id AND l.attempt_id = p.attempt_id
  AND l.issuer = p.issuer AND l.subject = p.subject AND l.auth_config_revision = p.auth_config_revision
  AND l.revoked_at_ms IS NULL))) LIMIT ?)`,
-		values: [c.coordinatorId, c.coordinatorId, c.issuer, c.revision, now, limit],
+		values: [c.coordinatorId, c.coordinatorId, c.issuer, c.revision, now, now, limit],
 	};
 }

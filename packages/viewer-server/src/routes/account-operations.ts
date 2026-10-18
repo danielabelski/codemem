@@ -91,17 +91,25 @@ function validStartBody(body: Record<string, unknown> | null): body is {
 	contextId: string;
 	coordinatorId: string;
 	authority: "controller_attestation" | "device_claim";
+	intent: AccountLinkOperationV1["intent"];
 } {
 	return (
 		body !== null &&
 		validString(body.groupId) &&
 		validString(body.contextId) &&
 		validString(body.coordinatorId) &&
-		(body.authority === "controller_attestation" || body.authority === "device_claim")
+		(body.authority === "controller_attestation" || body.authority === "device_claim") &&
+		(body.intent === "connect" || body.intent === "disconnect" || body.intent === "refresh")
 	);
 }
 async function startOperation(c: Context, options: Options): Promise<Response> {
-	const body = await readBody(c.req.raw, ["groupId", "contextId", "authority", "coordinatorId"]);
+	const body = await readBody(c.req.raw, [
+		"groupId",
+		"contextId",
+		"authority",
+		"coordinatorId",
+		"intent",
+	]);
 	if (!validStartBody(body)) return c.json({ error: "account_invalid_request" }, 400);
 	const initial = options.readContext(body.groupId);
 	if ("error" in initial && initial.error === "account_group_not_configured")
@@ -135,7 +143,7 @@ async function startOperation(c: Context, options: Options): Promise<Response> {
 		return c.json({ error: "account_link_not_allowed", blockedReason: "operation_active" }, 409);
 	if (view.remote.kind === "unavailable")
 		return c.json({ error: "account_status_unavailable" }, 503);
-	if (!view.canLink || view.remote.kind !== "status" || view.remote.state !== "unlinked")
+	if (!view.actions[body.intent] || view.remote.kind !== "status")
 		return c.json({ error: "account_link_not_allowed", blockedReason: view.blockedReason }, 409);
 	return beginCurrentOperation(
 		c,
@@ -155,6 +163,7 @@ function beginCurrentOperation(
 		contextId: string;
 		coordinatorId: string;
 		authority: "controller_attestation" | "device_claim";
+		intent: AccountLinkOperationV1["intent"];
 	},
 	view: AccountLinkViewV1,
 	expectedCoordinatorId: string,
@@ -180,6 +189,7 @@ function beginCurrentOperation(
 	)
 		return c.json({ error: "account_context_changed" }, 409);
 	const result = options.registry.start({
+		intent: body.intent,
 		context: checkedContext,
 		expectedCoordinatorId,
 		expectedAuthority: body.authority,

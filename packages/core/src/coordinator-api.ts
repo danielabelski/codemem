@@ -22,6 +22,7 @@ import {
 	registerCoordinatorAccountLinkStatusRoute,
 	registerCoordinatorDeviceAuthLinkRoutes,
 } from "./coordinator-device-auth-link.js";
+import { registerCoordinatorDeviceAuthLinkChangeRoutes } from "./coordinator-device-auth-link-change.js";
 import type { InvitePayload } from "./coordinator-invites.js";
 import { encodeInvitePayload, inviteLink } from "./coordinator-invites.js";
 import type { CoordinatorLegacyTeamCompletionManifestV1 } from "./coordinator-legacy-team-completion.js";
@@ -151,6 +152,8 @@ function registerOptionalCoordinatorAuth(
 			"/auth/*",
 			"/v1/auth/link-attempts",
 			"/v1/auth/link-attempts/*",
+			"/v1/auth/link-changes",
+			"/v1/auth/link-changes/*",
 			"/v1/auth/owner-config",
 			"/v1/auth/owner-attempts",
 			"/v1/auth/owner-attempts/*",
@@ -174,6 +177,11 @@ function registerOptionalCoordinatorAuth(
 		});
 	}
 	if (ready?.kind === "ready") {
+		registerCoordinatorDeviceAuthLinkChangeRoutes(app, {
+			...deps,
+			config: ready.auth.storeConfig,
+			storeFactory: ready.storeFactory,
+		});
 		registerCoordinatorAccountLinkStatusRoute(app, {
 			...deps,
 			config: ready.auth.storeConfig,

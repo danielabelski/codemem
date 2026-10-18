@@ -898,7 +898,8 @@ function startStatement(
  loopback_redirect,browser_start_hash,state,created_at_ms,expires_at_ms)
  SELECT ?,?,'owner_enroll',?,?,?,?,?,?,?,?,?,'pending',?,?
   WHERE ${NO_COLLISION_SQL}
- AND NOT EXISTS (SELECT 1 FROM coordinator_auth_link_attempts WHERE coordinator_id = ? AND attempt_id = ?)
+ AND NOT EXISTS (SELECT 1 FROM (SELECT coordinator_id,attempt_id FROM coordinator_auth_link_attempts
+ UNION ALL SELECT coordinator_id,attempt_id FROM coordinator_auth_link_change_attempts) WHERE coordinator_id = ? AND attempt_id = ?)
  AND NOT EXISTS (SELECT 1 FROM coordinator_auth_browser_transactions WHERE coordinator_id = ?
  AND attempt_id = ? AND purpose <> 'signin')
  AND (SELECT count(*) FROM coordinator_owner_enrollment_attempts WHERE coordinator_id = ? AND device_id = ?

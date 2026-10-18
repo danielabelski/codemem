@@ -434,6 +434,50 @@ export async function renderAuthLinkStartPage(
 	);
 }
 
+export async function renderAuthLinkChangeStartPage(
+	input: CoordinatorAuthLinkStartPageInput,
+): Promise<CoordinatorAuthBrowserPage> {
+	const attemptId = capturePageField(input, "attemptId");
+	const startCode = capturePageField(input, "startCode");
+	const csrfToken = captureSigninCsrf(input);
+	if (
+		!isAuthControllerId(attemptId) ||
+		typeof startCode !== "string" ||
+		!decodeCoordinatorAuthProof32(startCode)
+	)
+		return invalidInput();
+	return buildPage(
+		"Verify account",
+		`<h1>Connecting to Google…</h1><p>Choose the currently linked account to continue your request.</p><p class="note">Do not share this page.</p><div class="actions">${form("/auth/link-change/start", csrfToken, "Continue with Google", { attemptId, startCode })}</div>`,
+		undefined,
+		{ referrerPolicy: "same-origin", autoSubmit: true },
+	);
+}
+
+export async function renderAuthLinkChangeConfirmPage(input: {
+	attemptId: string;
+	csrfToken: string;
+	issuer: string;
+	profile: unknown;
+}): Promise<CoordinatorAuthBrowserPage> {
+	if (!isAuthControllerId(input.attemptId)) return invalidInput();
+	const csrfToken = captureSigninCsrf(input);
+	const actions =
+		form("/auth/link-change/confirm", csrfToken, "Unlink Google account", {
+			attemptId: input.attemptId,
+		}) +
+		form("/auth/link-change/cancel", csrfToken, "Cancel", {
+			attemptId: input.attemptId,
+			secondary: true,
+		});
+	return buildPage(
+		"Unlink account",
+		`<h1>Unlink Google account?</h1>${profileMarkup(projectAccountProfileView(input.profile, input.issuer))}<p>Your Identity, memories, device keys, project access, and history stay unchanged. Browser sessions for this account link will end and its display profile will be removed.</p><p>Only confirm if you started this request on this computer.</p><div class="actions">${actions}</div>`,
+		input.issuer,
+		{ referrerPolicy: "same-origin" },
+	);
+}
+
 export async function renderAuthSigninPage(
 	input: CoordinatorAuthSigninPageInput,
 ): Promise<CoordinatorAuthBrowserPage> {

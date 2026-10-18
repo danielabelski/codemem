@@ -2,6 +2,7 @@ import type { CoordinatorAuthBrowserTransactionStore } from "./coordinator-auth-
 import {
 	type CoordinatorAuthBrowserPage,
 	renderAuthBrowserNotice,
+	renderAuthLinkChangeStartPage,
 	renderAuthLinkStartPage,
 	renderAuthSigninContinuePage,
 } from "./coordinator-auth-browser-view.js";
@@ -42,6 +43,7 @@ type LinkStartStore = Pick<
 >;
 type Settings = Extract<CoordinatorBrowserAuthSettings, { kind: "enabled" }>;
 export interface CoordinatorBrowserLinkStartInput {
+	flow?: "link" | "link_change";
 	config: unknown;
 	csrfKey: BrowserCsrfKey;
 	store: LinkStartStore;
@@ -98,6 +100,7 @@ type Context = Readonly<{
 	limiter: InMemoryRequestRateLimiter;
 	client: CoordinatorOidcClient;
 	startUrl: string;
+	flow: "link" | "link_change";
 }>;
 type Snapshot = ReturnType<typeof snapshotBrowserRequest>;
 type LinkGuard = Extract<BrowserFormGuardResult, { ok: true; action: "link_start" }>;
@@ -228,7 +231,9 @@ async function linkStartPage(
 			"start",
 			context.scope,
 		);
-		const response = pageResponse(await renderAuthLinkStartPage({ ...query, csrfToken }));
+		const render =
+			context.flow === "link_change" ? renderAuthLinkChangeStartPage : renderAuthLinkStartPage;
+		const response = pageResponse(await render({ ...query, csrfToken }));
 		if ("setCookie" in cookie) response.headers.append("Set-Cookie", cookie.setCookie);
 		return result(response, "link_start_page");
 	} catch {
@@ -397,7 +402,11 @@ export async function createCoordinatorBrowserLinkStart(
 		dataMethod(limiter, "check");
 		const oidcOptions = captureOidcOptions(input);
 		const scope = Object.freeze({ publicOrigin: settings.publicOrigin, store: settings.store });
-		const startUrl = new URL("/auth/link/start", settings.publicOrigin).href;
+		const flow = ownData(input, "flow") === "link_change" ? "link_change" : "link";
+		const startUrl = new URL(
+			flow === "link_change" ? "/auth/link-change/start" : "/auth/link/start",
+			settings.publicOrigin,
+		).href;
 		const oidc = await createCoordinatorOidcClient(settings.oidc, oidcOptions);
 		if (!oidc.ok) return Object.freeze({ ok: false, error: oidc.error });
 		const context: Context = Object.freeze({
@@ -408,6 +417,7 @@ export async function createCoordinatorBrowserLinkStart(
 			limiter,
 			client: oidc.client,
 			startUrl,
+			flow,
 		});
 		return Object.freeze({
 			ok: true,
