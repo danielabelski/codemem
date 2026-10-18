@@ -42,7 +42,12 @@ async function verifiedBrowser(f: LinkFixture, loopbackRedirect: string) {
 	await authorize(f);
 	const created = await f.store.createAuthLinkAttempt(attempt({ loopbackRedirect }), f.cfg);
 	expect(created.kind).toBe("created");
-	const input = { ...materials(), purpose: "link" as const, attemptId: proof.attemptId };
+	const input = {
+		...materials(),
+		purpose: "link" as const,
+		attemptId: proof.attemptId,
+		browserStartHash: attempt().browserStartHash,
+	};
 	expect((await f.store.startAuthBrowserTransaction(input, browserConfig)).kind).toBe("started");
 	const consumed = await f.store.consumeAuthBrowserTransaction(input, browserConfig);
 	if (consumed.kind !== "consumed") throw new Error("fixture browser consume failed");

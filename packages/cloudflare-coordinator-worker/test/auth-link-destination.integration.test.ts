@@ -2,6 +2,8 @@ import { env } from "cloudflare:workers";
 import { randomUUID } from "node:crypto";
 import { D1CoordinatorStore } from "@codemem/core/internal/cloudflare-coordinator";
 import { afterEach, expect, it } from "vitest";
+import { consumeNativeLinkProof } from "./native-auth-proof-fixture.js";
+import { disposeNativeAuthFixture } from "./owner-ceremony-test-fixtures.js";
 
 const db = env.COORDINATOR_DB;
 const NOW = 1790899200000;
@@ -16,11 +18,9 @@ const tables = [
 ].map((name) => `coordinator_auth_${name}`);
 const owned: string[] = [];
 afterEach(async () => {
+	await disposeNativeAuthFixture();
 	for (const id of owned.splice(0)) {
 		await db.batch([
-			...tables.map((table) =>
-				db.prepare(`DELETE FROM ${table} WHERE coordinator_id = ?`).bind(id),
-			),
 			...["enrolled_devices", "groups"].map((table) =>
 				db.prepare(`DELETE FROM ${table} WHERE group_id = ?`).bind(id),
 			),
@@ -38,6 +38,7 @@ async function fixture(destination: string) {
 		issuer: "https://accounts.example.test",
 		revision: "a".repeat(64),
 		enabled: true,
+		redirectUri: "https://app.example.test/callback",
 	};
 	const signer = { groupId: id, deviceId: id, publicKey: "fixture-key", fingerprint: cfg.revision };
 	const review = {
@@ -53,12 +54,11 @@ async function fixture(destination: string) {
 	const authorized = await store.createAuthControllerAttestation(review);
 	expect(authorized.kind).toBe("created");
 	await store.createAuthLinkAttempt(
-		{ authority: { kind: "controller_attestation" }, attemptId: id, signer, runtimeVerifierHash: cfg.revision, loopbackRedirect: destination },
+		{ authority: { kind: "controller_attestation" }, attemptId: id, signer, runtimeVerifierHash: cfg.revision, browserStartHash: cfg.revision, loopbackRedirect: destination },
 		cfg,
 	);
-	const proof = { attemptId: id, browserTransactionHash: "e".repeat(64) };
-	// Trusted legacy claim/account inputs; no HTTP or OIDC verification claim.
-	await store.claimAuthLinkAttempt(proof, cfg);
+	const proof = { attemptId: id, browserTransactionHash: "e".repeat(64), binderHash: "" };
+	await consumeNativeLinkProof({ store, cfg }, { attemptId: id, browserStartHash: cfg.revision }, proof);
 	const account = { issuer: cfg.issuer, subject: "fixture-subject" };
 	await store.recordAuthLinkOidcVerified({ ...proof, account }, cfg);
 	return { id, time, store, cfg, proof };

@@ -139,7 +139,7 @@ function reconnect(db: SqliteDatabase) {
 	});
 }
 
-describe("inert lifecycle storage contract", () => {
+describe("lifecycle storage contract", () => {
 	it("retains ended A and its reservation while B reuses the original claim", () => {
 		// Arrange
 		const db = setup();
@@ -537,7 +537,7 @@ describe("first-generation proof and predecessor fence", () => {
 		expect(write).toThrow(/auth_device_claim_genesis_unavailable/);
 		expect(rows(db, claims)).toEqual([]);
 	});
-	it("does not activate lifecycle definitions in the actual fresh initializer", () => {
+	it("fresh initialization installs lifecycle definitions and fences frozen V2 readiness", () => {
 		// Arrange
 		const db = connectCoordinator(":memory:");
 		databases.push(db);
@@ -547,11 +547,11 @@ describe("first-generation proof and predecessor fence", () => {
 			.prepare("SELECT name FROM sqlite_master WHERE name = ?")
 			.all("coordinator_auth_device_claims_first_generation");
 		// Assert
-		expect(ready).toEqual({ ready: 10 });
-		expect(installed).toEqual([]);
+		expect(ready).toEqual({ ready: 9 });
+		expect(installed).toEqual([{ name: "coordinator_auth_device_claims_first_generation" }]);
 		expect(
 			db.prepare("SELECT name FROM pragma_table_info(?) WHERE name = ?").all(links, "generation"),
-		).toEqual([]);
+		).toEqual([{ name: "generation" }]);
 	});
 	it("accepts only the matching finalized first-link claim", () => {
 		// Arrange

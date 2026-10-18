@@ -66,6 +66,7 @@ async function startLink(f: Fixture) {
 		evidenceDigest: hash(),
 	};
 	const attemptId = crypto.randomUUID();
+	const browserStartHash = hash();
 	await f.store.createGroup(review.groupId, "Fixture group");
 	await f.store.enrollDevice(review.groupId, { ...review, identityId: null });
 	expect(await f.store.createAuthControllerAttestation(review)).toMatchObject({ kind: "created" });
@@ -75,12 +76,13 @@ async function startLink(f: Fixture) {
 			attemptId,
 			signer: review,
 			runtimeVerifierHash: hash(),
+			browserStartHash,
 			loopbackRedirect: "http://127.0.0.1:4567/codemem/auth/complete",
 		},
 		f.cfg,
 	);
 	expect(created).toMatchObject({ kind: "created" });
-	const input = { ...f.material(), purpose: "link" as const, attemptId };
+	const input = { ...f.material(), purpose: "link" as const, attemptId, browserStartHash };
 	expect(await f.store.startAuthBrowserTransaction(input, f.cfg)).toMatchObject({
 		kind: "started",
 	});
@@ -228,7 +230,7 @@ it("retires forty rows in real D1 batches, rejecting invalid options and preserv
 	await f.store.startAuthBrowserTransaction(input, f.cfg);
 	await other.store.startAuthBrowserTransaction(other.material(), other.cfg);
 	const seed = (await rows(f))[0];
-	const columns = Object.keys(seed);
+	const columns = Object.keys(seed).filter((name) => name !== "browser_sequence");
 	const copies = Array.from({ length: 40 }, (_, index) => ({
 		...seed,
 		browser_transaction_hash: hash(),

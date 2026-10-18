@@ -1,6 +1,7 @@
 import { env } from "cloudflare:workers";
 import { D1CoordinatorStore } from "@codemem/core/internal/cloudflare-coordinator";
 import { expect, it } from "vitest";
+import { consumeNativeLinkProof } from "./native-auth-proof-fixture.js";
 
 const NOW = 1790899200000;
 const HOUR = 3600000;
@@ -56,8 +57,9 @@ async function rows(f: Fixture, table = browserTable) {
 }
 const snapshot = (f: Fixture) => Promise.all(protectedTables.map((table) => rows(f, table)));
 async function seed(f: Fixture, count: number, overrides: (i: number) => Row = () => ({})) {
-	const original = (await rows(f))[0];
-	const columns = Object.keys(original);
+	const original = (await rows(f)).find((row) => row.purpose === "signin");
+	if (!original) throw new Error("Missing native signin seed");
+	const columns = Object.keys(original).filter((name) => name !== "browser_sequence");
 	const copies = Array.from({ length: count }, (_, i) => ({
 		...original,
 		browser_transaction_hash: hash(),
@@ -95,16 +97,17 @@ async function linkedAccount(f: Fixture) {
 		attemptId: crypto.randomUUID(),
 		signer: review,
 		runtimeVerifierHash: hash(),
+		browserStartHash: hash(),
 		loopbackRedirect: "http://127.0.0.1:4567/codemem/auth/complete",
 	};
-	const browser = { attemptId: start.attemptId, browserTransactionHash: hash() };
+	const browser = { attemptId: start.attemptId, browserTransactionHash: hash(), binderHash: "" };
 	const confirm = { ...browser, completionSecretHash: hash() };
 	const account = { issuer: f.cfg.issuer, subject: crypto.randomUUID() };
 	await f.store.createGroup(review.groupId, "Fixture group");
 	await f.store.enrollDevice(review.groupId, { ...review, identityId: null });
 	expect(await f.store.createAuthControllerAttestation(review)).toMatchObject({ kind: "created" });
 	expect(await f.store.createAuthLinkAttempt(start, f.cfg)).toMatchObject({ kind: "created" });
-	expect(await f.store.claimAuthLinkAttempt(browser, f.cfg)).toMatchObject({ kind: "applied" });
+	await consumeNativeLinkProof(f, start, browser);
 	expect(await f.store.recordAuthLinkOidcVerified({ ...browser, account }, f.cfg)).toMatchObject({
 		kind: "applied",
 	});
@@ -146,7 +149,7 @@ it("purges only aged signins in bounded order, leaving links, authority and fore
 				consumed_at_ms: created,
 			});
 		if (i === 1) Object.assign(row, { state: "expired", nonce: null, pkce_verifier: null });
-		if (i === 4) Object.assign(row, { purpose: "link", attempt_id: linked.browser.attemptId });
+		if (i === 4) Object.assign(row, { purpose: "link", attempt_id: "synthetic-retained-link" });
 		return row;
 	});
 	await other.store.startAuthBrowserTransaction(other.material(), other.cfg);
@@ -163,10 +166,10 @@ it("purges only aged signins in bounded order, leaving links, authority and fore
 	const repeat = await f.store.purgeAuthSigninBrowserTransactions(f.cfg);
 	// Assert: exact two hours qualifies; one millisecond younger and every link survive.
 	expect(first).toEqual(purged(3, true));
-	expect(partial).toEqual(before.slice(3));
+	expect(partial).toEqual(before.filter((row) => row.purpose !== "signin" || Number(row.created_at_ms) > NOW + 20));
 	expect(second).toEqual(purged(1));
 	expect(repeat).toEqual(purged(0));
-	expect(await rows(f)).toEqual(before.slice(4));
+	expect(await rows(f)).toEqual(before.filter((row) => row.purpose !== "signin" || Number(row.created_at_ms) > NOW + 100));
 	expect(await rows(f, floorTable)).toEqual(floorRow(f, NOW + 100));
 	expect(await snapshot(f)).toEqual(protectedBefore);
 	expect(await f.store.getEnrollment(linked.review.groupId, linked.review.deviceId)).toEqual(
@@ -253,6 +256,7 @@ it("keeps an issued session and profile live after purging its transaction witho
 	const profileInput = { credentialHash: input.credentialHash, profile };
 	expect(await f.store.recordAuthAccountProfile(profileInput, f.cfg)).toEqual({ kind: "recorded" });
 	const before = await snapshot(f);
+	const retainedLinks = (await rows(f)).filter((row) => row.purpose === "link");
 	f.time.now = NOW + 2 * HOUR;
 	// Act
 	const purged = await f.store.purgeAuthSigninBrowserTransactions(f.cfg);
@@ -263,7 +267,7 @@ it("keeps an issued session and profile live after purging its transaction witho
 	);
 	// Assert: purge removes ceremony storage only, never session or replay protection.
 	expect(purged).toEqual({ kind: "purged", processedCount: 1, more: false });
-	expect(await rows(f)).toEqual([]);
+	expect(await rows(f)).toEqual(retainedLinks);
 	expect(read).toEqual({ session: issued.session, profile });
 	expect(replay).toEqual(rejected("browser_transaction_used"));
 	expect(await snapshot(f)).toEqual(before);

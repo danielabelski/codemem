@@ -1,4 +1,5 @@
 import { describe, expect } from "vitest";
+import { failAuthStatementRun } from "./coordinator-auth-fault-test-fixture.js";
 import {
 	advance,
 	attempt,
@@ -223,9 +224,7 @@ function registerDenials(test: SessionTest) {
 		// Arrange
 		await linked(f);
 		const before = snapshot(f);
-		f.db.exec(
-			"CREATE TRIGGER fixture_signin_fault BEFORE INSERT ON coordinator_auth_sessions BEGIN SELECT RAISE(ABORT, 'fixture-private-backend-detail'); END",
-		);
+		const restore = failAuthStatementRun(f.db, "INSERT INTO coordinator_auth_sessions");
 		// Act
 		const result = f.store.signInWithConsumedBrowserTransaction(
 			signInInput(f),
@@ -235,6 +234,7 @@ function registerDenials(test: SessionTest) {
 		await expect(result).rejects.toThrow(/^auth_session_persistence_error$/);
 		expect(snapshot(f)).toEqual(before);
 		expect(sessionRows(f)).toEqual([[], []]);
+		restore();
 	});
 }
 

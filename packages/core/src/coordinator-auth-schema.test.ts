@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
@@ -10,6 +10,9 @@ import {
 } from "../../cloudflare-coordinator-worker/test/link-authority-upgrade-fixture.js";
 import { BetterSqliteCoordinatorStore } from "./better-sqlite-coordinator-store.js";
 import { COORDINATOR_AUTH_DEVICE_CLAIM_SCHEMA_STATEMENTS as proof } from "./coordinator-auth-device-claim-schema.js";
+import { AUTH_SCHEMA_V2_READINESS_SQL } from "./coordinator-auth-lifecycle-predecessor.js";
+import { upgradeAuthLifecycleSchema } from "./coordinator-auth-lifecycle-upgrade-sqlite.js";
+import { frozenV2Database } from "./coordinator-auth-lifecycle-upgrade-test-fixture.js";
 import { AUTH_LINK_SCHEMA_SQL } from "./coordinator-auth-link-contract.js";
 import { LEGACY_INLINE_AUTH_LINK_SCHEMA_SQL } from "./coordinator-auth-link-legacy-inline-test-fixture.js";
 import { attempt, cfg } from "./coordinator-auth-link-test-fixtures.js";
@@ -23,15 +26,18 @@ afterEach(() => {
 // Each fixture file is disposable; no default profile or coordinator path is opened.
 it("refuses old optional auth before a new-column query, keeps ordinary operations usable, and explicitly upgrades all rows", async () => {
 	const path = join(directory, "legacy.sqlite");
+	const legacy = frozenV2Database();
+	legacy.exec(linkAuthorityTables.map((table) => `DROP TABLE ${table};`).join("\n"));
+	legacy.exec("DROP TABLE coordinator_auth_device_claims");
+	legacy.exec(LEGACY_INLINE_AUTH_LINK_SCHEMA_SQL);
+	legacy.exec(legacyLinkAuthorityRowsSql);
+	const before = linkAuthorityTables.map((table) =>
+		legacy.prepare(`SELECT rowid,* FROM ${table} ORDER BY rowid`).all(),
+	);
+	writeFileSync(path, legacy.serialize());
+	legacy.close();
 	const store = new BetterSqliteCoordinatorStore(path);
 	try {
-		store.db.exec(linkAuthorityTables.map((table) => `DROP TABLE ${table};`).join("\n"));
-		store.db.exec("DROP TABLE coordinator_auth_device_claims");
-		store.db.exec(LEGACY_INLINE_AUTH_LINK_SCHEMA_SQL);
-		store.db.exec(legacyLinkAuthorityRowsSql);
-		const before = linkAuthorityTables.map((table) =>
-			store.db.prepare(`SELECT rowid,* FROM ${table} ORDER BY rowid`).all(),
-		);
 		const queries: string[] = [];
 		const prepare = store.db.prepare.bind(store.db);
 		const trace = vi.spyOn(store.db, "prepare").mockImplementation((sql) => {
@@ -53,7 +59,10 @@ it("refuses old optional auth before a new-column query, keeps ordinary operatio
 				.get(),
 		).toBeUndefined();
 		upgradeCoordinatorAuthSchemaFile(path);
-		await expect(store.assertAuthSchemaReady()).resolves.toBeUndefined();
+		expect(store.db.prepare(AUTH_SCHEMA_V2_READINESS_SQL).get()).toEqual({ ready: 10 });
+		await expect(store.assertAuthSchemaReady()).rejects.toBeInstanceOf(
+			CoordinatorAuthSchemaUpgradeRequiredError,
+		);
 		expect(
 			linkAuthorityTables.map((table) =>
 				withoutNewAuthorityColumns(
@@ -64,6 +73,8 @@ it("refuses old optional auth before a new-column query, keeps ordinary operatio
 				),
 			),
 		).toEqual(before);
+		upgradeAuthLifecycleSchema(store.db);
+		await expect(store.assertAuthSchemaReady()).resolves.toBeUndefined();
 		expect(await store.maintainAuthLinkAttempts(cfg)).toMatchObject({ kind: "maintained" });
 		expect(
 			store.db
@@ -109,7 +120,7 @@ it("rolls back fresh link DDL together with a failed proof install, then retries
 	}
 });
 
-it("finishes a partial explicit fresh bootstrap without rebuilding the existing link tables", async () => {
+it("does not repair partial auth on open and keeps ordinary group operations available", async () => {
 	const path = join(directory, "partial.sqlite");
 	const db = new Database(path);
 	db.exec(AUTH_LINK_SCHEMA_SQL);
@@ -121,13 +132,26 @@ it("finishes a partial explicit fresh bootstrap without rebuilding the existing 
 	db.close();
 	const store = new BetterSqliteCoordinatorStore(path);
 	try {
-		await store.assertAuthSchemaReady();
+		await expect(store.assertAuthSchemaReady()).rejects.toBeInstanceOf(
+			CoordinatorAuthSchemaUpgradeRequiredError,
+		);
 		for (const table of before)
 			expect(
 				store.db
 					.prepare("SELECT name,sql FROM sqlite_master WHERE name = ?")
 					.get((table as { name: string }).name),
 			).toEqual(table);
+		expect(
+			store.db
+				.prepare(
+					"SELECT name,sql FROM sqlite_master WHERE name LIKE 'coordinator_auth_%' ORDER BY name",
+				)
+				.all(),
+		).toEqual(before);
+		await store.createGroup("partial-auth-device-sync");
+		expect((await store.listGroups()).map(({ group_id }) => group_id)).toEqual([
+			"partial-auth-device-sync",
+		]);
 	} finally {
 		await store.close();
 	}

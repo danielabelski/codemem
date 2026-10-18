@@ -8,7 +8,8 @@ import {
 	AUTH_DEVICE_CLAIM_FIRST_GENERATION_GUARD_SQL,
 } from "../../core/src/coordinator-auth-lifecycle-schema.js";
 import { authLinkLiveGenerationSql } from "../../core/src/coordinator-auth-link-liveness.js";
-import { AUTH_SCHEMA_READINESS_SQL } from "../../core/src/coordinator-auth-schema.js";
+import { AUTH_SCHEMA_V2_READINESS_SQL as AUTH_SCHEMA_READINESS_SQL } from "../../core/src/coordinator-auth-lifecycle-predecessor.js";
+import { restoreFrozenAuthPredecessor } from "./frozen-auth-predecessor-fixture.js";
 
 const db = env.COORDINATOR_DB;
 const links = "coordinator_auth_account_links";
@@ -34,6 +35,7 @@ async function reconnect() {
 }
 
 beforeEach(async () => {
+	await restoreFrozenAuthPredecessor();
 	vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("network forbidden"));
 	// Only isolated local D1 fixtures change; complete trigger bodies stay intact.
 	await db.prepare("DROP TRIGGER IF EXISTS coordinator_auth_device_claims_first_generation").run();

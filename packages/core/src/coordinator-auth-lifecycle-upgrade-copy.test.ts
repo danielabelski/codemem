@@ -1,7 +1,6 @@
 import { readdirSync, readFileSync } from "node:fs";
 import Database from "better-sqlite3";
 import { afterEach, expect, it } from "vitest";
-import { connectCoordinator } from "./better-sqlite-coordinator-store.js";
 import { COORDINATOR_AUTH_DEVICE_CLAIM_SCHEMA_STATEMENTS } from "./coordinator-auth-device-claim-schema.js";
 import { AUTH_LIFECYCLE_PREDECESSOR_TABLES } from "./coordinator-auth-lifecycle-predecessor-shapes.js";
 import { AUTH_ACCOUNT_LINK_GENERATION_TABLE_SQL } from "./coordinator-auth-lifecycle-schema.js";
@@ -12,6 +11,7 @@ import {
 	authLifecyclePreservationCheck,
 	authLifecycleSnapshotStatements,
 } from "./coordinator-auth-lifecycle-upgrade-copy.js";
+import { frozenV2Database } from "./coordinator-auth-lifecycle-upgrade-test-fixture.js";
 import { AUTH_LINK_AUTHORITY_CUTOVER_SQL } from "./coordinator-auth-link-authority-upgrade.js";
 
 const links = "coordinator_auth_account_links";
@@ -430,7 +430,7 @@ it.each(["inline", "migrations"] as const)(
 		// Arrange: actual old families, not future lifecycle DDL or a generated recognizer schema.
 		let db: Database.Database;
 		if (family === "inline") {
-			db = connectCoordinator(":memory:");
+			db = frozenV2Database();
 			databases.push(db);
 		} else {
 			db = memory();

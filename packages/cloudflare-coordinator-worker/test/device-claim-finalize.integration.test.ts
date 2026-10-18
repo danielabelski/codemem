@@ -1,6 +1,7 @@
 import { env } from "cloudflare:workers";
 import { D1CoordinatorStore } from "@codemem/core/internal/cloudflare-coordinator";
 import { expect, it } from "vitest";
+import { failNativeAuthBatch } from "./native-auth-fault-fixture.js";
 import { consumeSigninProof } from "../../core/src/coordinator-auth-browser-proof-test-fixtures.js";
 import { config, input, NOW, seedEnrollmentSql } from "./device-claim-eligibility-fixture.js";
 
@@ -23,14 +24,14 @@ it("native D1 finalizes atomically, rolls back an audit fault, and retains the e
 	const proof = { purpose: "coordinator-account-link-v1" as const, coordinatorId: config.coordinatorId, attemptId: request.attemptId, groupId: input.signer.groupId, identityId: input.identityId, deviceId: input.signer.deviceId, fingerprint: input.signer.fingerprint, runtimeVerifierHash: request.runtimeVerifierHash, completionSecretHash: "d".repeat(64), signer: input.signer };
 	const tables = ["coordinator_auth_link_attempts", "coordinator_auth_device_claims", "coordinator_auth_account_links", "coordinator_auth_link_audit_log", "enrolled_devices", "coordinator_identity_group_grants"];
 	const snapshot = () => Promise.all(tables.map(async (name) => (await env.COORDINATOR_DB.prepare(`SELECT * FROM ${name}`).all()).results));
-	await env.COORDINATOR_DB.exec("CREATE TRIGGER finalization_fault BEFORE INSERT ON coordinator_auth_link_audit_log BEGIN SELECT RAISE(ABORT,'injected_finalization_failure'); END");
+	const restoreFault = failNativeAuthBatch("INSERT INTO coordinator_auth_link_audit_log");
 	const before = await snapshot();
 	// Act: a failure late in the real D1 batch must undo attempt consumption, proof and link.
 	const failed = await store.finalizeAuthLinkAttempt(proof, config).then(() => null, (error: unknown) => error);
 	// Assert
 	expect(String(failed)).toMatch(/auth_link_persistence_error|injected_finalization_failure/);
 	expect(await snapshot()).toEqual(before);
-	await env.COORDINATOR_DB.exec("DROP TRIGGER finalization_fault");
+	restoreFault();
 	// Act: identical proof succeeds after rollback, then retries without another INSERT.
 	const result = await store.finalizeAuthLinkAttempt(proof, config);
 	const committed = await snapshot();

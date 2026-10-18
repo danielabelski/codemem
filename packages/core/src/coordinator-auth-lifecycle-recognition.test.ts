@@ -1,9 +1,7 @@
-import { readdirSync, readFileSync } from "node:fs";
-import Database, { type Database as SqliteDatabase } from "better-sqlite3";
+import type { Database as SqliteDatabase } from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
-import { connectCoordinator } from "./better-sqlite-coordinator-store.js";
 import { AUTH_LIFECYCLE_SQLITE_PREDECESSOR_RECOGNITION_SQL } from "./coordinator-auth-lifecycle-recognition.js";
-import { AUTH_LINK_AUTHORITY_CUTOVER_SQL } from "./coordinator-auth-link-authority-upgrade.js";
+import { frozenV2Database } from "./coordinator-auth-lifecycle-upgrade-test-fixture.js";
 
 const browser = "coordinator_auth_browser_transactions";
 const links = "coordinator_auth_account_links";
@@ -14,19 +12,8 @@ afterEach(() => {
 	for (const db of databases.splice(0)) db.close();
 });
 function setup(source: "inline" | "migrations" = "inline") {
-	if (source === "inline") {
-		const db = connectCoordinator(":memory:");
-		databases.push(db);
-		return db;
-	}
-	const db = new Database(":memory:");
+	const db = frozenV2Database(source);
 	databases.push(db);
-	const directory = new URL("../../cloudflare-coordinator-worker/migrations/", import.meta.url);
-	for (const name of readdirSync(directory)
-		.filter((name) => /^00(?:[0-2]\d|3[0-3])_.*\.sql$/u.test(name))
-		.sort())
-		db.exec(readFileSync(new URL(name, directory), "utf8"));
-	db.exec(AUTH_LINK_AUTHORITY_CUTOVER_SQL);
 	return db;
 }
 function recognize(db: SqliteDatabase) {

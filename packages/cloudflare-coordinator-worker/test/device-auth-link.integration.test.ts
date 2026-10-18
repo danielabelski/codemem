@@ -1,6 +1,7 @@
 import { env, exports } from "cloudflare:workers";
 import { createHash, generateKeyPairSync, randomBytes, randomUUID, sign } from "node:crypto";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
+import { disposeNativeAuthFixture } from "./owner-ceremony-test-fixtures.js";
 import { createCoordinatorApp } from "../../core/src/coordinator-api.js";
 import { D1CoordinatorStore } from "../../core/src/d1-coordinator-store.js";
 import { buildCanonicalRequest, SIGNATURE_VERSION } from "../../core/src/sync-auth.js";
@@ -39,19 +40,9 @@ beforeEach(() => {
 afterEach(async () => {
 	expect(globalThis.fetch).not.toHaveBeenCalled();
 	vi.restoreAllMocks();
+	await disposeNativeAuthFixture();
 	for (const f of fixtures.splice(0)) {
 		await env.COORDINATOR_DB.batch([
-			...[
-				"link_audit_log",
-				"account_links",
-				"browser_transactions",
-				"link_attempts",
-				"controller_attestations",
-			].map((name) =>
-				env.COORDINATOR_DB.prepare(
-					`DELETE FROM coordinator_auth_${name} WHERE coordinator_id = ?`,
-				).bind(f.config.coordinatorId),
-			),
 			env.COORDINATOR_DB.prepare(
 				"DELETE FROM request_nonces WHERE device_id IN (SELECT device_id FROM enrolled_devices WHERE group_id = ?)",
 			).bind(f.review.groupId),

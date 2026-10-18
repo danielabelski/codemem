@@ -3,6 +3,7 @@ import { join } from "node:path";
 import Database, { type Database as SqliteDatabase } from "better-sqlite3";
 import { BetterSqliteCoordinatorStore } from "./better-sqlite-coordinator-store.js";
 import type { CoordinatorAuthControllerReviewInput } from "./coordinator-auth-controller.js";
+import { installEmptyCurrentAuthFixture } from "./coordinator-auth-current-schema-test-fixture.js";
 import {
 	D1CoordinatorStore,
 	type D1DatabaseLike,
@@ -97,6 +98,7 @@ export function setupStore(
 	try {
 		const worker = join(import.meta.dirname, "../../cloudflare-coordinator-worker");
 		db.exec(readFileSync(join(worker, "schema.sql"), "utf8"));
+		installEmptyCurrentAuthFixture(db);
 		return { store: new D1CoordinatorStore(sqliteD1(db), options), db };
 	} catch (error) {
 		db.close();

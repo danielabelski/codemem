@@ -1,8 +1,15 @@
+import { createHash } from "node:crypto";
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import Database, { type Database as SqliteDatabase } from "better-sqlite3";
 import { afterEach, describe, expect, it } from "vitest";
 import { COORDINATOR_AUTH_DEVICE_CLAIM_SCHEMA_SQL } from "./coordinator-auth-device-claim-schema.js";
+import { AUTH_LIFECYCLE_FRESH_SCHEMA_STATEMENTS } from "./coordinator-auth-lifecycle-fresh-schema.js";
+import { frozenV2Database } from "./coordinator-auth-lifecycle-upgrade-test-fixture.js";
+import {
+	CANONICAL_PUBLIC_KEY,
+	EXPECTED_KEY_ID,
+} from "./coordinator-ed25519-key-id-test-fixtures.js";
 
 const TABLE = "coordinator_auth_device_claims";
 const worker = join(import.meta.dirname, "../../cloudflare-coordinator-worker");
@@ -30,12 +37,12 @@ afterEach(() => {
 	for (const db of databases.splice(0)) db.close();
 });
 
-function setup(source: "constant" | "migration" | "Worker") {
-	const db = new Database(":memory:");
+function setup(source: "constant" | "migration" | "Worker predecessor") {
+	const db =
+		source === "Worker predecessor" ? frozenV2Database("migrations") : new Database(":memory:");
 	databases.push(db);
 	db.pragma("recursive_triggers = OFF");
 	if (source === "constant") db.exec(COORDINATOR_AUTH_DEVICE_CLAIM_SCHEMA_SQL);
-	if (source === "Worker") db.exec(readFileSync(join(worker, "schema.sql"), "utf8"));
 	if (source === "migration") {
 		expect(migrationNames).toHaveLength(1);
 		db.exec(readFileSync(join(worker, "migrations", migrationNames[0] as string), "utf8"));
@@ -60,9 +67,79 @@ function definition(db: SqliteDatabase) {
 		});
 }
 
-it("constant, actual fresh Worker schema and actual migration have identical table/index/trigger definitions", () => {
+function currentWorker() {
+	const db = new Database(":memory:");
+	databases.push(db);
+	db.exec(readFileSync(join(worker, "schema.sql"), "utf8"));
+	return db;
+}
+
+it("current Worker V3 proof storage matches fresh definitions and accepts a matching canonical genesis tuple", () => {
+	// Arrange: schema proof pins only, not Google verification or device eligibility.
+	const db = currentWorker();
+	const reference = new Database(":memory:");
+	databases.push(reference);
+	for (const sql of AUTH_LIFECYCLE_FRESH_SCHEMA_STATEMENTS) reference.exec(sql);
+	const proof = {
+		...row,
+		public_key: CANONICAL_PUBLIC_KEY,
+		key_id: EXPECTED_KEY_ID,
+		fingerprint: createHash("sha256").update(CANONICAL_PUBLIC_KEY).digest("hex"),
+	};
+	const attempt = {
+		coordinator_id: proof.coordinator_id,
+		attempt_id: proof.attempt_id,
+		identity_id: proof.identity_id,
+		group_id: proof.group_id,
+		device_id: proof.device_id,
+		public_key: proof.public_key,
+		fingerprint: proof.fingerprint,
+		issuer: proof.issuer,
+		auth_config_revision: proof.auth_config_revision,
+		authority_kind: "device_claim",
+		runtime_verifier_hash: "1".repeat(64),
+		browser_transaction_hash: "2".repeat(64),
+		completion_secret_hash: "3".repeat(64),
+		browser_start_hash: "4".repeat(64),
+		loopback_redirect: "http://127.0.0.1:1234/callback",
+		state: "finalized",
+		link_id: proof.claim_id,
+		account_subject: "synthetic-subject",
+		created_at_ms: 0,
+		expires_at_ms: 600000,
+		claimed_at_ms: 0,
+		oidc_verified_at_ms: 0,
+		confirmed_at_ms: 0,
+		finalized_at_ms: proof.created_at_ms,
+	};
+	db.prepare(
+		`INSERT INTO coordinator_auth_link_attempts (${Object.keys(attempt).join(",")}) VALUES (${Object.keys(
+			attempt,
+		)
+			.map(() => "?")
+			.join(",")})`,
+	).run(...Object.values(attempt));
+	// Act
+	insert(db, proof);
+	// Assert
+	expect(definition(db)).toEqual(definition(reference));
+	expect(definition(db).filter(({ type }) => type === "trigger")).toHaveLength(4);
+	expect(db.prepare(`SELECT * FROM ${TABLE}`).all()).toEqual([proof]);
+});
+
+it("current Worker V3 denies a claim without its winning genesis attempt", () => {
 	// Arrange
-	const sources = ["constant", "migration", "Worker"] as const;
+	const db = currentWorker();
+	// Act
+	const write = () => insert(db);
+	// Assert
+	expect(write).toThrow(/auth_device_claim_genesis_unavailable/);
+	expect(db.prepare(`SELECT * FROM ${TABLE}`).all()).toEqual([]);
+});
+
+it("frozen V2 constant, named Worker predecessor migrations and 0032 retain identical proof definitions", () => {
+	// Arrange
+	const sources = ["constant", "migration", "Worker predecessor"] as const;
 	const dbs = sources.map(setup);
 	// Act
 	const definitions = dbs.map(definition);
@@ -75,123 +152,126 @@ it("constant, actual fresh Worker schema and actual migration have identical tab
 	}
 });
 
-describe.each(["constant", "migration", "Worker"] as const)("%s claim storage", (source) => {
-	it("stores exact bytes without inventing logical references or proving ownership", () => {
-		// Arrange: dummy IDs are not Google proof; future finalizers must authorize writes.
-		const db = setup(source);
-		// Act
-		insert(db);
-		// Assert
-		expect(db.prepare(`SELECT * FROM ${TABLE}`).all()).toEqual([row]);
-	});
-
-	it("allows independent claims and coordinator namespaces", () => {
-		// Arrange
-		const db = setup(source);
-		const independent = {
-			claim_id: "claim-b",
-			identity_id: "identity-b",
-			device_id: "device-b",
-			key_id: "c".repeat(64),
-			attempt_id: "dummy-attempt-b",
-		};
-		// Act
-		insert(db);
-		insert(db, independent);
-		insert(db, { coordinator_id: "coordinator-b", claim_id: "claim-c" });
-		// Assert
-		expect(db.prepare(`SELECT * FROM ${TABLE} ORDER BY claim_id`).all()).toEqual([
-			row,
-			{ ...row, ...independent },
-			{ ...row, coordinator_id: "coordinator-b", claim_id: "claim-c" },
-		]);
-	});
-	it("accepts identifier/key/time upper bounds and preserves CRLF PEM bytes", () => {
-		// Arrange
-		const db = setup(source);
-		const maximum = {
-			coordinator_id: "c".repeat(256),
-			claim_id: "l".repeat(256),
-			identity_id: "i".repeat(256),
-			group_id: "g".repeat(256),
-			device_id: "d".repeat(256),
-			attempt_id: "t".repeat(256),
-			public_key: `${"p".repeat(4094)}\r\n`,
-			created_at_ms: Number.MAX_SAFE_INTEGER,
-		};
-		// Act
-		insert(db, maximum);
-		// Assert
-		expect(db.prepare(`SELECT * FROM ${TABLE}`).all()).toEqual([{ ...row, ...maximum }]);
-	});
-	it.each([
-		"coordinator_id",
-		"claim_id",
-		"identity_id",
-		"group_id",
-		"device_id",
-		"attempt_id",
-		"public_key",
-	])("rejects overlong %s", (column) => {
-		// Arrange
-		const db = setup(source);
-		const value = "x".repeat(column === "public_key" ? 4097 : 257);
-		// Act
-		const invalid = () => insert(db, { [column]: value });
-		// Assert
-		expect(invalid).toThrow(/CHECK constraint failed/);
-		expect(db.prepare(`SELECT * FROM ${TABLE}`).all()).toEqual([]);
-	});
-
-	it.each(["claim_id", "identity_id", "device_id", "key_id", "attempt_id"])(
-		"rejects only-%s collisions including REPLACE with recursive triggers off",
-		(field) => {
-			// Arrange: every other unique value differs, so each constraint is causal.
+describe.each(["constant", "migration", "Worker predecessor"] as const)(
+	"frozen V2 %s claim storage",
+	(source) => {
+		it("stores exact bytes without inventing logical references or proving ownership", () => {
+			// Arrange: dummy IDs are not Google proof; future finalizers must authorize writes.
 			const db = setup(source);
+			// Act
 			insert(db);
-			const changes: Record<string, unknown> = {
+			// Assert
+			expect(db.prepare(`SELECT * FROM ${TABLE}`).all()).toEqual([row]);
+		});
+
+		it("allows independent claims and coordinator namespaces", () => {
+			// Arrange
+			const db = setup(source);
+			const independent = {
 				claim_id: "claim-b",
 				identity_id: "identity-b",
 				device_id: "device-b",
 				key_id: "c".repeat(64),
 				attempt_id: "dummy-attempt-b",
 			};
-			changes[field] = row[field as keyof typeof row];
-			if (field === "claim_id") changes.coordinator_id = "coordinator-b";
-			const before = db.prepare(`SELECT * FROM ${TABLE}`).all();
 			// Act
-			const ordinary = () => insert(db, changes);
-			const replace = () =>
-				insert(db, changes, insertSql.replace("INSERT INTO", "INSERT OR REPLACE INTO"));
+			insert(db);
+			insert(db, independent);
+			insert(db, { coordinator_id: "coordinator-b", claim_id: "claim-c" });
 			// Assert
-			expect(db.pragma("recursive_triggers", { simple: true })).toBe(0);
-			expect(ordinary).toThrow(/auth_device_claim_collision/);
-			expect(replace).toThrow(/auth_device_claim_collision/);
-			expect(db.prepare(`SELECT * FROM ${TABLE}`).all()).toEqual(before);
-		},
-	);
+			expect(db.prepare(`SELECT * FROM ${TABLE} ORDER BY claim_id`).all()).toEqual([
+				row,
+				{ ...row, ...independent },
+				{ ...row, coordinator_id: "coordinator-b", claim_id: "claim-c" },
+			]);
+		});
+		it("accepts identifier/key/time upper bounds and preserves CRLF PEM bytes", () => {
+			// Arrange
+			const db = setup(source);
+			const maximum = {
+				coordinator_id: "c".repeat(256),
+				claim_id: "l".repeat(256),
+				identity_id: "i".repeat(256),
+				group_id: "g".repeat(256),
+				device_id: "d".repeat(256),
+				attempt_id: "t".repeat(256),
+				public_key: `${"p".repeat(4094)}\r\n`,
+				created_at_ms: Number.MAX_SAFE_INTEGER,
+			};
+			// Act
+			insert(db, maximum);
+			// Assert
+			expect(db.prepare(`SELECT * FROM ${TABLE}`).all()).toEqual([{ ...row, ...maximum }]);
+		});
+		it.each([
+			"coordinator_id",
+			"claim_id",
+			"identity_id",
+			"group_id",
+			"device_id",
+			"attempt_id",
+			"public_key",
+		])("rejects overlong %s", (column) => {
+			// Arrange
+			const db = setup(source);
+			const value = "x".repeat(column === "public_key" ? 4097 : 257);
+			// Act
+			const invalid = () => insert(db, { [column]: value });
+			// Assert
+			expect(invalid).toThrow(/CHECK constraint failed/);
+			expect(db.prepare(`SELECT * FROM ${TABLE}`).all()).toEqual([]);
+		});
 
-	it.each([
-		`UPDATE ${TABLE} SET public_key = 'changed'`,
-		`UPDATE ${TABLE} SET claim_id = claim_id`,
-		`DELETE FROM ${TABLE}`,
-		`${insertSql} ON CONFLICT DO UPDATE SET public_key = excluded.public_key`,
-	])("rejects immutable mutation: %s", (sql) => {
-		// Arrange
-		const db = setup(source);
-		insert(db);
-		// Act
-		const mutate = () => {
-			if (sql.includes("ON CONFLICT")) insert(db, { public_key: "changed" }, sql);
-			else db.exec(sql);
-		};
-		// Assert
-		expect(mutate).toThrow(/auth_device_claim_(immutable|collision)/);
-		expect(db.prepare(`SELECT * FROM ${TABLE}`).all()).toEqual([row]);
-	});
-});
+		it.each(["claim_id", "identity_id", "device_id", "key_id", "attempt_id"])(
+			"rejects only-%s collisions including REPLACE with recursive triggers off",
+			(field) => {
+				// Arrange: every other unique value differs, so each constraint is causal.
+				const db = setup(source);
+				insert(db);
+				const changes: Record<string, unknown> = {
+					claim_id: "claim-b",
+					identity_id: "identity-b",
+					device_id: "device-b",
+					key_id: "c".repeat(64),
+					attempt_id: "dummy-attempt-b",
+				};
+				changes[field] = row[field as keyof typeof row];
+				if (field === "claim_id") changes.coordinator_id = "coordinator-b";
+				const before = db.prepare(`SELECT * FROM ${TABLE}`).all();
+				// Act
+				const ordinary = () => insert(db, changes);
+				const replace = () =>
+					insert(db, changes, insertSql.replace("INSERT INTO", "INSERT OR REPLACE INTO"));
+				// Assert
+				expect(db.pragma("recursive_triggers", { simple: true })).toBe(0);
+				expect(ordinary).toThrow(/auth_device_claim_collision/);
+				expect(replace).toThrow(/auth_device_claim_collision/);
+				expect(db.prepare(`SELECT * FROM ${TABLE}`).all()).toEqual(before);
+			},
+		);
 
-describe.each(["constant", "migration", "Worker"] as const)(
+		it.each([
+			`UPDATE ${TABLE} SET public_key = 'changed'`,
+			`UPDATE ${TABLE} SET claim_id = claim_id`,
+			`DELETE FROM ${TABLE}`,
+			`${insertSql} ON CONFLICT DO UPDATE SET public_key = excluded.public_key`,
+		])("rejects immutable mutation: %s", (sql) => {
+			// Arrange
+			const db = setup(source);
+			insert(db);
+			// Act
+			const mutate = () => {
+				if (sql.includes("ON CONFLICT")) insert(db, { public_key: "changed" }, sql);
+				else db.exec(sql);
+			};
+			// Assert
+			expect(mutate).toThrow(/auth_device_claim_(immutable|collision)/);
+			expect(db.prepare(`SELECT * FROM ${TABLE}`).all()).toEqual([row]);
+		});
+	},
+);
+
+describe.each(["constant", "migration", "Worker predecessor"] as const)(
 	"%s hidden-row replacement",
 	(source) => {
 		it("rejects every hidden row identifier with fresh logical values", () => {
@@ -226,64 +306,67 @@ describe.each(["constant", "migration", "Worker"] as const)(
 	},
 );
 
-describe.each(["constant", "migration", "Worker"] as const)("%s claim CHECKs", (source) => {
-	it.each(columns)("rejects missing/null required %s", (column) => {
-		// Arrange
-		const db = setup(source);
-		const present = columns.filter((name) => name !== column);
-		const missingSql = `INSERT INTO ${TABLE} (${present.join(",")}) VALUES (${present.map(() => "?").join(",")})`;
-		// Act
-		const missing = () =>
-			db.prepare(missingSql).run(...present.map((name) => row[name as keyof typeof row]));
-		const nullValue = () => insert(db, { [column]: null });
-		// Assert
-		expect(missing).toThrow(/NOT NULL/);
-		expect(nullValue).toThrow(/NOT NULL/);
-		expect(db.prepare(`SELECT * FROM ${TABLE}`).all()).toEqual([]);
-	});
+describe.each(["constant", "migration", "Worker predecessor"] as const)(
+	"frozen V2 %s claim CHECKs",
+	(source) => {
+		it.each(columns)("rejects missing/null required %s", (column) => {
+			// Arrange
+			const db = setup(source);
+			const present = columns.filter((name) => name !== column);
+			const missingSql = `INSERT INTO ${TABLE} (${present.join(",")}) VALUES (${present.map(() => "?").join(",")})`;
+			// Act
+			const missing = () =>
+				db.prepare(missingSql).run(...present.map((name) => row[name as keyof typeof row]));
+			const nullValue = () => insert(db, { [column]: null });
+			// Assert
+			expect(missing).toThrow(/NOT NULL/);
+			expect(nullValue).toThrow(/NOT NULL/);
+			expect(db.prepare(`SELECT * FROM ${TABLE}`).all()).toEqual([]);
+		});
 
-	it.each(columns.filter((column) => column !== "created_at_ms"))(
-		"rejects blank, NUL and blob %s",
-		(column) => {
+		it.each(columns.filter((column) => column !== "created_at_ms"))(
+			"rejects blank, NUL and blob %s",
+			(column) => {
+				// Arrange
+				const db = setup(source);
+				// Act
+				const attempts = ["", "   ", "bad\0value", Buffer.from("blob")].map(
+					(value) => () => insert(db, { [column]: value }),
+				);
+				// Assert
+				for (const attempt of attempts) expect(attempt).toThrow(/CHECK constraint failed/);
+				expect(db.prepare(`SELECT * FROM ${TABLE}`).all()).toEqual([]);
+			},
+		);
+
+		it.each([
+			{ fingerprint: "g".repeat(64) },
+			{ fingerprint: "A".repeat(64) },
+			{ fingerprint: "a".repeat(63) },
+			{ key_id: "g".repeat(64) },
+			{ key_id: "B".repeat(64) },
+			{ key_id: "b".repeat(65) },
+			{ created_at_ms: -1 },
+			{ created_at_ms: 0.5 },
+			{ created_at_ms: "not-a-time" },
+			{ created_at_ms: Number.MAX_SAFE_INTEGER + 1 },
+			{ auth_config_revision: "opaque-config-revision-v1" },
+			{ created_at_ms: Buffer.from("0") },
+		])("rejects invalid digest/time %j", (changes) => {
 			// Arrange
 			const db = setup(source);
 			// Act
-			const attempts = ["", "   ", "bad\0value", Buffer.from("blob")].map(
-				(value) => () => insert(db, { [column]: value }),
-			);
+			const invalid = () => insert(db, changes);
 			// Assert
-			for (const attempt of attempts) expect(attempt).toThrow(/CHECK constraint failed/);
+			expect(invalid).toThrow(/CHECK constraint failed/);
 			expect(db.prepare(`SELECT * FROM ${TABLE}`).all()).toEqual([]);
-		},
-	);
-
-	it.each([
-		{ fingerprint: "g".repeat(64) },
-		{ fingerprint: "A".repeat(64) },
-		{ fingerprint: "a".repeat(63) },
-		{ key_id: "g".repeat(64) },
-		{ key_id: "B".repeat(64) },
-		{ key_id: "b".repeat(65) },
-		{ created_at_ms: -1 },
-		{ created_at_ms: 0.5 },
-		{ created_at_ms: "not-a-time" },
-		{ created_at_ms: Number.MAX_SAFE_INTEGER + 1 },
-		{ auth_config_revision: "opaque-config-revision-v1" },
-		{ created_at_ms: Buffer.from("0") },
-	])("rejects invalid digest/time %j", (changes) => {
-		// Arrange
-		const db = setup(source);
-		// Act
-		const invalid = () => insert(db, changes);
-		// Assert
-		expect(invalid).toThrow(/CHECK constraint failed/);
-		expect(db.prepare(`SELECT * FROM ${TABLE}`).all()).toEqual([]);
-	});
-});
+		});
+	},
+);
 
 it("reapplying the migration preserves claims and every existing coordinator table", () => {
 	// Arrange
-	const db = setup("Worker");
+	const db = setup("Worker predecessor");
 	db.exec(
 		"INSERT INTO groups (group_id, created_at) VALUES ('fixture-group', '2026-10-01T00:00:00.000Z')",
 	);

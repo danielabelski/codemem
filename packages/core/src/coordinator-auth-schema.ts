@@ -1,9 +1,12 @@
-import { AUTH_DEVICE_CLAIM_DEFINITION_CHECKS } from "./coordinator-auth-device-claim-schema.js";
+import {
+	AUTH_LIFECYCLE_CURRENT_READINESS_SQL,
+	AUTH_LIFECYCLE_CURRENT_READY_COUNT,
+} from "./coordinator-auth-lifecycle-current-readiness.js";
 import type { AuthLinkBackend, AuthLinkStatement } from "./coordinator-auth-link.js";
 
 export const AUTH_SCHEMA_UPGRADE_REQUIRED = "coordinator_auth_schema_upgrade_required";
 export const AUTH_SCHEMA_UPGRADE_MESSAGE =
-	"Coordinator authentication needs a schema upgrade. Pause auth writers and back up the coordinator database. For the legacy authority upgrade, run codemem coordinator upgrade-auth-schema --db-path <coordinator.sqlite>. D1 operators must review and apply outstanding auth migrations before deploying the upgraded Worker. A coordinator already using device-claim auth needs only outstanding additive migrations, including 0033; do not replay its authority-table cutover. Device-signed sync remains available.";
+	"Coordinator authentication needs the explicit lifecycle schema upgrade. Pause auth writers and review the preserving migration before applying it. Do not replay the legacy authority cutover or restore older data automatically. Device-signed sync remains available.";
 
 export class CoordinatorAuthSchemaUpgradeRequiredError extends Error {
 	constructor() {
@@ -12,15 +15,8 @@ export class CoordinatorAuthSchemaUpgradeRequiredError extends Error {
 	}
 }
 
-// Inspect five authority columns, four proof definitions and the display staging table.
-// No writes or I/O cache; unknown proof variants fail closed.
-export const AUTH_SCHEMA_READY_COUNT = 10;
-export const AUTH_SCHEMA_READINESS_SQL = `SELECT
- (SELECT count(*) FROM pragma_table_info('coordinator_auth_link_attempts') WHERE lower(name) = 'authority_kind')
- + (SELECT count(*) FROM pragma_table_info('coordinator_auth_account_links') WHERE lower(name) IN ('authority_kind','device_claim_id'))
-	+ (SELECT count(*) FROM pragma_table_info('coordinator_auth_link_audit_log') WHERE lower(name) IN ('authority_kind','device_claim_id'))
-	+ (SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'coordinator_auth_link_profiles')
- + ${AUTH_DEVICE_CLAIM_DEFINITION_CHECKS.map(({ matches }) => `(${matches})`).join(" + ")} AS ready`;
+export const AUTH_SCHEMA_READY_COUNT = AUTH_LIFECYCLE_CURRENT_READY_COUNT;
+export const AUTH_SCHEMA_READINESS_SQL = AUTH_LIFECYCLE_CURRENT_READINESS_SQL;
 
 export interface CoordinatorAuthSchemaStore {
 	assertAuthSchemaReady(): Promise<void>;

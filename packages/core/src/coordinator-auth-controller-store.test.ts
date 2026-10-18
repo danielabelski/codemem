@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Database as SqliteDatabase } from "better-sqlite3";
@@ -15,6 +15,8 @@ import {
 	authControllerRetryEligibleValues,
 	type CoordinatorAuthControllerReviewInput,
 } from "./coordinator-auth-controller.js";
+import { frozenCallerDatabase } from "./coordinator-auth-lifecycle-upgrade-test-fixture.js";
+import { CoordinatorAuthSchemaUpgradeRequiredError } from "./coordinator-auth-schema.js";
 import {
 	type Backend,
 	enroll,
@@ -1016,18 +1018,23 @@ function registerBindingTests(test: ReturnType<typeof it.extend<{ fixture: Fixtu
 }
 
 describe("SQLite auth-controller existing-file upgrade", () => {
-	it("adds an empty review table without trusting or changing legacy enrollment", async () => {
+	it("does not add optional auth to an existing pre-controller file and retains ordinary enrollment access", async () => {
 		// Arrange: only this disposable fixture file simulates a pre-controller store.
 		const directory = mkdtempSync(join(tmpdir(), "controller-upgrade-test-"));
 		const path = join(directory, "coordinator.sqlite");
 		let store: BetterSqliteCoordinatorStore | undefined;
 		try {
-			store = new BetterSqliteCoordinatorStore(path);
-			await enroll(store);
-			setIdentity(store.db, "identity-a");
-			const before = await store.getEnrollment("group-a", "device-a", true);
-			store.db.exec("DROP TABLE coordinator_auth_controller_attestations");
-			await store.close();
+			const legacy = frozenCallerDatabase();
+			let before: Awaited<ReturnType<BetterSqliteCoordinatorStore["getEnrollment"]>>;
+			try {
+				const deviceStore = new D1CoordinatorStore(sqliteD1(legacy));
+				await enroll(deviceStore);
+				setIdentity(legacy, "identity-a");
+				before = await deviceStore.getEnrollment("group-a", "device-a", true);
+				writeFileSync(path, legacy.serialize());
+			} finally {
+				legacy.close();
+			}
 			// Act
 			store = new BetterSqliteCoordinatorStore(path);
 			const after = await store.getEnrollment("group-a", "device-a", true);
@@ -1035,14 +1042,14 @@ describe("SQLite auth-controller existing-file upgrade", () => {
 			expect(after).toEqual(before);
 			expect(
 				store.db
-					.prepare("SELECT COUNT(*) AS count FROM coordinator_auth_controller_attestations")
-					.get(),
-			).toEqual({ count: 0 });
-			expect(
-				await store.getActiveAuthControllerAttestation("coordinator-a", "attestation-a"),
-			).toBeNull();
-			const explicit = await store.createAuthControllerAttestation(review());
-			expect(explicit.kind).toBe("created");
+					.prepare("SELECT name FROM sqlite_master WHERE instr(name,'coordinator_auth_') = 1")
+					.all(),
+			).toEqual([]);
+			await expect(store.assertAuthSchemaReady()).rejects.toBeInstanceOf(
+				CoordinatorAuthSchemaUpgradeRequiredError,
+			);
+			await store.createGroup("ordinary-sync-group");
+			expect(await store.getEnrollment("group-a", "device-a", true)).toEqual(before);
 		} finally {
 			if (store?.db.open) await store.close();
 			rmSync(directory, { recursive: true, force: true });

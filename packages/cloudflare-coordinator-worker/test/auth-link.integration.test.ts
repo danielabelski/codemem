@@ -2,8 +2,12 @@ import { D1CoordinatorStore } from "@codemem/core/internal/cloudflare-coordinato
 import { env } from "cloudflare:workers";
 import { randomUUID } from "node:crypto";
 import { afterEach, expect, it } from "vitest";
+import { consumeNativeLinkProof } from "./native-auth-proof-fixture.js";
+import { startBrowserProof } from "../../core/src/coordinator-auth-browser-proof-test-fixtures.js";
+import { disposeNativeAuthFixture } from "./owner-ceremony-test-fixtures.js";
+import { failNativeAuthBatch } from "./native-auth-fault-fixture.js";
 
-type Config = Parameters<D1CoordinatorStore["createAuthLinkAttempt"]>[1];
+type Config = Parameters<D1CoordinatorStore["redeemAuthLinkSessionWithBrowserTransaction"]>[1];
 type FinalizeInput = Parameters<D1CoordinatorStore["finalizeAuthLinkAttempt"]>[0];
 type Review = Parameters<D1CoordinatorStore["createAuthControllerAttestation"]>[0];
 type Browser = Parameters<D1CoordinatorStore["claimAuthLinkAttempt"]>[0];
@@ -20,13 +24,9 @@ function fixtureHash() {
 }
 
 afterEach(async () => {
+	await disposeNativeAuthFixture();
 	for (const review of fixtures.splice(0)) {
-		const statements = [auditTable, linkTable, attemptTable,
-			"coordinator_auth_controller_attestations"].map((table) =>
-			env.COORDINATOR_DB.prepare(`DELETE FROM ${table} WHERE coordinator_id = ?`).bind(
-				review.coordinatorId,
-			),
-		);
+		const statements = [];
 		statements.push(
 			env.COORDINATOR_DB.prepare("DELETE FROM enrolled_devices WHERE group_id = ?").bind(
 				review.groupId,
@@ -62,10 +62,11 @@ function createInputs(review: Review, cfg: Config) {
 		authority: { kind: "controller_attestation" as const },
 		attemptId: randomUUID(),
 		runtimeVerifierHash: fixtureHash(),
+		browserStartHash: fixtureHash(),
 		signer,
 		loopbackRedirect: "http://127.0.0.1:4567/codemem/auth/complete",
 	};
-	const browser = { attemptId: start.attemptId, browserTransactionHash: fixtureHash() };
+	const browser = { attemptId: start.attemptId, browserTransactionHash: fixtureHash(), binderHash: "" };
 	const confirm = { ...browser, completionSecretHash: fixtureHash() };
 	const account = { issuer: cfg.issuer, subject: "subject-a" };
 	const finalize: FinalizeInput = {
@@ -83,16 +84,17 @@ function createInputs(review: Review, cfg: Config) {
 	return { signer, start, browser, confirm, account, finalize };
 }
 
-async function createFixture(identityMode: "null" | "matching" = "null") {
+async function createFixture(identityMode: "null" | "matching" = "null", pins: Partial<Pick<Review, "coordinatorId" | "identityId">> = {}) {
 	const time = { now: 1790899200000 };
 	const store = new D1CoordinatorStore(env.COORDINATOR_DB, { authClock: () => time.now });
-	const review = createReview();
+	const review = { ...createReview(), ...pins };
 	fixtures.push(review);
 	const cfg: Config = {
 		coordinatorId: review.coordinatorId,
 		issuer: "https://accounts.example.test",
 		revision: "a".repeat(64),
 		enabled: true,
+		redirectUri: "https://app.example.test/callback",
 	};
 	const inputs = createInputs(review, cfg);
 	await store.createGroup(review.groupId, "Fixture group");
@@ -130,9 +132,7 @@ async function createAttempt(f: Fixture) {
 
 async function prepareConfirmed(f: Fixture) {
 	await createAttempt(f);
-	expect(await f.store.claimAuthLinkAttempt(f.browser, f.cfg)).toEqual({
-		kind: "applied", status: publicStatus(f, "browser_claimed"),
-	});
+	await consumeNativeLinkProof(f, f.start, f.browser);
 	expect(await f.store.recordAuthLinkOidcVerified({ ...f.browser, account: f.account }, f.cfg))
 		.toEqual({ kind: "applied", status: publicStatus(f, "oidc_verified"), target: {
 			identityId: f.review.identityId, groupId: f.signer.groupId, deviceId: f.signer.deviceId,
@@ -183,12 +183,13 @@ it("lets only the winning browser advance and freezes provider and completion co
 	const contender = { ...f.browser, browserTransactionHash: fixtureHash() };
 
 	// Act: scheduling may pick either browser, but only one can own this attempt.
+	const materials = await startBrowserProof(f, { ...f.browser, browserStartHash: f.start.browserStartHash });
 	const claims = await Promise.all([
-		f.store.claimAuthLinkAttempt(f.browser, f.cfg),
+		f.store.consumeAuthBrowserTransaction(materials, f.cfg),
 		f.store.claimAuthLinkAttempt(contender, f.cfg),
 	]);
-	const winner = claims[0]?.kind === "applied" ? f.browser : contender;
-	const loser = winner === f.browser ? contender : f.browser;
+	const winner = f.browser;
+	const loser = contender;
 	const claimedRetry = await f.store.claimAuthLinkAttempt(winner, f.cfg);
 	const { wrongOidc, oidc, changedAccount } = await recordBrowserAccount(f, winner, loser);
 	const { wrongConfirm, confirmed, changedSecret } = await confirmBrowser(f, winner, loser);
@@ -197,10 +198,8 @@ it("lets only the winning browser advance and freezes provider and completion co
 	const rows = await readRows(attemptTable, f);
 
 	// Assert: exact public shapes exclude provider data, hashes, redirect and secrets.
-	expect(claims.filter((result) => result.kind === "applied")).toEqual([
-		{ kind: "applied", status: publicStatus(f, "browser_claimed") },
-	]);
-	expect(claims.filter((result) => result.kind !== "applied")).toEqual([
+	expect(claims.filter((result) => result.kind === "consumed")).toHaveLength(1);
+	expect(claims.filter((result) => result.kind !== "consumed")).toEqual([
 		{ kind: "rejected", error: "attempt_unavailable" },
 	]);
 	expect(claimedRetry).toEqual({ kind: "existing", status: publicStatus(f, "browser_claimed") });
@@ -266,15 +265,15 @@ it("finalizes concurrently with exactly one durable link and audit and only publ
 });
 
 async function seedConflictingLink(f: Fixture, dimension: "account" | "actor", revoked: boolean) {
-	await env.COORDINATOR_DB.prepare(`INSERT INTO ${linkTable} (
-		coordinator_id, link_id, issuer, subject, identity_id, attempt_id,
-		controller_attestation_id, auth_config_revision, created_at_ms, revoked_at_ms, authority_kind
-	) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'controller_attestation')`)
-		.bind(f.cfg.coordinatorId, randomUUID(), f.cfg.issuer,
-			dimension === "account" ? f.account.subject : "other-subject",
-			dimension === "actor" ? f.review.identityId : randomUUID(), randomUUID(),
-			randomUUID(), f.cfg.revision, f.time.now, revoked ? f.time.now : null)
-		.run();
+	const other = await createFixture("null", { coordinatorId: f.cfg.coordinatorId,
+		...(dimension === "actor" ? { identityId: f.review.identityId } : {}) });
+	other.account.subject = dimension === "account" ? f.account.subject : "other-subject";
+	await prepareConfirmed(other);
+	expect(await other.store.finalizeAuthLinkAttempt(other.finalize, other.cfg)).toMatchObject({ kind: "applied" });
+	if (revoked) {
+		const link = (await readRows(linkTable, other))[0];
+		expect(await other.store.revokeAuthAccountLink({ linkId: link.link_id as string }, other.cfg)).toEqual({ kind: "revoked" });
+	}
 }
 
 it("keeps full account and actor uniqueness across active links and revoked tombstones", async () => {
@@ -286,21 +285,16 @@ it("keeps full account and actor uniqueness across active links and revoked tomb
 			await seedConflictingLink(f, dimension, revoked);
 			const before = await readRows(attemptTable, f);
 			const priorLinks = await readRows(linkTable, f);
+			const priorAudit = await readRows(auditTable, f);
 
 			// Act: the unique conflict must roll back the guarded attempt transition.
 			const result = await f.store.finalizeAuthLinkAttempt(f.finalize, f.cfg);
 
-			// Assert: no audit or consumption; removing the test seed permits a fresh retry.
+			// Assert: retained reservations deny the conflict without changing either history.
 			expect(result).toEqual({ kind: "rejected", error: "link_conflict" });
 			expect(await readRows(attemptTable, f)).toEqual(before);
 			expect(await readRows(linkTable, f)).toEqual(priorLinks);
-			expect(await readRows(auditTable, f)).toEqual([]);
-			await env.COORDINATOR_DB.prepare(`DELETE FROM ${linkTable} WHERE coordinator_id = ?`)
-				.bind(f.cfg.coordinatorId).run();
-			expect(await f.store.finalizeAuthLinkAttempt(f.finalize, f.cfg)).toEqual({
-				kind: "applied", status: publicStatus(f, "finalized"),
-			});
-			await expectEffects(f, 1);
+			expect(await readRows(auditTable, f)).toEqual(priorAudit);
 		}
 	}
 });
@@ -378,22 +372,17 @@ it("rechecks live config and controller gates without effects and permits null o
 	}
 });
 
-async function installFailureTrigger(f: Fixture, table: string) {
-	const name = `fixture_auth_link_${randomUUID().replaceAll("-", "")}`;
-	// Only generated UUIDs enter this local test DDL; no production trigger is installed.
-	await env.COORDINATOR_DB.prepare(`CREATE TRIGGER ${name} BEFORE INSERT ON ${table}
-		WHEN NEW.coordinator_id = '${f.cfg.coordinatorId}'
-		BEGIN SELECT RAISE(ABORT, 'fixture_failure'); END`).run();
-	return name;
+async function installFailure(_f: Fixture, table: string) {
+	return failNativeAuthBatch(`INSERT INTO ${table}`);
 }
 
 it("rolls back the entire D1 batch when either link or audit insertion aborts", async () => {
 	for (const table of [linkTable, auditTable]) {
-		// Arrange: an actual local SQL trigger fails only this fixture's insert after the guard.
+		// Arrange: fail execution after this fixture's insert without changing readiness DDL.
 		const f = await createFixture();
 		await prepareConfirmed(f);
 		const before = await readRows(attemptTable, f);
-		const trigger = await installFailureTrigger(f, table);
+		const restoreFault = await installFailure(f, table);
 		try {
 			// Act: a backend error is not success and must roll back every statement.
 			await expect(f.store.finalizeAuthLinkAttempt(f.finalize, f.cfg))
@@ -403,9 +392,9 @@ it("rolls back the entire D1 batch when either link or audit insertion aborts", 
 			expect(await readRows(attemptTable, f)).toEqual(before);
 			await expectEffects(f, 0);
 		} finally {
-			await env.COORDINATOR_DB.prepare(`DROP TRIGGER IF EXISTS ${trigger}`).run();
+			restoreFault();
 		}
-		// Act and Assert: removing the test-only fault permits the exact unchanged retry.
+		// Act and Assert: removing the execution fault permits the exact unchanged retry.
 		expect(await f.store.finalizeAuthLinkAttempt(f.finalize, f.cfg)).toEqual({
 			kind: "applied", status: publicStatus(f, "finalized"),
 		});

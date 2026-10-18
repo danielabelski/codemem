@@ -51,7 +51,10 @@ function registerIssueInputs(test: SessionTest) {
 			await linked(f, { signinProof: false });
 			const before = snapshot(f);
 			// Act
-			const redeem = await f.store.redeemAuthLinkSession(input as never, f.cfg);
+			const redeem = await f.store.redeemAuthLinkSessionWithBrowserTransaction(
+				input as never,
+				f.cfg,
+			);
 			const signIn = await f.store.signInWithConsumedBrowserTransaction(
 				input as never,
 				browserProofConfig(f),
@@ -74,7 +77,7 @@ function registerIssueInputs(test: SessionTest) {
 			for (const field of ["attemptId", "browserTransactionHash", "credentialHash"])
 				results.push({
 					field,
-					result: await f.store.redeemAuthLinkSession(
+					result: await f.store.redeemAuthLinkSessionWithBrowserTransaction(
 						hostile(field, redeemInput(), kind) as never,
 						f.cfg,
 					),

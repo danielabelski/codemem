@@ -70,6 +70,7 @@ async function linkFixture(f: Fixture) {
 		attemptId: crypto.randomUUID(),
 		signer,
 		runtimeVerifierHash: hash(),
+		browserStartHash: hash(),
 		loopbackRedirect: "http://127.0.0.1:4567/codemem/auth/complete",
 	};
 	await f.store.createGroup(review.groupId, "Fixture group");
@@ -159,7 +160,7 @@ it("binds link resolution to its existing claim and deadline without granting ac
 	const f = fixture();
 	const start = await linkFixture(f);
 	f.time.now += 60000;
-	const input = { ...f.input, purpose: "link" as const, attemptId: start.attemptId };
+	const input = { ...f.input, purpose: "link" as const, attemptId: start.attemptId, browserStartHash: start.browserStartHash };
 	// Act: starting later must preserve the original attempt deadline.
 	const started = await f.store.startAuthBrowserTransaction(input, f.cfg);
 	const stored = await rows(f);
@@ -179,7 +180,7 @@ it("binds link resolution to its existing claim and deadline without granting ac
 	const other = await linkFixture(f);
 	const attemptsBefore = await rows(f, protectedTables[0]);
 	const collision = await f.store.startAuthBrowserTransaction(
-		{ ...input, attemptId: other.attemptId },
+		{ ...input, attemptId: other.attemptId, browserStartHash: other.browserStartHash },
 		f.cfg,
 	);
 	const consumed = await f.store.consumeAuthBrowserTransaction(input, f.cfg);
@@ -223,7 +224,7 @@ it("expires forty rows in capped batches, retains burnt hashes and leaves other 
 		kind: "started",
 	});
 	const seed = (await rows(f))[0];
-	const columns = Object.keys(seed);
+	const columns = Object.keys(seed).filter((name) => name !== "browser_sequence");
 	const copies = Array.from({ length: 39 }, () => ({
 		...seed,
 		browser_transaction_hash: hash(),

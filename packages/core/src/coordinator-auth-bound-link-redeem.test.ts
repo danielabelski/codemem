@@ -36,7 +36,12 @@ import { D1CoordinatorStore } from "./d1-coordinator-store.js";
 async function ready(f: LinkFixture, options: { late?: boolean } = {}) {
 	await authorize(f);
 	expect(await f.store.createAuthLinkAttempt(attempt(), f.cfg)).toMatchObject({ kind: "created" });
-	const proof = { ...materials(), purpose: "link" as const, attemptId: "attempt-a" };
+	const proof = {
+		...materials(),
+		purpose: "link" as const,
+		attemptId: "attempt-a",
+		browserStartHash: attempt().browserStartHash,
+	};
 	expect(await f.store.startAuthBrowserTransaction(proof, browserConfig)).toMatchObject({
 		kind: "started",
 	});
@@ -338,32 +343,10 @@ function registerReplay(test: SessionTest) {
 		expect(sessionRows(f).map((rows) => rows.length)).toEqual([1, 1]);
 		expect(authority(f)).toEqual(before);
 	});
-	test.for(["legacy-first", "guarded-first"] as const)(
-		"%s redemption burns the same proof for both APIs",
-		async (order, { fixture: f }) => {
-			// Arrange
-			const input = await ready(f);
-			const legacy = () =>
-				f.store.redeemAuthLinkSession(
-					{
-						attemptId: input.attemptId,
-						browserTransactionHash: input.browserTransactionHash,
-						credentialHash: input.credentialHash,
-					},
-					f.cfg,
-				);
-			const guarded = () =>
-				f.store.redeemAuthLinkSessionWithBrowserTransaction(input, browserConfig);
-			// Act
-			const first = await (order === "legacy-first" ? legacy() : guarded());
-			const before = authority(f);
-			const second = await (order === "legacy-first" ? guarded() : legacy());
-			// Assert
-			expectIssued(first, f);
-			expectRejected(second, "browser_transaction_used");
-			expect(authority(f)).toEqual(before);
-		},
-	);
+	test("only the browser-bound session APIs are exposed", async ({ fixture: f }) => {
+		expect("redeemAuthLinkSession" in f.store).toBe(false);
+		expect("signInWithAuthAccount" in f.store).toBe(false);
+	});
 }
 
 function registerAtomicity(test: SessionTest) {

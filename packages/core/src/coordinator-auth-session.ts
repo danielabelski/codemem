@@ -6,6 +6,7 @@ import {
 import { isAuthControllerId } from "./coordinator-auth-controller.js";
 import type { AuthLinkBackend, AuthLinkStatement } from "./coordinator-auth-link.js";
 import type { CoordinatorAuthLinkConfig } from "./coordinator-auth-link-contract.js";
+import { authLinkLiveGenerationSql } from "./coordinator-auth-link-liveness.js";
 import { authAccountLinkProvenanceSql } from "./coordinator-auth-link-provenance.js";
 import { authPersistenceError } from "./coordinator-auth-schema.js";
 import {
@@ -20,7 +21,6 @@ import {
 	type CoordinatorAuthAccountSignInInput,
 	type CoordinatorAuthBoundLinkSessionRedeemInput,
 	type CoordinatorAuthLinkSessionPreserveResult,
-	type CoordinatorAuthLinkSessionRedeemInput,
 	type CoordinatorAuthSession,
 	type CoordinatorAuthSessionError,
 	type CoordinatorAuthSessionIssueResult,
@@ -183,7 +183,7 @@ export const AUTH_SESSION_LINK_MATCH_SQL = `l.coordinator_id = s.coordinator_id 
  AND l.identity_id = s.identity_id AND l.issuer = s.issuer AND l.subject = s.subject
  AND ${ACCOUNT_PROVENANCE}`;
 const LINK_MATCH = AUTH_SESSION_LINK_MATCH_SQL;
-export const AUTH_SESSION_LIVE_GUARD_SQL = `s.coordinator_id = ? AND s.credential_hash = ? AND s.issuer = ? AND s.auth_config_revision = ? AND s.revoked_at_ms IS NULL AND l.revoked_at_ms IS NULL AND s.expires_at_ms > ? AND s.created_at_ms <= ?`;
+export const AUTH_SESSION_LIVE_GUARD_SQL = `s.coordinator_id = ? AND s.credential_hash = ? AND s.issuer = ? AND s.auth_config_revision = ? AND s.revoked_at_ms IS NULL AND ${authLinkLiveGenerationSql({ link: "l" })} AND s.expires_at_ms > ? AND s.created_at_ms <= ?`;
 const RECEIPT_COLUMNS = `coordinator_id, browser_transaction_hash, source, attempt_id, link_id, session_id, auth_config_revision, created_at_ms`;
 const REDEEM_RECEIPT_SELECT_SQL = `INSERT INTO coordinator_auth_session_receipts (${RECEIPT_COLUMNS})
  SELECT t.coordinator_id, t.browser_transaction_hash, 'link_redeem', t.attempt_id, t.link_id, ?, ?, ?
@@ -193,10 +193,8 @@ const REDEEM_RECEIPT_SELECT_SQL = `INSERT INTO coordinator_auth_session_receipts
  AND l.auth_config_revision = t.auth_config_revision AND l.authority_kind = t.authority_kind
  AND ${ACCOUNT_PROVENANCE}
  WHERE t.coordinator_id = ? AND t.attempt_id = ? AND t.browser_transaction_hash = ?
- AND t.state = 'finalized' AND t.issuer = ? AND t.auth_config_revision = ? AND l.revoked_at_ms IS NULL
+ AND t.state = 'finalized' AND t.issuer = ? AND t.auth_config_revision = ? AND ${authLinkLiveGenerationSql({ link: "l" })}
  AND ? >= t.finalized_at_ms AND ? < t.finalized_at_ms + 120000 AND ? < t.expires_at_ms`;
-const REDEEM_RECEIPT_SQL = `${REDEEM_RECEIPT_SELECT_SQL}
- ON CONFLICT(coordinator_id, browser_transaction_hash) DO NOTHING`;
 const BOUND_LINK_BROWSER_GUARD_SQL = `b.coordinator_id = t.coordinator_id
  AND b.browser_transaction_hash = t.browser_transaction_hash AND b.attempt_id = t.attempt_id
  AND b.binder_hash = ? AND b.purpose = 'link' AND b.state = 'consumed'
@@ -215,15 +213,10 @@ const PRESERVE_LINK_COMPLETION_SQL = `UPDATE coordinator_auth_link_attempts AS t
  AND EXISTS (SELECT 1 FROM coordinator_auth_account_links l
  WHERE l.coordinator_id = t.coordinator_id AND l.link_id = t.link_id AND l.attempt_id = t.attempt_id
  AND l.identity_id = t.identity_id AND l.issuer = t.issuer AND l.subject = t.account_subject
- AND l.auth_config_revision = t.auth_config_revision AND l.revoked_at_ms IS NULL AND l.authority_kind = t.authority_kind AND ${ACCOUNT_PROVENANCE})
+ AND l.auth_config_revision = t.auth_config_revision AND ${authLinkLiveGenerationSql({ link: "l" })} AND l.authority_kind = t.authority_kind AND ${ACCOUNT_PROVENANCE})
  AND EXISTS (SELECT 1 FROM coordinator_auth_browser_transactions b WHERE ${BOUND_LINK_BROWSER_GUARD_SQL})
  AND EXISTS (SELECT 1 FROM coordinator_auth_sessions s
  JOIN coordinator_auth_account_links l ON ${LINK_MATCH} WHERE ${AUTH_SESSION_LIVE_GUARD_SQL})`;
-const SIGNIN_RECEIPT_SQL = `INSERT INTO coordinator_auth_session_receipts (${RECEIPT_COLUMNS})
- SELECT l.coordinator_id, ?, 'signin', NULL, l.link_id, ?, ?, ? FROM coordinator_auth_account_links l
- WHERE l.coordinator_id = ? AND l.issuer = ? AND l.subject = ? AND l.revoked_at_ms IS NULL AND ${ACCOUNT_PROVENANCE}
- AND NOT EXISTS (SELECT 1 FROM coordinator_auth_link_attempts t WHERE t.coordinator_id = l.coordinator_id AND t.browser_transaction_hash = ?)
- ON CONFLICT(coordinator_id, browser_transaction_hash) DO NOTHING`;
 const CONSUMED_BROWSER_GUARD_SQL = `b.coordinator_id = ? AND b.browser_transaction_hash = ?
  AND b.purpose = 'signin' AND b.attempt_id IS NULL AND b.state = 'consumed'
  AND b.nonce IS NULL AND b.pkce_verifier IS NULL AND b.claim_token IS NOT NULL
@@ -233,7 +226,8 @@ const CONSUMED_SIGNIN_RECEIPT_SQL = `INSERT INTO coordinator_auth_session_receip
  SELECT b.coordinator_id, b.browser_transaction_hash, 'signin', NULL, l.link_id, ?, ?, ?, 1
  FROM coordinator_auth_browser_transactions b JOIN coordinator_auth_account_links l
  ON l.coordinator_id = b.coordinator_id AND l.issuer = b.issuer
- WHERE ${CONSUMED_BROWSER_GUARD_SQL} AND l.subject = ? AND l.revoked_at_ms IS NULL AND ${ACCOUNT_PROVENANCE}
+ WHERE ${CONSUMED_BROWSER_GUARD_SQL} AND l.subject = ? AND ${authLinkLiveGenerationSql({ link: "l" })} AND ${ACCOUNT_PROVENANCE}
+ AND b.browser_sequence > l.signin_sequence_floor
  AND NOT EXISTS (SELECT 1 FROM coordinator_auth_link_attempts t
  WHERE t.coordinator_id = b.coordinator_id AND t.browser_transaction_hash = b.browser_transaction_hash)
  AND (SELECT COUNT(*) FROM coordinator_auth_sessions s WHERE ${LINK_MATCH}
@@ -244,12 +238,12 @@ const SESSION_INSERT_SQL = `INSERT INTO coordinator_auth_sessions
  (coordinator_id, session_id, credential_hash, browser_transaction_hash, link_id, identity_id, issuer, subject, auth_config_revision, created_at_ms, expires_at_ms)
  SELECT r.coordinator_id, r.session_id, ?, r.browser_transaction_hash, r.link_id, l.identity_id, l.issuer, l.subject, r.auth_config_revision, r.created_at_ms, r.created_at_ms + 28800000
  FROM coordinator_auth_session_receipts r JOIN coordinator_auth_account_links l ON l.coordinator_id = r.coordinator_id AND l.link_id = r.link_id
- WHERE r.coordinator_id = ? AND r.browser_transaction_hash = ? AND r.session_id = ? AND l.revoked_at_ms IS NULL AND ${ACCOUNT_PROVENANCE}`;
+ WHERE r.coordinator_id = ? AND r.browser_transaction_hash = ? AND r.session_id = ? AND ${authLinkLiveGenerationSql({ link: "l" })} AND ${ACCOUNT_PROVENANCE}`;
 const REDEEM_CONSUME_SQL = `UPDATE coordinator_auth_link_attempts SET state = 'session_redeemed'
  WHERE coordinator_id = ? AND attempt_id = ? AND browser_transaction_hash = ? AND state = 'finalized'
  AND EXISTS (SELECT 1 FROM coordinator_auth_account_links l WHERE l.coordinator_id = coordinator_auth_link_attempts.coordinator_id
  AND l.link_id = coordinator_auth_link_attempts.link_id AND l.attempt_id = coordinator_auth_link_attempts.attempt_id
- AND l.authority_kind = coordinator_auth_link_attempts.authority_kind AND l.revoked_at_ms IS NULL AND ${ACCOUNT_PROVENANCE})
+ AND l.authority_kind = coordinator_auth_link_attempts.authority_kind AND ${authLinkLiveGenerationSql({ link: "l" })} AND ${ACCOUNT_PROVENANCE})
  AND EXISTS (SELECT 1 FROM coordinator_auth_sessions s WHERE s.coordinator_id = coordinator_auth_link_attempts.coordinator_id AND s.session_id = ? AND s.browser_transaction_hash = coordinator_auth_link_attempts.browser_transaction_hash)`;
 const ISSUE_READ_SQL = `SELECT s.session_id, s.identity_id, s.link_id, s.issuer, s.subject, s.expires_at_ms
  FROM coordinator_auth_session_receipts r JOIN coordinator_auth_sessions s
@@ -355,43 +349,6 @@ export class AuthSessionOperations
 			throw authPersistenceError(error, "auth_session_persistence_error");
 		}
 	}
-	async redeemAuthLinkSession(
-		input: CoordinatorAuthLinkSessionRedeemInput,
-		config: CoordinatorAuthLinkConfig,
-	): Promise<CoordinatorAuthSessionIssueResult> {
-		const c = captureConfig(config);
-		const i = captureIssue(input, ["attemptId"]);
-		if (!c || !i || !isAuthControllerId(i.attemptId)) return rejected("invalid_input");
-		if (!c.enabled) return rejected("auth_config_changed");
-		const now = sessionNow(this.clock);
-		const sessionId = globalThis.crypto.randomUUID();
-		await this.batch([
-			{
-				sql: REDEEM_RECEIPT_SQL,
-				values: [
-					sessionId,
-					c.revision,
-					now,
-					c.coordinatorId,
-					i.attemptId,
-					i.browserTransactionHash,
-					c.issuer,
-					c.revision,
-					now,
-					now,
-					now,
-				],
-			},
-			this.sessionInsert(i, c, sessionId),
-			{
-				sql: REDEEM_CONSUME_SQL,
-				values: [c.coordinatorId, i.attemptId, i.browserTransactionHash, sessionId],
-			},
-		]);
-		const result = await this.issueReceipt(i, c, now, sessionId);
-		if (result) return result;
-		return this.diagnoseRedeem(i.attemptId, i.browserTransactionHash, c, now);
-	}
 	/** Complete once while preserving the existing session and its own active account link. */
 	async preserveAuthLinkSessionCompletion(
 		input: CoordinatorAuthBoundLinkSessionRedeemInput,
@@ -495,44 +452,6 @@ export class AuthSessionOperations
 		if (result) return result;
 		return this.diagnoseRedeem(i.attemptId, i.browserTransactionHash, c, now);
 	}
-	async signInWithAuthAccount(
-		input: CoordinatorAuthAccountSignInInput,
-		config: CoordinatorAuthLinkConfig,
-	): Promise<CoordinatorAuthSessionIssueResult> {
-		const c = captureConfig(config);
-		const i = captureIssue(input, ["account"]);
-		if (!c || !i) return rejected("invalid_input");
-		const account = parseCoordinatorAccountReference(capture(i.account, ["issuer", "subject"]), {
-			issuer: c.issuer,
-		});
-		if (!account.ok) return rejected("invalid_input");
-		if (!c.enabled) return rejected("auth_config_changed");
-		const now = sessionNow(this.clock);
-		const sessionId = globalThis.crypto.randomUUID();
-		await this.batch([
-			{
-				sql: SIGNIN_RECEIPT_SQL,
-				values: [
-					i.browserTransactionHash,
-					sessionId,
-					c.revision,
-					now,
-					c.coordinatorId,
-					account.account.issuer,
-					account.account.subject,
-					i.browserTransactionHash,
-				],
-			},
-			this.sessionInsert(i, c, sessionId),
-		]);
-		const result = await this.issueReceipt(i, c, now, sessionId);
-		if (result) return result;
-		const used = await this.first({
-			sql: "SELECT 1 FROM coordinator_auth_link_attempts WHERE coordinator_id = ? AND browser_transaction_hash = ?",
-			values: [c.coordinatorId, i.browserTransactionHash],
-		});
-		return rejected(used ? "browser_transaction_used" : "account_not_linked");
-	}
 	/** Admission only; the caller has already verified JWT, cookie binding and CSRF. */
 	async signInWithConsumedBrowserTransaction(
 		input: CoordinatorAuthAccountSignInInput,
@@ -581,7 +500,7 @@ export class AuthSessionOperations
 		});
 		if (!transaction) return rejected("transaction_unavailable");
 		const link = await this.first({
-			sql: "SELECT 1 FROM coordinator_auth_account_links WHERE coordinator_id = ? AND issuer = ? AND subject = ? AND revoked_at_ms IS NULL",
+			sql: `SELECT 1 FROM coordinator_auth_account_links l WHERE l.coordinator_id = ? AND l.issuer = ? AND l.subject = ? AND ${authLinkLiveGenerationSql({ link: "l" })}`,
 			values: [c.coordinatorId, c.issuer, account.account.subject],
 		});
 		if (!link) return rejected("account_not_linked");
@@ -718,7 +637,8 @@ function revokeStatements(linkId: string, coordinatorId: string, now: number): A
  SELECT l.coordinator_id, l.link_id, 'link_revoked', a.attempt_id, a.identity_id, a.group_id, a.device_id, a.fingerprint, a.controller_attestation_id, a.auth_config_revision, l.revoked_at_ms, l.authority_kind, l.device_claim_id
  FROM coordinator_auth_account_links l JOIN coordinator_auth_link_audit_log a ON ${AUDIT_MATCH}
  WHERE l.coordinator_id = ? AND l.link_id = ? AND l.revoked_at_ms IS NOT NULL
- ON CONFLICT(coordinator_id, link_id, action) DO NOTHING`,
+ AND NOT EXISTS (SELECT 1 FROM coordinator_auth_link_audit_log retained
+ WHERE retained.coordinator_id = l.coordinator_id AND retained.link_id = l.link_id AND retained.action = 'link_revoked')`,
 			values: [coordinatorId, linkId],
 		},
 	];

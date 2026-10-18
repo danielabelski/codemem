@@ -110,14 +110,18 @@ the separate provider-continuation page uses `no-referrer` and carries no start
 code. Gateways must omit the private handoff query, Referer, and form body from
 logs. No account, device, or sharing permission comes from opening this page.
 
-The atomic claim matches its raw-byte hash to the signed device attempt's saved
-commitment before recording the browser cookie binding. Missing or wrong codes
-leave the attempt and provider material untouched. Once claimed, the original
-browser binding controls progress; the code cannot claim another browser.
+The normal browser flow starts its browser transaction atomically with its
+committed start proof. A standalone claim is retained only for exact retries; no
+current production flow starts a browser claim through that API. The atomic start
+claim matches its raw-byte hash to the signed device attempt's saved commitment before
+recording the browser cookie binding. Missing or wrong codes leave the attempt
+and provider material untouched. Once claimed, the original browser binding
+controls progress; the code cannot claim another browser.
 Public creation must require the commitment, and public start must require the
-code. Nullable legacy commitments exist only for internal compatibility; they
-are not a public fallback, and blind compatibility claims cannot bypass a saved
-non-null commitment. The device still does not know the later completion secret.
+code. Legacy rows with nullable commitments are retained data, not a public
+fallback: normal starts must have a committed start proof, and no compatibility
+claim can bypass a saved non-null commitment. The device still does not know the
+later completion secret.
 
 Initiation creates a host-only `__Host-codemem-auth-transaction` cookie with
 `HttpOnly`, `Secure`, `SameSite=Lax`, and `Path=/`, plus a CSRF value.
@@ -613,14 +617,17 @@ written for a device claim. Attested authority queries also require the attempt'
 
 The reviewed leaf source is `packages/core/src/coordinator-auth-link-authority-upgrade.ts`.
 The operator command calls its explicit transaction; store opening never runs it.
-It is not installed in the Worker's migration directory. SQLite and native D1 fixture
-tests exercise the same copy/check/swap SQL, including rollback at each swap.
-It rejects unknown schema and dependencies rather than rebuilding them silently.
-Fresh auth storage now uses explicit authority kinds. HTTP link creation still
-accepts only controller attestations; internal Core link and account-session
-operations also support device claims as described above. Fresh SQLite
-auth storage installs the committed-proof table without enabling external
-device-claim creation.
+It is a legacy authority cutover, not the V3 lifecycle migration. It rejects V3
+schemas and must not be presented as remediation for
+`coordinator_auth_schema_upgrade_required`. It is not installed in the Worker's
+migration directory. SQLite and native D1 fixture tests exercise the same
+copy/check/swap SQL, including rollback at each swap. It rejects unknown schema
+and dependencies rather than rebuilding them silently.
+The legacy authority schema used explicit authority kinds. HTTP link creation
+still accepts only controller attestations; internal Core link and account-session
+operations also support device claims as described above. Its SQLite bootstrap
+installed the committed-proof table without enabling external device-claim
+creation. That legacy bootstrap is not the current V3 fresh-database boundary.
 Owner enrollment requires an attestation-backed link without rechecking its old
 controller or device. Existing auth storage is not rebuilt on open, and ordinary
 device-signed sync remains unchanged. Optional auth on an old schema returns
@@ -630,125 +637,43 @@ querying the new columns or starting provider discovery. The fixed
 Disabled auth stays disabled.
 No authority upgrade is automatically applied through the Worker migration directory.
 
-#### Operator cutover
+#### V3 lifecycle migration boundary
 
-Do not deploy new auth writers against a legacy schema. Stop admitting new link
-attempts, drain or expire existing attempts using the existing deployment, then
-pause all optional-auth writers. Back up SQLite; for D1, take a Time Travel bookmark and export.
-Keep ordinary device-signed sync separate from this auth pause.
+Only a genuinely empty SQLite database, with zero existing non-`sqlite_` schema
+objects, bootstraps V3 account-auth storage automatically. An existing populated
+caller, pre-auth, V2, or partial-auth SQLite database never adds, repairs, or
+upgrades auth objects on open. An existing V3 database that passes readiness
+remains usable. Older or incomplete account-auth storage returns
+`coordinator_auth_schema_upgrade_required` while ordinary device-signed sync,
+enrollments, keys, and memory history continue to work.
 
-If new auth writers were deployed prematurely, restore the previous deployment
-before draining attempts; the new schema check also refuses legacy maintenance.
+The legacy `codemem coordinator upgrade-auth-schema` command is not a V3 fix. It
+performs only the historic authority cutover and rejects V3. Do not run it for a
+current upgrade-required result or replay its authority cutover as a substitute
+for the [V3 lifecycle migration](coordinator-account-management.md#migration-and-activation-boundary).
 
-For an existing local coordinator database, explicitly run:
+For a fresh D1 database that needs account auth, use the current Worker
+`schema.sql` bootstrap only after approval for that new empty database. Historical
+`0001`–`0033` migrations alone create V2 readiness (19 of 61 current checks), not
+the V3 auth schema. Never run `schema.sql` on an existing database, replay
+historical migrations to force an upgrade, drop tables, restore automatically, or
+reset roles, grants, keys, or history.
 
-```text
-codemem coordinator upgrade-auth-schema --db-path coordinator.sqlite --json
-```
+An existing SQLite or D1 auth history needs the reviewed, record-preserving V3
+lifecycle upgrade. It is blocked until a separately approved and verified
+execution path exists. For D1, all 191 statements must run in one atomic
+`db.batch()`; do not split them into chunks or change billing to bypass limits.
+They total 514,744 SQL bytes; the largest statement is 24,078 bytes, and the
+serialized statement array is 536,619 bytes.
+Each statement fits D1's documented 100,000-byte per-statement limit, but
+production statement accounting and aggregate batch limits are not confirmed.
+Before any live operation, obtain approved disposable-binding test evidence or
+Cloudflare support confirmation, then take a backup, quiesce auth writers, run
+preflight, and obtain operator approval.
 
-This opens only that existing file, validates the recognized legacy schema and
-retained provenance, then commits the three-table copy/check/swap and proof schema
-in one immediate transaction. A failed assertion aborts everything; do not repair
-references, delete history, or invent controller IDs to force it through.
-
-For D1, export the exact reviewed source without opening any database:
-
-```text
-codemem coordinator upgrade-auth-schema --export-sql > coordinator-auth-upgrade.sql
-```
-
-The file targets Wrangler's remote SQL-file import (`wrangler d1 execute --remote
---file`), which requires separate operator approval and confirmation of the
-deployed import service's atomicity. No remote import is tested or run here.
-
-The native D1 tests prove the programmatic path: execute the exported
-`AUTH_LINK_AUTHORITY_CUTOVER_STATEMENTS` array in one `db.batch()` while auth
-writers remain paused. The file contains complete proof triggers; never split
-it on semicolons.
-Do not replay the historical migration directory on a deployment without a ledger.
-The export command performs no remote execution and grants no rollout approval.
-
-Before resuming auth writers, verify row counts and every preserved column, proof
-immutability, and an enabled auth request against the upgraded database. Deploy
-the matching writers as part of that controlled cutover; restart SQLite auth
-composition if it was stopped during setup. Device-claim creation remains disabled.
-
-The three legacy link tables declare `controller_attestation_id` as `NOT NULL`, and
-SQLite cannot relax that with `ALTER TABLE`. The schema change therefore rebuilds
-those tables by creating a replacement, copying every row with
-`authority_kind = 'controller_attestation'`, checking row counts, swapping names,
-and recreating indexes. The proof definition matches the separate additive migration
-`0032_device_claim_proofs.sql`; the explicit cutover also installs that leaf schema
-in the same transaction or D1 batch. Existing rows keep every value.
-
-The copy must contain executable assertions, not merely `SELECT` results. Create
-a migration-owned check table with `passed INTEGER NOT NULL CHECK (passed = 1)`
-and insert each count and full-row equality result as 1 or 0 before any table
-swap. A mismatch inserts 0, fails the constraint, and aborts the transaction.
-
-An unexpected pre-existing check-table name also aborts; it is never cleared or
-reused. Remove only that migration-owned table after all assertions succeed.
-
-This work ships migration code and local tests only. Nothing is applied to a
-live D1 database or a user's database without a separate approval. Before any
-live apply:
-
-1. Pause affected auth writers, require live link attempts to finish or expire,
-   and recognize the exact legacy schema that supported only attestation-backed
-   links. Run read-only preflight queries for tables, dependencies, and row
-   counts, and validate every reference with `isAuthControllerId`.
-
-   Existing completed links retain their known legacy authority kind and
-   immutable historical tuple; their original controller need not still exist.
-   Retained source or audit records must agree with that tuple, including
-   receipts, revisions, coordinator, Identity, and attempt references where
-   present. Expired or failed attempts confer no authority and keep their
-   historical references; revoked records are also preserved.
-
-   An unknown schema, malformed references, inconsistent retained provenance, or
-   any remaining live attempt aborts with an actionable operator report. Known
-   historical provenance is not a default for new writes or a reconstructed
-   operator attestation. Never drop, repair, or silently promote a bad row.
-2. Take a D1 Time Travel bookmark and an export.
-3. Pause affected auth writers and apply only the reviewed upgrade file through
-   a verified atomic execution path. Do not assume a migration ledger or replay
-   the existing migration directory.
-4. Re-check row counts and compare every preserved column in every existing row,
-   using exact projections or deterministic hashes rather than sampling.
-
-An existing SQLite coordinator store also requires an explicit upgrade. Opening
-a store or reading account status must never rebuild its tables automatically.
-Fresh stores use the new schema directly; old stores fail with an actionable
-upgrade-required result until an operator runs the reviewed migration.
-
-Cloudflare documents transactional rollback for Worker `db.batch()` and failure
-recovery for remote SQL-file import. Wrangler 4.127.1 uses the D1 import service
-for remote `execute --file`; it does not apply that file one statement at a time
-through its command-query path. The exact copy/check/swap file must still pass
-non-live D1 runtime tests, including injected failures before and after each
-table swap and deliberately failing the check-table assertion, before those
-guarantees are used for a rollout. That assertion failure must roll back the
-entire import, including all previously executed copy and DDL statements.
-
-The D1 file has no explicit `BEGIN` or `COMMIT`; D1 owns that transaction. A local
-SQLite upgrade uses an explicit immediate transaction. Neither path may rely on
-`PRAGMA foreign_keys = OFF`: D1 enforces foreign keys, and deferring checks does
-not suppress cascading deletes. Preflight and fixtures must cover referenced
-tables, triggers, indexes, and views, as well as row contents.
-
-The old auth writer omits `authority_kind`, while the new schema requires it.
-The code/schema cutover therefore needs a coordinated writer pause, not an
-implicit administrator default or a compatibility shim. Time Travel restore is
-a separately controlled recovery operation that overwrites current data, not a
-routine rollback step.
-
-References: [D1 batch transactions](https://developers.cloudflare.com/d1/worker-api/d1-database/),
-[remote SQL-file execution](https://developers.cloudflare.com/d1/get-started/),
-[D1 foreign keys](https://developers.cloudflare.com/d1/sql-api/foreign-keys/), and
-[Time Travel](https://developers.cloudflare.com/d1/reference/time-travel/).
-
-The coordinator and viewer ship together. Ordinary signed-device sync routes,
-enrollments, keys, and memory history do not change.
+This contract does not authorize a migration, restore, deployment, or any remote
+database operation. References: [D1 batch transactions](https://developers.cloudflare.com/d1/worker-api/d1-database/)
+and [D1 platform limits](https://developers.cloudflare.com/d1/platform/limits/).
 
 ### Eligibility
 
@@ -961,14 +886,15 @@ After OIDC/JWS verification and the original cookie, CSRF, and Origin checks,
 future public handlers **must** issue a normal sign-in session through
 `signInWithConsumedBrowserTransaction`, as defined by the
 [session admission contract](coordinator-auth-session-admission.md). The older
-`signInWithAuthAccount` helper remains trusted internal only and is not a public
-handler substitute.
+`signInWithAuthAccount` helper is retired and not part of the current public
+handler contract.
 
 Successful device finalization does not return a browser cookie to the CLI and
 does not treat a runtime credential as a browser session. The original browser
 transaction cookie can redeem finalized status once; only that browser then gets
 the account-management session. A new requester cannot follow the authorization
-link to redeem it.
+link to redeem it. Any older unbound redemption path is retired and not part of
+the current contract.
 
 The session cookie is `__Host-codemem-session`: an opaque random 32-byte value,
 `Secure`, `HttpOnly`, `SameSite=Lax`, `Path=/`, and no `Domain`. The server stores

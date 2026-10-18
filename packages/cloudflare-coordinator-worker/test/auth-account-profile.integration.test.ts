@@ -2,6 +2,8 @@ import { env } from "cloudflare:workers";
 import { randomUUID } from "node:crypto";
 import { D1CoordinatorStore } from "@codemem/core/internal/cloudflare-coordinator";
 import { afterEach, expect, it } from "vitest";
+import { consumeNativeLinkProof } from "./native-auth-proof-fixture.js";
+import { disposeNativeAuthFixture } from "./owner-ceremony-test-fixtures.js";
 import { browserProofConfig, consumeSigninProof } from "../../core/src/coordinator-auth-browser-proof-test-fixtures.js";
 
 type Fixture = Awaited<ReturnType<typeof fixture>>;
@@ -23,13 +25,9 @@ const full = {
 };
 
 afterEach(async () => {
+	await disposeNativeAuthFixture();
 	for (const f of owned.splice(0)) {
 		await env.COORDINATOR_DB.batch([
-			...[profiles, ...authorityTables].map((table) =>
-				env.COORDINATOR_DB.prepare(`DELETE FROM ${table} WHERE coordinator_id = ?`).bind(
-					f.coordinatorId,
-				),
-			),
 			env.COORDINATOR_DB.prepare("DELETE FROM enrolled_devices WHERE group_id = ?").bind(f.groupId),
 			env.COORDINATOR_DB.prepare("DELETE FROM groups WHERE group_id = ?").bind(f.groupId),
 		]);
@@ -57,6 +55,7 @@ async function fixture() {
 		issuer: "https://accounts.example.test",
 		revision: "a".repeat(64),
 		enabled: true,
+		redirectUri: "https://app.example.test/callback",
 	};
 	const signer = review;
 	const start = {
@@ -64,16 +63,17 @@ async function fixture() {
 		attemptId: randomUUID(),
 		signer,
 		runtimeVerifierHash: hash(),
+		browserStartHash: hash(),
 		loopbackRedirect: "http://127.0.0.1:4567/codemem/auth/complete",
 	};
-	const browser = { attemptId: start.attemptId, browserTransactionHash: hash() };
+	const browser = { attemptId: start.attemptId, browserTransactionHash: hash(), binderHash: "" };
 	const confirm = { ...browser, completionSecretHash: hash() };
 	const account = { issuer: cfg.issuer, subject: "fixture-subject" };
 	await store.createGroup(review.groupId, "Fixture group");
 	await store.enrollDevice(review.groupId, { ...signer, identityId: null });
 	expect(await store.createAuthControllerAttestation(review)).toMatchObject({ kind: "created" });
 	expect(await store.createAuthLinkAttempt(start, cfg)).toMatchObject({ kind: "created" });
-	expect(await store.claimAuthLinkAttempt(browser, cfg)).toMatchObject({ kind: "applied" });
+	await consumeNativeLinkProof({ store, cfg }, start, browser);
 	expect(await store.recordAuthLinkOidcVerified({ ...browser, account }, cfg)).toMatchObject({
 		kind: "applied",
 	});
@@ -134,7 +134,7 @@ it("persists only display snapshots and refuses delayed or equal-time clobbering
 	const f = await fixture();
 	const firstLinkHash = hash();
 	expect(
-		await f.store.redeemAuthLinkSession({ ...f.browser, credentialHash: firstLinkHash }, f.cfg),
+		await f.store.redeemAuthLinkSessionWithBrowserTransaction({ ...f.browser, credentialHash: firstLinkHash }, f.cfg),
 	).toMatchObject({ kind: "issued" });
 	const old = await signIn(f);
 	const before = await authority(f);
@@ -153,8 +153,8 @@ it("persists only display snapshots and refuses delayed or equal-time clobbering
 	const rich = await signIn(f);
 	expect(await record(f, rich.credentialHash)).toEqual({ kind: "recorded" });
 	f.time.now += 1;
-	const newest = await signIn(f);
 	const equal = await signIn(f);
+	const newest = await signIn(f);
 	const stable = await authority(f);
 	const newestProfile = { displayName: "Newest" };
 	expect(await record(f, newest.credentialHash, newestProfile)).toEqual({ kind: "recorded" });
@@ -173,6 +173,7 @@ it("persists only display snapshots and refuses delayed or equal-time clobbering
 			picture_url: null,
 			source_session_id: newest.session.sessionId,
 			source_signed_in_at_ms: NOW + 2,
+			source_order: expect.any(Number),
 		},
 	]);
 	for (const secret of ["fixture-raw-token", f.account.subject, old.credentialHash])

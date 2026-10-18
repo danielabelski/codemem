@@ -2,11 +2,14 @@ import { D1CoordinatorStore } from "@codemem/core/internal/cloudflare-coordinato
 import { env } from "cloudflare:workers";
 import { randomUUID } from "node:crypto";
 import { afterEach, expect, it } from "vitest";
+import { consumeNativeLinkProof } from "./native-auth-proof-fixture.js";
+import { disposeNativeAuthFixture } from "./owner-ceremony-test-fixtures.js";
+import { failNativeAuthBatch } from "./native-auth-fault-fixture.js";
 import { browserProofConfig, consumeSigninProof } from "../../core/src/coordinator-auth-browser-proof-test-fixtures.js";
 
-type Config = Parameters<D1CoordinatorStore["createAuthLinkAttempt"]>[1];
+type Config = Parameters<D1CoordinatorStore["redeemAuthLinkSessionWithBrowserTransaction"]>[1];
 type Fixture = Awaited<ReturnType<typeof createFixture>>;
-type IssueResult = Awaited<ReturnType<D1CoordinatorStore["redeemAuthLinkSession"]>>;
+type IssueResult = Awaited<ReturnType<D1CoordinatorStore["redeemAuthLinkSessionWithBrowserTransaction"]>>;
 const NOW = 1790899200000;
 const SESSION_TTL = 28800000;
 const ATTEMPT_TTL = 600000;
@@ -26,13 +29,9 @@ function hash() {
 }
 
 afterEach(async () => {
+	await disposeNativeAuthFixture();
 	for (const f of owned.splice(0)) {
 		await env.COORDINATOR_DB.batch([
-			...[sessions, receipts, audit, links, attempts, controllers].map((table) =>
-				env.COORDINATOR_DB.prepare(`DELETE FROM ${table} WHERE coordinator_id = ?`).bind(
-					f.coordinatorId,
-				),
-			),
 			env.COORDINATOR_DB.prepare("DELETE FROM enrolled_devices WHERE group_id = ?").bind(f.groupId),
 			env.COORDINATOR_DB.prepare("DELETE FROM groups WHERE group_id = ?").bind(f.groupId),
 		]);
@@ -51,6 +50,7 @@ async function createFixture() {
 	const cfg: Config = {
 		coordinatorId: review.coordinatorId, issuer: "https://accounts.example.test",
 		revision: "a".repeat(64), enabled: true,
+		redirectUri: "https://app.example.test/callback",
 	};
 	const signer = {
 		groupId: review.groupId, deviceId: review.deviceId,
@@ -59,9 +59,10 @@ async function createFixture() {
 	const start = {
 		authority: { kind: "controller_attestation" as const },
 		attemptId: randomUUID(), signer, runtimeVerifierHash: hash(),
+		browserStartHash: hash(),
 		loopbackRedirect: "http://127.0.0.1:4567/codemem/auth/complete",
 	};
-	const browser = { attemptId: start.attemptId, browserTransactionHash: hash() };
+	const browser = { attemptId: start.attemptId, browserTransactionHash: hash(), binderHash: "" };
 	const confirm = { ...browser, completionSecretHash: hash() };
 	const account = { issuer: cfg.issuer, subject: randomUUID() };
 	const finalize = {
@@ -80,7 +81,7 @@ async function createFixture() {
 
 async function confirmLink(f: Fixture) {
 	expect(await f.store.createAuthLinkAttempt(f.start, f.cfg)).toMatchObject({ kind: "created" });
-	expect(await f.store.claimAuthLinkAttempt(f.browser, f.cfg)).toMatchObject({ kind: "applied" });
+	await consumeNativeLinkProof(f, f.start, f.browser);
 	expect(await f.store.recordAuthLinkOidcVerified({ ...f.browser, account: f.account }, f.cfg))
 		.toMatchObject({ kind: "applied" });
 	expect(await f.store.confirmAuthLinkAttempt(f.confirm, f.cfg)).toMatchObject({ kind: "applied" });
@@ -137,7 +138,7 @@ it("redeems only the original browser once and keeps finalize replay public", as
 	const unknownInput = { ...signIn(f), account: { ...f.account, subject: randomUUID() } };
 	await consumeSigninProof(f, unknownInput.browserTransactionHash);
 	// Act: a wrong browser and an unknown account must not consume anything.
-	const wrongBrowser = await f.store.redeemAuthLinkSession({
+	const wrongBrowser = await f.store.redeemAuthLinkSessionWithBrowserTransaction({
 		...first, browserTransactionHash: hash(),
 	}, f.cfg);
 	const unknown = await f.store.signInWithConsumedBrowserTransaction(unknownInput, browserProofConfig(f));
@@ -145,10 +146,10 @@ it("redeems only the original browser once and keeps finalize replay public", as
 		...signIn(f), browserTransactionHash: f.browser.browserTransactionHash,
 	}, browserProofConfig(f));
 	const results = await Promise.all([
-		f.store.redeemAuthLinkSession(first, f.cfg),
-		f.store.redeemAuthLinkSession(second, f.cfg),
+		f.store.redeemAuthLinkSessionWithBrowserTransaction(first, f.cfg),
+		f.store.redeemAuthLinkSessionWithBrowserTransaction(second, f.cfg),
 	]);
-	const replay = await f.store.redeemAuthLinkSession(redeem(f), f.cfg);
+	const replay = await f.store.redeemAuthLinkSessionWithBrowserTransaction(redeem(f), f.cfg);
 	const publicReplay = await f.store.finalizeAuthLinkAttempt(f.finalize, f.cfg);
 	// Assert: one durable receipt/session; replay never returns the old credential.
 	expect(wrongBrowser).toEqual({ kind: "rejected", error: "attempt_unavailable" });
@@ -182,7 +183,7 @@ it("expires absolutely and rotates sessions without reenrolling a known account"
 	const f = await createFixture();
 	await linkAccount(f);
 	const input = redeem(f);
-	const issued = await expectIssued(await f.store.redeemAuthLinkSession(input, f.cfg), f);
+	const issued = await expectIssued(await f.store.redeemAuthLinkSessionWithBrowserTransaction(input, f.cfg), f);
 	const before = await grants(f);
 	// Act: reads never extend the eight-hour expiry; current revision is independent of genesis.
 	f.time.now = issued.expiresAtMs - 1;
@@ -225,14 +226,14 @@ it("enforces both redemption deadlines and the maximum safe session clock", asyn
 		// Act: exactly at either deadline is rejected; at the safe clock maximum succeeds.
 		if (scenario === "redeem-window") f.time.now += REDEEM_WINDOW;
 		if (scenario === "original-deadline") f.time.now += 30000;
-		const denied = await f.store.redeemAuthLinkSession(redeem(f), f.cfg);
+		const denied = await f.store.redeemAuthLinkSessionWithBrowserTransaction(redeem(f), f.cfg);
 		// Assert: deadline rejection writes nothing and an immediately earlier retry succeeds.
 		if (scenario !== "maximum-clock") {
 			expect(denied).toEqual({ kind: "rejected", error: "redeem_window_expired" });
 			await expectSessionCounts(f, 0);
 			expect((await rows(f, attempts))[0]?.state).toBe("finalized");
 			f.time.now -= 1;
-			await expectIssued(await f.store.redeemAuthLinkSession(redeem(f), f.cfg), f);
+			await expectIssued(await f.store.redeemAuthLinkSessionWithBrowserTransaction(redeem(f), f.cfg), f);
 		} else {
 			const session = await expectIssued(denied, f, finalizedAt);
 			expect(session.expiresAtMs).toBe(Number.MAX_SAFE_INTEGER);
@@ -251,7 +252,7 @@ it("logs out only one session and admin revocation preserves link tombstones", a
 	const first = redeem(f);
 	const second = signIn(f);
 	await consumeSigninProof(f, second.browserTransactionHash);
-	const issued = await expectIssued(await f.store.redeemAuthLinkSession(first, f.cfg), f);
+	const issued = await expectIssued(await f.store.redeemAuthLinkSessionWithBrowserTransaction(first, f.cfg), f);
 	const other = await expectIssued(await f.store.signInWithConsumedBrowserTransaction(second, browserProofConfig(f)), f);
 	const before = await grants(f);
 	const scope = { coordinatorId: f.cfg.coordinatorId };
@@ -298,11 +299,11 @@ it("logs out only one session and admin revocation preserves link tombstones", a
 });
 
 async function expectTombstoneConflict(f: Fixture) {
-	const start = { ...f.start, attemptId: randomUUID(), runtimeVerifierHash: hash() };
+	const start = { ...f.start, attemptId: randomUUID(), runtimeVerifierHash: hash(), browserStartHash: hash() };
 	const browser = { attemptId: start.attemptId, browserTransactionHash: hash() };
 	const confirm = { ...browser, completionSecretHash: hash() };
 	expect(await f.store.createAuthLinkAttempt(start, f.cfg)).toMatchObject({ kind: "created" });
-	expect(await f.store.claimAuthLinkAttempt(browser, f.cfg)).toMatchObject({ kind: "applied" });
+	await consumeNativeLinkProof(f, start, { ...browser, binderHash: "" });
 	expect(await f.store.recordAuthLinkOidcVerified({ ...browser, account: f.account }, f.cfg))
 		.toMatchObject({ kind: "applied" });
 	expect(await f.store.confirmAuthLinkAttempt(confirm, f.cfg)).toMatchObject({ kind: "applied" });
@@ -316,18 +317,8 @@ async function expectTombstoneConflict(f: Fixture) {
 	expect(await rows(f, audit)).toEqual(priorAudit);
 }
 
-async function installFault(f: Fixture, target: "session-insert" | "attempt-update") {
-	const name = `fixture_auth_session_${randomUUID().replaceAll("-", "")}`;
-	let event = `BEFORE INSERT ON ${sessions}`;
-	let condition = `NEW.coordinator_id = '${f.cfg.coordinatorId}'`;
-	if (target === "attempt-update") {
-		event = `BEFORE UPDATE OF state ON ${attempts}`;
-		condition += " AND NEW.state = 'session_redeemed'";
-	}
-	// Generated UUID scope prevents this local fault from touching another fixture.
-	await env.COORDINATOR_DB.prepare(`CREATE TRIGGER ${name} ${event} WHEN ${condition}
-		BEGIN SELECT RAISE(ABORT, 'fixture_session_failure'); END`).run();
-	return name;
+async function installFault(_f: Fixture, target: "session-insert" | "attempt-update") {
+	return failNativeAuthBatch(target === "session-insert" ? `INSERT INTO ${sessions}` : `UPDATE ${attempts} SET state = 'session_redeemed'`);
 }
 
 it("rolls back receipt, session and attempt on real D1 statement failures", async () => {
@@ -338,20 +329,20 @@ it("rolls back receipt, session and attempt on real D1 statement failures", asyn
 		const before = await rows(f, attempts);
 		const beforeGrants = await grants(f);
 		const input = redeem(f);
-		const trigger = await installFault(f, target);
+		const restoreFault = await installFault(f, target);
 		try {
 			// Act
-			await expect(f.store.redeemAuthLinkSession(input, f.cfg))
+			await expect(f.store.redeemAuthLinkSessionWithBrowserTransaction(input, f.cfg))
 				.rejects.toThrow(/^auth_session_persistence_error$/);
 			// Assert: the complete original finalized row and every proof commitment survive.
 			expect(await rows(f, attempts)).toEqual(before);
 			await expectSessionCounts(f, 0);
 			expect(await grants(f)).toEqual(beforeGrants);
 		} finally {
-			await env.COORDINATOR_DB.prepare(`DROP TRIGGER IF EXISTS ${trigger}`).run();
+			restoreFault();
 		}
-		// Act / Assert: removing only our trigger allows an unchanged successful retry.
-		await expectIssued(await f.store.redeemAuthLinkSession(input, f.cfg), f);
+		// Act / Assert: removing only the execution fault allows an unchanged successful retry.
+		await expectIssued(await f.store.redeemAuthLinkSessionWithBrowserTransaction(input, f.cfg), f);
 		await expectSessionCounts(f, 1);
 		expect((await rows(f, attempts))[0]?.state).toBe("session_redeemed");
 		expect(await grants(f)).toEqual(beforeGrants);

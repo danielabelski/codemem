@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
+import { failAuthStatementRun } from "./coordinator-auth-fault-test-fixture.js";
 import { AUTH_LINK_PROFILE_SCHEMA_SQL } from "./coordinator-auth-link-profile.js";
 import {
 	advance,
@@ -188,8 +189,7 @@ function registerAtomicVerificationTests(test: ReturnType<typeof backendTest>) {
 		await advance(f, "browser_claimed");
 		const before = snapshot(f);
 		const input = { ...proof, account, profile };
-		f.db.exec(`CREATE TRIGGER fail_profile_insert BEFORE INSERT ON ${TABLE}
- BEGIN SELECT RAISE(ABORT, 'fixture staging failure'); END;`);
+		const restore = failAuthStatementRun(f.db, `INSERT INTO ${TABLE}`);
 		// Act / Assert: neither the state nor account subject may survive a failed stage.
 		await expect(f.store.recordAuthLinkOidcVerified(input, f.cfg)).rejects.toThrow(
 			"auth_link_persistence_error",
@@ -208,7 +208,7 @@ function registerAtomicVerificationTests(test: ReturnType<typeof backendTest>) {
 		});
 		expect(rows(f)).toEqual([]);
 		// Act: remove only the fixture fault and retry the same verified input.
-		f.db.exec("DROP TRIGGER fail_profile_insert");
+		restore();
 		const retry = await f.store.recordAuthLinkOidcVerified(input, f.cfg);
 		// Assert
 		expect(retry).toMatchObject({ kind: "applied", status: { state: "oidc_verified" } });
@@ -266,9 +266,19 @@ function registerPrivacyTests(test: ReturnType<typeof backendTest>) {
 		await verified(f);
 		await confirmed(f);
 		f.db
+			.prepare("INSERT INTO coordinator_auth_account_associations VALUES (?,?,?,?,?,?)")
+			.run(
+				f.cfg.coordinatorId,
+				account.issuer,
+				account.subject,
+				"other-identity",
+				"existing-link",
+				f.now,
+			);
+		f.db
 			.prepare(`INSERT INTO coordinator_auth_account_links
- (coordinator_id,link_id,issuer,subject,identity_id,attempt_id,controller_attestation_id,auth_config_revision,created_at_ms,authority_kind)
- VALUES (?,?,?,?,?,?,?,?,?,'controller_attestation')`)
+ (coordinator_id,link_id,issuer,subject,identity_id,attempt_id,controller_attestation_id,auth_config_revision,created_at_ms,authority_kind,generation,signin_sequence_floor)
+ VALUES (?,?,?,?,?,?,?,?,?,'controller_attestation',1,0)`)
 			.run(
 				f.cfg.coordinatorId,
 				"existing-link",
@@ -331,13 +341,19 @@ for (const backend of ["SQLite", "D1"] as const) {
 	});
 }
 
-it("the reviewed migration and fresh Worker schema include the exact new table definition", () => {
+it("the frozen migration retains V2 while the current Worker snapshot contains V3 profile storage", async () => {
+	// Arrange
 	const worker = new URL("../../cloudflare-coordinator-worker/", import.meta.url);
+	const { AUTH_LIFECYCLE_LINK_PROFILE_TABLE_SQL } = await import(
+		"./coordinator-auth-lifecycle-profile-schema.js"
+	);
+	// Act
 	const migration = readFileSync(
 		new URL("migrations/0033_add_auth_link_profiles.sql", worker),
 		"utf8",
 	);
 	const schema = readFileSync(new URL("schema.sql", worker), "utf8");
+	// Assert: these inputs intentionally belong to different schema generations.
 	expect(migration).toContain(AUTH_LINK_PROFILE_SCHEMA_SQL.trim());
-	expect(schema).toContain(AUTH_LINK_PROFILE_SCHEMA_SQL.trim());
+	expect(schema).toContain(AUTH_LIFECYCLE_LINK_PROFILE_TABLE_SQL.trim());
 });

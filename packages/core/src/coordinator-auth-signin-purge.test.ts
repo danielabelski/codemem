@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { describe, expect, it, vi } from "vitest";
+import { withBrowserHash } from "./coordinator-auth-browser-proof-test-fixtures.js";
 import { CoordinatorAuthBrowserTransactions } from "./coordinator-auth-browser-transaction.js";
 import { AUTH_BROWSER_TXN_SCHEMA_SQL } from "./coordinator-auth-browser-transaction-contract.js";
 import {
@@ -12,17 +13,20 @@ import {
 	TABLE,
 	transactionRows,
 } from "./coordinator-auth-browser-transaction-test-fixtures.js";
+import { failAuthStatementRun } from "./coordinator-auth-fault-test-fixture.js";
 import type { AuthLinkBackend, AuthLinkStatement } from "./coordinator-auth-link.js";
 import {
 	attempt,
 	authorize,
 	backendTest,
+	browserSequence,
 	expectRejected,
 	type LinkFixture,
 	NOW,
 	type Test,
 	TTL,
 } from "./coordinator-auth-link-test-fixtures.js";
+import { CoordinatorAuthSchemaUpgradeRequiredError } from "./coordinator-auth-schema.js";
 import { linked, sessionRows, signInInput } from "./coordinator-auth-session-test-fixtures.js";
 import type { Backend } from "./coordinator-auth-store-test-fixtures.js";
 
@@ -54,7 +58,13 @@ function protectedData(f: LinkFixture) {
 			"SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT IN (?,?) ORDER BY name",
 		)
 		.all(TABLE, FLOOR) as { name: string }[];
-	return tables.map(({ name }) => [name, f.db.prepare(`SELECT * FROM "${name}"`).all()]);
+	return tables.map(({ name }) => {
+		const sql =
+			name === "sqlite_sequence"
+				? "SELECT * FROM sqlite_sequence WHERE name <> 'coordinator_auth_browser_transactions'"
+				: `SELECT * FROM "${name}"`;
+		return [name, f.db.prepare(sql).all()];
+	});
 }
 function snapshot(f: LinkFixture) {
 	return [transactionRows(f), f.db.prepare(`SELECT * FROM ${FLOOR}`).all(), protectedData(f)];
@@ -87,7 +97,12 @@ function setCreated(f: LinkFixture, id: number, created: number) {
 async function startLink(f: LinkFixture) {
 	await authorize(f);
 	await f.store.createAuthLinkAttempt(attempt(), f.cfg);
-	const input = { ...materials(500), purpose: "link" as const, attemptId: "attempt-a" };
+	const input = {
+		...materials(500),
+		purpose: "link" as const,
+		attemptId: "attempt-a",
+		browserStartHash: attempt().browserStartHash,
+	};
 	expect((await f.store.startAuthBrowserTransaction(input, config)).kind).toBe("started");
 	return input;
 }
@@ -126,6 +141,7 @@ function registerEligibility(test: Test) {
 		f.db.prepare(`UPDATE ${TABLE} SET coordinator_id='other' WHERE state_hash=?`).run(hash(20005));
 		const before = transactionRows(f);
 		const protectedBefore = protectedData(f);
+		const sequenceBefore = browserSequence(f);
 		f.now = NOW + AGE;
 		// Act
 		const result = await purge(f);
@@ -144,6 +160,7 @@ function registerEligibility(test: Test) {
 		))
 			expect(Number(row.created_at_ms)).toBeLessThanOrEqual(floor(f) ?? -1);
 		expect(protectedData(f)).toEqual(protectedBefore);
+		expect(browserSequence(f)).toBe(sequenceBefore);
 	});
 	test("expired future-born links and unrelated ceremony data stay identical", async ({
 		fixture: f,
@@ -281,7 +298,9 @@ function registerFloors(test: Test) {
 		// Arrange
 		seed(f, 1024);
 		f.now = NOW + AGE + 10;
+		const sequenceBefore = browserSequence(f);
 		for (let index = 0; index < 4; index++) await purge(f);
+		expect(browserSequence(f)).toBe(sequenceBefore);
 		const before = protectedData(f);
 		// Act
 		const denied = [];
@@ -298,6 +317,7 @@ function registerFloors(test: Test) {
 		expect(allowed.kind).toBe("started");
 		expect(floor(f)).toBe(NOW);
 		expect(protectedData(f)).toEqual(before);
+		expect(browserSequence(f)).toBe(sequenceBefore + 1);
 	});
 	test("live rolling-window cap remains 1024 after old rows are purged", async ({ fixture: f }) => {
 		// Arrange
@@ -320,9 +340,19 @@ function registerFloors(test: Test) {
 		seed(f, 2);
 		f.now += AGE;
 		await purge(f, scope, { limit: 1 });
-		f.db.exec(
-			`CREATE TRIGGER no_floor_rewrite BEFORE UPDATE ON ${FLOOR} BEGIN SELECT RAISE(ABORT,'unexpected-floor-write'); END`,
-		);
+		const prepare = f.db.prepare.bind(f.db);
+		const spy = vi.spyOn(f.db, "prepare").mockImplementation((sql) => {
+			const statement = prepare(sql);
+			if (sql.startsWith(`INSERT INTO ${FLOOR}`)) {
+				const run = statement.run.bind(statement);
+				vi.spyOn(statement, "run").mockImplementation((...values) => {
+					const result = run(...values);
+					expect(result.changes).toBe(0);
+					return result;
+				});
+			}
+			return statement;
+		});
 		const equal = await purge(f);
 		f.now = NOW + 1;
 		seed(f, 1, NOW - AGE);
@@ -348,6 +378,7 @@ function registerFloors(test: Test) {
 		expect(floor(f, "other")).toBeNull();
 		expectRejected(denied, "clock_retention_blocked");
 		expect(foreign.kind).toBe("started");
+		spy.mockRestore();
 	});
 	test("future-created eligible data imposes a known availability wait through F plus one hour", async ({
 		fixture: f,
@@ -451,15 +482,22 @@ function registerReplay(test: Test) {
 			attempt({ attemptId: "attempt-b", runtimeVerifierHash: hash(999) }),
 			f.cfg,
 		);
-		const oldClaim = await f.store.claimAuthLinkAttempt(
-			{ attemptId: "attempt-b", browserTransactionHash: input.browserTransactionHash },
-			f.cfg,
+		const oldClaim = await withBrowserHash(input.browserTransactionHash, () =>
+			f.store.startAuthBrowserTransaction(
+				{
+					...materials(900),
+					purpose: "link",
+					attemptId: "attempt-b",
+					browserStartHash: attempt({ attemptId: "attempt-b" }).browserStartHash,
+				},
+				f.cfg,
+			),
 		);
 		const fresh = await f.store.startAuthBrowserTransaction(materials(), config);
 		// Assert: state/binder collision detection is retention-scoped; receipts are not.
 		expectRejected(collision, "transaction_conflict");
 		expectRejected(replay, "browser_transaction_used");
-		expectRejected(oldClaim, "attempt_unavailable");
+		expectRejected(oldClaim, "transaction_conflict");
 		expect(fresh.kind).toBe("started");
 		expect(transactionRows(f).filter((row) => row.purpose === "signin")).toHaveLength(1);
 		expect(
@@ -480,8 +518,9 @@ function registerFaults(test: Test) {
 			f.now += AGE;
 			const table = stage === "floor" ? FLOOR : TABLE;
 			const operation = stage === "floor" ? "INSERT" : "DELETE";
-			f.db.exec(
-				`CREATE TRIGGER fault BEFORE ${operation} ON ${table} BEGIN SELECT RAISE(ABORT,'private-provider-nonce-marker'); END`,
+			const restore = failAuthStatementRun(
+				f.db,
+				`${operation} ${stage === "floor" ? "INTO" : "FROM"} ${table}`,
 			);
 			const before = transactionRows(f);
 			const protectedBefore = protectedData(f);
@@ -494,6 +533,7 @@ function registerFaults(test: Test) {
 			expect(transactionRows(f)).toEqual(before);
 			expect(protectedData(f)).toEqual(protectedBefore);
 			expect(floor(f)).toBe(stage === "floor" ? null : NOW);
+			restore();
 		},
 	);
 	test("insertion between stages above the captured floor survives until the next floor advance", async ({
@@ -526,7 +566,7 @@ function registerFaults(test: Test) {
 		expect(floor(f)).toBe(NOW + 1);
 		expect(transactionRows(f)).toEqual([]);
 	});
-	test("missing floor table sanitizes signin and purge failures but does not affect link start", async ({
+	test("missing floor table fails closed for signin, purge and link start before auth writes", async ({
 		fixture: f,
 	}) => {
 		// Arrange
@@ -537,17 +577,23 @@ function registerFaults(test: Test) {
 		const errors = await Promise.all([
 			f.store.startAuthBrowserTransaction(materials(), config).catch((error: unknown) => error),
 			purge(f).catch((error: unknown) => error),
+			f.store
+				.startAuthBrowserTransaction(
+					{
+						...materials(2),
+						purpose: "link",
+						attemptId: "attempt-a",
+						browserStartHash: attempt().browserStartHash,
+					},
+					config,
+				)
+				.catch((error: unknown) => error),
 		]);
-		const link = await f.store.startAuthBrowserTransaction(
-			{ ...materials(2), purpose: "link", attemptId: "attempt-a" },
-			config,
-		);
 		// Assert
 		for (const error of errors) {
-			expect(error).toMatchObject({ message: "auth_browser_transaction_persistence_error" });
-			expect((error as Error).cause).toBeUndefined();
+			expect(error).toBeInstanceOf(CoordinatorAuthSchemaUpgradeRequiredError);
 		}
-		expect(link.kind).toBe("started");
+		expect(transactionRows(f)).toEqual([]);
 	});
 }
 
@@ -640,14 +686,13 @@ function registerValidation(test: Test) {
 		async (now, { fixture: f }) => {
 			// Arrange
 			f.now = now;
-			f.db.exec(
-				`CREATE TRIGGER no_floor_insert BEFORE INSERT ON ${FLOOR} BEGIN SELECT RAISE(ABORT,'unexpected-write'); END`,
-			);
+			const before = f.db.prepare("SELECT total_changes() AS changes").get();
 			// Act
 			const result = await purge(f, scope, {});
 			// Assert
 			expect(result).toEqual(purged());
 			expect(floor(f)).toBeNull();
+			expect(f.db.prepare("SELECT total_changes() AS changes").get()).toEqual(before);
 		},
 	);
 }

@@ -1,6 +1,8 @@
 import { readdirSync, readFileSync } from "node:fs";
 import Database, { type Database as SqliteDatabase } from "better-sqlite3";
-import { connectCoordinator } from "./better-sqlite-coordinator-store.js";
+import { COORDINATOR_AUTH_DEVICE_CLAIM_SCHEMA_SQL } from "./coordinator-auth-device-claim-schema.js";
+import { AUTH_ONLY_PREDECESSOR_MIGRATION_NAMES } from "./coordinator-auth-historical-migration-test-fixture.js";
+import { AUTH_LIFECYCLE_PREDECESSOR_DEFINITIONS } from "./coordinator-auth-lifecycle-predecessor-shapes.js";
 import { AUTH_LINK_AUTHORITY_CUTOVER_SQL } from "./coordinator-auth-link-authority-upgrade.js";
 
 export const LEGACY_AUTH_TABLES = [
@@ -144,18 +146,52 @@ function legacyRow(db: SqliteDatabase, table: string, index: number) {
 	if (!table.endsWith("device_claims")) row.rowid = [7, 103, 1009, 3007, 4013, 5003, 7001][index];
 	return row;
 }
-export function populatedPredecessor(source: "inline" | "migrations"): SqliteDatabase {
-	let db: SqliteDatabase;
-	if (source === "inline") db = connectCoordinator(":memory:");
-	else {
-		db = new Database(":memory:");
-		const directory = new URL("../../cloudflare-coordinator-worker/migrations/", import.meta.url);
+/** Closed pre-V3 inputs: never let a current constructor choose historical DDL. */
+export function frozenCallerDatabase(): SqliteDatabase {
+	const db = new Database(":memory:");
+	const directory = new URL("../../cloudflare-coordinator-worker/migrations/", import.meta.url);
+	const auth = new Set<string>(AUTH_ONLY_PREDECESSOR_MIGRATION_NAMES);
+	try {
 		for (const name of readdirSync(directory)
 			.filter((name) => /^00(?:[0-2]\d|3[0-3])_.*\.sql$/u.test(name))
-			.sort())
-			db.exec(readFileSync(new URL(name, directory), "utf8"));
-		db.exec(AUTH_LINK_AUTHORITY_CUTOVER_SQL);
+			.sort()) {
+			if (!auth.has(name)) db.exec(readFileSync(new URL(name, directory), "utf8"));
+		}
+		return db;
+	} catch (error) {
+		db.close();
+		throw error;
 	}
+}
+export function frozenV2Database(source: "inline" | "migrations" = "inline"): SqliteDatabase {
+	const db = source === "inline" ? frozenCallerDatabase() : new Database(":memory:");
+	const directory = new URL("../../cloudflare-coordinator-worker/migrations/", import.meta.url);
+	try {
+		if (source === "migrations")
+			for (const name of readdirSync(directory)
+				.filter((name) => /^00(?:[0-2]\d|3[0-3])_.*\.sql$/u.test(name))
+				.sort()) {
+				db.exec(readFileSync(new URL(name, directory), "utf8"));
+			}
+		if (source === "migrations") db.exec(AUTH_LINK_AUTHORITY_CUTOVER_SQL);
+		else {
+			for (const definition of AUTH_LIFECYCLE_PREDECESSOR_DEFINITIONS)
+				db.exec(definition.variants[0] as string);
+			db.exec(COORDINATOR_AUTH_DEVICE_CLAIM_SCHEMA_SQL);
+			for (const name of [
+				"0016_add_auth_controller_attestations.sql",
+				"0023_add_auth_signin_purge_floors.sql",
+			])
+				db.exec(readFileSync(new URL(name, directory), "utf8"));
+		}
+		return db;
+	} catch (error) {
+		db.close();
+		throw error;
+	}
+}
+export function populatedPredecessor(source: "inline" | "migrations"): SqliteDatabase {
+	const db = frozenV2Database(source);
 	for (const table of LEGACY_AUTH_TABLES) {
 		let indexes = [0, 1, 2];
 		if (table.endsWith("device_claims")) indexes = [1, 2];

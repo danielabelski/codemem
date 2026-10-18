@@ -14,6 +14,7 @@ import {
 	attempt,
 	backendTest,
 	browserHash,
+	browserSequence,
 	completionHash,
 	type LinkFixture,
 	rows,
@@ -44,7 +45,13 @@ function authoritySnapshot(f: LinkFixture) {
 			"SELECT name FROM sqlite_master WHERE type='table' AND name NOT IN ('coordinator_auth_link_attempts','coordinator_auth_browser_transactions') ORDER BY name",
 		)
 		.all() as { name: string }[];
-	return tables.map(({ name }) => [name, f.db.prepare(`SELECT * FROM "${name}"`).all()]);
+	return tables.map(({ name }) => {
+		const sql =
+			name === "sqlite_sequence"
+				? "SELECT * FROM sqlite_sequence WHERE name <> 'coordinator_auth_browser_transactions'"
+				: `SELECT * FROM "${name}"`;
+		return [name, f.db.prepare(sql).all()];
+	});
 }
 type Stage = "pending" | "browser_claimed" | "oidc_verified";
 async function next(f: LinkFixture, state: Stage, config = f.cfg, proof = browser) {
@@ -82,6 +89,7 @@ for (const backend of ["SQLite", "D1"] as const) {
 		// Arrange: unrelated Team membership is deliberately present in the shared seed.
 		f.db.exec(seedEnrollmentSql);
 		const before = authoritySnapshot(f);
+		const sequenceBefore = browserSequence(f);
 		// Act / Assert: every successful stage preserves all non-transaction tables.
 		expect(await f.store.createAuthLinkAttempt(request(), f.cfg)).toMatchObject({
 			kind: "created",
@@ -92,6 +100,7 @@ for (const backend of ["SQLite", "D1"] as const) {
 			kind: "started",
 			expiresAtMs: f.now + TTL,
 		});
+		expect(browserSequence(f)).toBe(sequenceBefore + 1);
 		const bound = await f.store.resolveAuthLinkBrowserTransaction(
 			{ attemptId: "attempt-a", binderHash: start().binderHash },
 			browserConfig,
@@ -155,6 +164,7 @@ for (const backend of ["SQLite", "D1"] as const) {
 			const browser = await prepare(f, state);
 			f.db.exec(mutation);
 			const before = authoritySnapshot(f);
+			const sequenceBefore = browserSequence(f);
 			// Act
 			const result = await next(f, state, f.cfg, browser);
 			// Assert
@@ -162,6 +172,7 @@ for (const backend of ["SQLite", "D1"] as const) {
 			expect(await f.store.readAuthLinkCompletionDestination(browser, f.cfg)).toBeNull();
 			expect(await f.store.getAuthLinkAttemptStatus("attempt-a", device, f.cfg)).toBeNull();
 			expect(authoritySnapshot(f)).toEqual(before);
+			expect(browserSequence(f)).toBe(sequenceBefore);
 			if (state === "pending") expect(transactionRows(f)).toEqual([]);
 		},
 	);
@@ -228,6 +239,7 @@ for (const backend of ["SQLite", "D1"] as const) {
 			await prepare(f, "pending");
 			const before = rows(f, TABLES[0]);
 			const authority = authoritySnapshot(f);
+			const sequenceBefore = browserSequence(f);
 			// Act
 			const result = await f.store.startAuthBrowserTransaction(
 				{
@@ -241,6 +253,7 @@ for (const backend of ["SQLite", "D1"] as const) {
 			expect(rows(f, TABLES[0])).toEqual(before);
 			expect(transactionRows(f)).toEqual([]);
 			expect(authoritySnapshot(f)).toEqual(authority);
+			expect(browserSequence(f)).toBe(sequenceBefore);
 		},
 	);
 	test.for(["browser_claimed", "oidc_verified"] as const)(

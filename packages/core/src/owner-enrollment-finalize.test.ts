@@ -1,5 +1,4 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
-import { upgradeAuthLifecycleSchema } from "./coordinator-auth-lifecycle-upgrade-sqlite.js";
 import type { AuthLinkBackend } from "./coordinator-auth-link.js";
 import { consumeSigninProof, NOW } from "./coordinator-auth-link-test-fixtures.js";
 import { issueBrowserCookie, readBrowserCookie } from "./coordinator-browser-credential.js";
@@ -280,8 +279,6 @@ it.each([
 
 const authorityDrift = {
 	link: `UPDATE coordinator_auth_account_links SET revoked_at_ms=${NOW}`,
-	// Keep the V2 runtime recheck until atomic V3 activation makes birth replacement impossible.
-	account: "UPDATE coordinator_auth_account_links SET subject='other-subject'",
 	grant:
 		"UPDATE coordinator_identity_group_grants SET status='revoked',revoked_at='2026-10-01' WHERE group_id='group-a'",
 	revision:
@@ -293,7 +290,6 @@ it.each(["confirm", "finalize"] as const)(
 	async (stage) => {
 		// Arrange: keep the real prepared ceremony; after upgrade this case exercises only storage.
 		await prepared(stage);
-		upgradeAuthLifecycleSchema(f.db);
 		const before = f.snapshot();
 		// Act
 		const rewrite = () =>

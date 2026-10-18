@@ -138,11 +138,11 @@ function captureStart(value: unknown): CoordinatorAuthBrowserTransactionStartInp
 		)
 			return null;
 		const browserStartHash = captureAuthLinkBrowserStartHash(value);
-		if (browserStartHash === false) return null;
+		if (browserStartHash === false || browserStartHash === null) return null;
 		return {
 			purpose: "link",
 			attemptId: attempt.value,
-			...(browserStartHash === null ? {} : { browserStartHash }),
+			browserStartHash,
 			stateHash: i.stateHash,
 			binderHash: i.binderHash,
 			nonce: i.nonce,
@@ -315,9 +315,15 @@ export class CoordinatorAuthBrowserTransactions implements CoordinatorAuthBrowse
  AND a.browser_transaction_hash = b.browser_transaction_hash AND a.issuer = b.issuer
  AND a.auth_config_revision = b.auth_config_revision
  AND (a.state IN ('finalized','session_redeemed','failed','expired') OR a.expires_at_ms <= ?))
+ THEN 'inactive'
+ WHEN b.purpose = 'link_change' AND NOT EXISTS (SELECT 1 FROM coordinator_auth_link_change_attempts change_attempt
+ WHERE change_attempt.coordinator_id = b.coordinator_id AND change_attempt.attempt_id = b.attempt_id
+ AND change_attempt.browser_transaction_hash = b.browser_transaction_hash AND change_attempt.issuer = b.issuer
+ AND change_attempt.auth_config_revision = b.auth_config_revision
+ AND change_attempt.state IN ('pending','browser_claimed','oidc_verified','confirmed') AND change_attempt.expires_at_ms > ?)
  THEN 'inactive' ELSE 'active' END AS activity
  FROM ${TABLE} b WHERE b.coordinator_id = ? AND b.binder_hash = ?`,
-			values: [c.issuer, c.revision, c.redirectUri, now, now, c.coordinatorId, i.binderHash],
+			values: [c.issuer, c.revision, c.redirectUri, now, now, now, c.coordinatorId, i.binderHash],
 		});
 		if (!row || row.activity === "inactive") return { kind: "inactive" };
 		if (row.activity === "active") return { kind: "active" };
@@ -368,7 +374,11 @@ export class CoordinatorAuthBrowserTransactions implements CoordinatorAuthBrowse
 				],
 			});
 		} catch (error) {
-			if (isAuthControllerUniqueError(error)) return rejected("transaction_conflict");
+			if (
+				isAuthControllerUniqueError(error) ||
+				String(error).includes("auth_browser_transaction_collision")
+			)
+				return rejected("transaction_conflict");
 			throw authPersistenceError(error, "auth_browser_transaction_persistence_error");
 		}
 		const row = await this.startedRow(i, c, hash, now);
@@ -449,7 +459,7 @@ export class CoordinatorAuthBrowserTransactions implements CoordinatorAuthBrowse
  WHERE a.coordinator_id = ? AND a.attempt_id = ? AND a.issuer = ? AND a.auth_config_revision = ?
  AND ${source.sql}
  AND a.state = 'pending' AND a.browser_transaction_hash IS NULL AND a.expires_at_ms > ?
- AND ((a.browser_start_hash IS NULL AND ? IS NULL) OR a.browser_start_hash = ?) AND ${FRESH_HASH}
+ AND a.browser_start_hash = ? AND ${FRESH_HASH}
  ${ASSERT_HASH_FRESH}`,
 			values: [
 				hash,
@@ -466,7 +476,6 @@ export class CoordinatorAuthBrowserTransactions implements CoordinatorAuthBrowse
 				...source.values,
 				now,
 				browserStartHash,
-				browserStartHash,
 				...freshValues(c, hash),
 				c.coordinatorId,
 				hash,
@@ -477,7 +486,7 @@ export class CoordinatorAuthBrowserTransactions implements CoordinatorAuthBrowse
  WHERE coordinator_id = ? AND attempt_id = ? AND issuer = ? AND auth_config_revision = ?
  AND ${claimSource.sql}
  AND state = 'pending' AND browser_transaction_hash IS NULL AND expires_at_ms > ?
- AND ((browser_start_hash IS NULL AND ? IS NULL) OR browser_start_hash = ?)
+ AND browser_start_hash = ?
  AND NOT EXISTS (SELECT 1 FROM coordinator_auth_session_receipts r WHERE r.coordinator_id = ? AND r.browser_transaction_hash = ?)
  AND EXISTS (SELECT 1 FROM ${TABLE} b WHERE ${MATCH_CONFIG} AND b.browser_transaction_hash = ? AND b.attempt_id = ?
  AND b.purpose = 'link' AND b.state = 'pending' AND b.state_hash = ? AND b.binder_hash = ? AND b.created_at_ms = ?
@@ -491,7 +500,6 @@ export class CoordinatorAuthBrowserTransactions implements CoordinatorAuthBrowse
 				c.revision,
 				...claimSource.values,
 				now,
-				browserStartHash,
 				browserStartHash,
 				c.coordinatorId,
 				hash,
@@ -511,7 +519,11 @@ export class CoordinatorAuthBrowserTransactions implements CoordinatorAuthBrowse
 		try {
 			await this.backend.batch(statements);
 		} catch (error) {
-			if (isAuthControllerUniqueError(error)) return rejected("transaction_conflict");
+			if (
+				isAuthControllerUniqueError(error) ||
+				String(error).includes("auth_browser_transaction_collision")
+			)
+				return rejected("transaction_conflict");
 			throw authPersistenceError(error, "auth_browser_transaction_persistence_incomplete");
 		}
 		return null;

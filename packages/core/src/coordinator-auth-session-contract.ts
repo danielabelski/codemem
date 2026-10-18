@@ -34,14 +34,11 @@ export type CoordinatorAuthLinkSessionPreserveResult =
 /** Hashes come from trusted browser authentication and a fresh 32-byte server generator.
  * Shape validation is not cryptographic evidence; raw credentials never enter this API.
  */
-export interface CoordinatorAuthLinkSessionRedeemInput {
+export interface CoordinatorAuthBoundLinkSessionRedeemInput {
 	attemptId: string;
 	browserTransactionHash: string;
 	credentialHash: string;
-}
-/** Binding hashes are derived and resolved by the trusted server, never nominated by HTTP JSON. */
-export interface CoordinatorAuthBoundLinkSessionRedeemInput
-	extends CoordinatorAuthLinkSessionRedeemInput {
+	/** Derived and resolved by the trusted server, never nominated by HTTP JSON. */
 	binderHash: string;
 }
 /** Account claims must already be independently verified by the server's OIDC ceremony. */
@@ -76,10 +73,6 @@ export interface CoordinatorAuthSessionStore {
 		scope: CoordinatorAuthSessionScope,
 		options?: CoordinatorAuthSessionPurgeOptions,
 	): Promise<CoordinatorAuthSessionPurgeResult>;
-	redeemAuthLinkSession(
-		input: CoordinatorAuthLinkSessionRedeemInput,
-		config: CoordinatorAuthLinkConfig,
-	): Promise<CoordinatorAuthSessionIssueResult>;
 	redeemAuthLinkSessionWithBrowserTransaction(
 		input: CoordinatorAuthBoundLinkSessionRedeemInput,
 		config: CoordinatorAuthBrowserConfig,
@@ -89,10 +82,6 @@ export interface CoordinatorAuthSessionStore {
 		input: CoordinatorAuthBoundLinkSessionRedeemInput,
 		config: CoordinatorAuthBrowserConfig,
 	): Promise<CoordinatorAuthLinkSessionPreserveResult>;
-	signInWithAuthAccount(
-		input: CoordinatorAuthAccountSignInInput,
-		config: CoordinatorAuthLinkConfig,
-	): Promise<CoordinatorAuthSessionIssueResult>;
 	/** Caller already verified OIDC claims, original browser binding and CSRF.
 	 * Hashes are trusted server metadata, never accepted from HTTP JSON.
 	 */

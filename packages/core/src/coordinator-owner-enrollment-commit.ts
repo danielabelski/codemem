@@ -1,4 +1,5 @@
 import type { AuthLinkBackend, AuthLinkStatement } from "./coordinator-auth-link.js";
+import { authLinkLiveGenerationSql } from "./coordinator-auth-link-liveness.js";
 import {
 	ed25519KeyIdForRevocation,
 	parseSshEd25519PublicKeyForRevocation,
@@ -31,7 +32,7 @@ export const OWNER_ACTIVE_LINK_SQL = `EXISTS (SELECT 1 FROM coordinator_auth_acc
  AND l.authority_kind = 'controller_attestation' AND l.controller_attestation_id IS NOT NULL AND l.device_claim_id IS NULL
  AND l.issuer = a.issuer AND l.subject = a.account_subject AND l.identity_id = a.identity_id
  AND l.attempt_id = a.link_attempt_id AND l.controller_attestation_id = a.link_controller_attestation_id
- AND l.auth_config_revision = a.link_auth_config_revision AND l.revoked_at_ms IS NULL)`;
+ AND l.auth_config_revision = a.link_auth_config_revision AND ${authLinkLiveGenerationSql({ link: "l" })})`;
 
 // Private SQL expressions only: a is the stored attempt in both callers.
 export function ownerExcludedLegacyDecisionSql(

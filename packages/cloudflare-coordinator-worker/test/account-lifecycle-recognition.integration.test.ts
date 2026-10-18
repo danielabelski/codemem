@@ -1,10 +1,12 @@
 import { env } from "cloudflare:workers";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { AUTH_LIFECYCLE_PREDECESSOR_PREDICATE_SQL } from "../../core/src/coordinator-auth-lifecycle-recognition.js";
+import { restoreFrozenAuthPredecessor } from "./frozen-auth-predecessor-fixture.js";
 
 const db = env.COORDINATOR_DB;
 const recognize = () => db.prepare(`SELECT (${AUTH_LIFECYCLE_PREDECESSOR_PREDICATE_SQL}) AS recognized`).first();
 beforeEach(async () => {
+	await restoreFrozenAuthPredecessor();
 	vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("network forbidden"));
 	// Reset only local Miniflare fixtures; no actual coordinator database is used.
 	await db.prepare("DROP INDEX IF EXISTS lifecycle_test_extra_index").run();

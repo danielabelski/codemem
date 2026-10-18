@@ -5,6 +5,10 @@ import Database from "better-sqlite3";
 import { describe, expect, it } from "vitest";
 import { BetterSqliteCoordinatorStore } from "./better-sqlite-coordinator-store.js";
 import {
+	AUTH_LIFECYCLE_CURRENT_READINESS_SQL,
+	AUTH_LIFECYCLE_CURRENT_READY_COUNT,
+} from "./coordinator-auth-lifecycle-current-readiness.js";
+import {
 	COORDINATOR_LEGACY_TEAM_COMPLETION_MAX_BYTES,
 	COORDINATOR_LEGACY_TEAM_COMPLETION_MAX_RECORDS,
 	type CoordinatorLegacyTeamCompletionManifestV1,
@@ -16,6 +20,7 @@ import {
 } from "./recipient-policy-identifiers.js";
 
 const EXPECTED_COORDINATOR_TABLES = [
+	"coordinator_auth_account_associations",
 	"coordinator_auth_account_links",
 	"coordinator_auth_account_profiles",
 	"coordinator_auth_browser_transactions",
@@ -23,6 +28,8 @@ const EXPECTED_COORDINATOR_TABLES = [
 	"coordinator_auth_device_claims",
 	"coordinator_auth_link_attempts",
 	"coordinator_auth_link_audit_log",
+	"coordinator_auth_link_change_attempts",
+	"coordinator_auth_link_profile_refreshes",
 	"coordinator_auth_link_profiles",
 	"coordinator_auth_session_receipts",
 	"coordinator_auth_sessions",
@@ -77,6 +84,28 @@ function legacyTeamCompletion(): CoordinatorLegacyTeamCompletionManifestV1 {
 		project_recipients: [],
 		completed_at: "2026-09-01T00:00:00.000Z",
 	};
+}
+
+function expectCurrentCoordinatorTables(store: BetterSqliteCoordinatorStore) {
+	const tables = store.db
+		.prepare(
+			"SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+		)
+		.all() as { name: string }[];
+	expect(tables.map(({ name }) => name).sort()).toEqual(EXPECTED_COORDINATOR_TABLES);
+	// Validate exact definitions and reject unexpected objects, not just table names.
+	const readiness = () => store.db.prepare(AUTH_LIFECYCLE_CURRENT_READINESS_SQL).get();
+	expect(readiness()).toEqual({ ready: AUTH_LIFECYCLE_CURRENT_READY_COUNT });
+	store.db.exec("SAVEPOINT unexpected_auth_definition");
+	try {
+		store.db.exec(
+			"CREATE INDEX fixture_unexpected_association ON coordinator_auth_account_associations(subject)",
+		);
+		expect(readiness()).not.toEqual({ ready: AUTH_LIFECYCLE_CURRENT_READY_COUNT });
+	} finally {
+		store.db.exec("ROLLBACK TO unexpected_auth_definition; RELEASE unexpected_auth_definition");
+	}
+	expect(readiness()).toEqual({ ready: AUTH_LIFECYCLE_CURRENT_READY_COUNT });
 }
 
 describe("CoordinatorStore", () => {
@@ -270,13 +299,7 @@ describe("CoordinatorStore", () => {
 		it("creates all expected tables", async () => {
 			const { store, cleanup } = setupStore();
 			try {
-				const tables = store.db
-					.prepare(
-						"SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
-					)
-					.all() as { name: string }[];
-				const names = tables.map((t) => t.name).sort();
-				expect(names).toEqual(EXPECTED_COORDINATOR_TABLES);
+				expectCurrentCoordinatorTables(store);
 			} finally {
 				await cleanup();
 			}

@@ -90,6 +90,31 @@ function snapshot(f: Fixture, except: readonly string[] = []) {
 function rows(f: Fixture, table: string) {
 	return f.db.prepare(`SELECT * FROM "${table}"`).all();
 }
+function expectFirstLinkBirth(
+	f: Fixture,
+	genesis: Record<string, unknown>,
+	browsers: Record<string, unknown>[],
+) {
+	const link = rows(f, TABLES[1])[0] as Record<string, unknown>;
+	expect(link).toMatchObject({
+		generation: 1,
+		signin_sequence_floor: browsers[0].browser_sequence,
+	});
+	expect(rows(f, "coordinator_auth_account_associations")).toEqual([
+		{
+			coordinator_id: config.coordinatorId,
+			issuer: config.issuer,
+			subject: "subject-private",
+			identity_id: "identity-a",
+			first_link_id: link.link_id,
+			created_at_ms: NOW,
+		},
+	]);
+	expect(rows(f, TABLES[0])).toEqual([
+		{ ...genesis, state: "finalized", link_id: link.link_id, finalized_at_ms: NOW },
+	]);
+	expect(rows(f, "coordinator_auth_browser_transactions")).toEqual(browsers);
+}
 function expectPrivate(text: string) {
 	for (const value of [
 		runtimeProof,
@@ -678,14 +703,20 @@ for (const backend of ["SQLite", "D1"] as const) {
 				expect(snapshot(f)).toEqual(before);
 			},
 		);
-		test("confirmed signed finalization hashes decoded bytes, retries once, and never grants access", async ({
+		test("confirmed signed finalization hashes decoded bytes, retries once, and never grants device or group access", async ({
 			f,
 			key,
 			app,
 		}) => {
 			// Arrange
 			await seed(f, key, app);
-			const protectedBefore = snapshot(f, TABLES);
+			const birthTables = [...TABLES, "coordinator_auth_account_associations"];
+			const protectedBefore = snapshot(f, birthTables);
+			const genesisBefore = rows(f, TABLES[0])[0] as Record<string, unknown>;
+			const browserBefore = rows(f, "coordinator_auth_browser_transactions") as Record<
+				string,
+				unknown
+			>[];
 			const path = `${ROOT}/attempt-a/finalize`;
 			const body = JSON.stringify(finalBody(key));
 			const init = { method: "POST", body, headers: headers(key, "POST", path, body) };
@@ -705,7 +736,8 @@ for (const backend of ["SQLite", "D1"] as const) {
 			expectPrivate(await retry.text());
 			expect(rows(f, TABLES[1])).toHaveLength(1);
 			expect(rows(f, TABLES[2])).toHaveLength(1);
-			expect(snapshot(f, TABLES)).toEqual(protectedBefore);
+			expectFirstLinkBirth(f, genesisBefore, browserBefore);
+			expect(snapshot(f, birthTables)).toEqual(protectedBefore);
 		});
 		test.for([
 			"padding",

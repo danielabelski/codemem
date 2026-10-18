@@ -2,13 +2,23 @@
 
 ## Coordinator authentication upgrades
 
-An older coordinator can keep serving ordinary device-signed sync while optional
-auth reports `coordinator_auth_schema_upgrade_required`. The operator must pause
-auth writers and back up the coordinator database before running
-`codemem coordinator upgrade-auth-schema --db-path coordinator.sqlite --json`.
-For D1, `codemem coordinator upgrade-auth-schema --export-sql` only prints the
-reviewed SQL; apply it separately using the [controlled cutover](contracts/coordinator-auth-protocol.md#operator-cutover).
-Never replay historical migrations on a deployment without a migration ledger.
+Only a genuinely empty SQLite database—one with no existing non-`sqlite_` schema
+objects—bootstraps V3 account-auth tables automatically. Opening a populated
+caller, pre-auth, V2, or partial-auth database never adds, repairs, or upgrades
+auth objects. An existing V3 database that passes readiness remains usable.
+Older or incomplete auth storage returns
+`coordinator_auth_schema_upgrade_required`; ordinary device-signed sync still
+works.
+
+The legacy `codemem coordinator upgrade-auth-schema` command is an authority
+cutover only. It is not a V3 fix and rejects V3 schemas, so do not use it to
+remediate `coordinator_auth_schema_upgrade_required`. A populated coordinator
+requires the separately reviewed, record-preserving V3 lifecycle upgrade in the
+[lifecycle contract](contracts/coordinator-account-management.md#migration-and-activation-boundary).
+That upgrade is blocked until an approved and verified execution path exists.
+Never run a fresh schema on an existing database, replay an authority cutover as
+an upgrade, drop tables, auto-restore data, or reset roles, grants, keys, or
+history.
 
 ## Explore the viewer
 

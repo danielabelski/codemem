@@ -45,6 +45,7 @@ async function fixture() {
 		attemptId: randomUUID(),
 		signer: review,
 		runtimeVerifierHash: hash(),
+		browserStartHash: hash(),
 		loopbackRedirect: "http://127.0.0.1:4567/codemem/auth/complete",
 	};
 	await store.createGroup(review.groupId, "Fixture group");
@@ -54,6 +55,7 @@ async function fixture() {
 	const proofs = {
 		purpose: "link" as const,
 		attemptId: start.attemptId,
+		browserStartHash: start.browserStartHash,
 		stateHash: hash(),
 		binderHash: hash(),
 		nonce: "n".repeat(43),
@@ -197,7 +199,7 @@ it("native D1 denies a wrong original binder, pending proof and exact browser ex
 	expect(await snapshot(expired)).toEqual(expiredBefore);
 });
 
-it("native D1 serializes eight calls across two instances and restart cannot replay or use legacy redemption", async () => {
+it("native D1 serializes eight calls across two instances and restart cannot replay", async () => {
 	// Arrange
 	const f = await fixture();
 	const stores = [f.store, f.fresh()];
@@ -212,11 +214,12 @@ it("native D1 serializes eight calls across two instances and restart cannot rep
 	);
 	const before = await snapshot(f);
 	const replay = await f.fresh().redeemAuthLinkSessionWithBrowserTransaction(f.input, f.cfg);
-	const legacy = await f.store.redeemAuthLinkSession(
+	const wrongBinderReplay = await f.store.redeemAuthLinkSessionWithBrowserTransaction(
 		{
 			attemptId: f.input.attemptId,
 			browserTransactionHash: f.input.browserTransactionHash,
 			credentialHash: hash(),
+			binderHash: hash(),
 		},
 		f.cfg,
 	);
@@ -226,22 +229,23 @@ it("native D1 serializes eight calls across two instances and restart cannot rep
 		Array(7).fill({ kind: "rejected", error: "browser_transaction_used" }),
 	);
 	expect(replay).toEqual({ kind: "rejected", error: "browser_transaction_used" });
-	expect(legacy).toEqual({ kind: "rejected", error: "browser_transaction_used" });
+	expect(wrongBinderReplay).toEqual({ kind: "rejected", error: "browser_transaction_used" });
 	expect(await rows(f, tables[2])).toHaveLength(1);
 	expect(await rows(f, tables[3])).toHaveLength(1);
 	expect(await snapshot(f)).toEqual(before);
 });
 
-it("native D1 legacy-first issuance and finalization deadline each prevent guarded reissuance", async () => {
+it("native D1 prior bound issuance and finalization deadline each prevent reissuance", async () => {
 	// Arrange
 	const f = await fixture();
 	expect(
 		(
-			await f.store.redeemAuthLinkSession(
+			await f.store.redeemAuthLinkSessionWithBrowserTransaction(
 				{
 					attemptId: f.input.attemptId,
 					browserTransactionHash: f.input.browserTransactionHash,
 					credentialHash: f.input.credentialHash,
+					binderHash: f.input.binderHash,
 				},
 				f.cfg,
 			)

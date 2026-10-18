@@ -60,7 +60,6 @@ import { AuthSessionOperations } from "./coordinator-auth-session.js";
 import type {
 	CoordinatorAuthAccountSignInInput,
 	CoordinatorAuthBoundLinkSessionRedeemInput,
-	CoordinatorAuthLinkSessionRedeemInput,
 	CoordinatorAuthSessionPurgeOptions,
 	CoordinatorAuthSessionScope,
 } from "./coordinator-auth-session-contract.js";
@@ -1106,12 +1105,6 @@ export class D1CoordinatorStore implements CoordinatorStore {
 		return this.authBrowserTransactions.maintainAuthBrowserTransactions(scope, options);
 	}
 
-	async redeemAuthLinkSession(
-		input: CoordinatorAuthLinkSessionRedeemInput,
-		config: CoordinatorAuthLinkConfig,
-	) {
-		return this.authSessions.redeemAuthLinkSession(input, config);
-	}
 	async redeemAuthLinkSessionWithBrowserTransaction(
 		input: CoordinatorAuthBoundLinkSessionRedeemInput,
 		config: CoordinatorAuthBrowserConfig,
@@ -1135,12 +1128,6 @@ export class D1CoordinatorStore implements CoordinatorStore {
 		options?: CoordinatorAuthSessionPurgeOptions,
 	) {
 		return this.authSessions.purgeAuthGuardedSigninReceipts(scope, options);
-	}
-	async signInWithAuthAccount(
-		input: CoordinatorAuthAccountSignInInput,
-		config: CoordinatorAuthLinkConfig,
-	) {
-		return this.authSessions.signInWithAuthAccount(input, config);
 	}
 	async signInWithConsumedBrowserTransaction(
 		input: CoordinatorAuthAccountSignInInput,

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { failAuthStatementRun } from "./coordinator-auth-fault-test-fixture.js";
 import { setupHistoricalStore } from "./coordinator-auth-historical-store-test-fixture.js";
 import {
 	advance,
@@ -96,7 +97,7 @@ function registerLogout(test: SessionTest) {
 	}) => {
 		// Arrange
 		await linked(f);
-		await f.store.redeemAuthLinkSession(redeemInput(), f.cfg);
+		await f.store.redeemAuthLinkSessionWithBrowserTransaction(redeemInput(), f.cfg);
 		await f.store.signInWithConsumedBrowserTransaction(
 			{ ...signInInput(f), credentialHash: otherCredentialHash },
 			browserProofConfig(f),
@@ -159,7 +160,7 @@ function registerRevoke(test: SessionTest) {
 	}) => {
 		// Arrange
 		await linked(f);
-		await f.store.redeemAuthLinkSession(redeemInput(), f.cfg);
+		await f.store.redeemAuthLinkSessionWithBrowserTransaction(redeemInput(), f.cfg);
 		await f.store.signInWithConsumedBrowserTransaction(
 			{ ...signInInput(f), credentialHash: otherCredentialHash },
 			browserProofConfig(f),
@@ -226,16 +227,18 @@ function registerRevoke(test: SessionTest) {
 		await linked(f);
 		await f.store.signInWithConsumedBrowserTransaction(signInInput(f), browserProofConfig(f));
 		const before = snapshot(f);
-		f.db.exec(
-			"CREATE TRIGGER fixture_revoke_fault BEFORE INSERT ON coordinator_auth_link_audit_log WHEN NEW.action = 'link_revoked' BEGIN SELECT RAISE(ABORT, 'fixture-private-backend-detail'); END",
-		);
+		const restore = failAuthStatementRun(f.db, "INSERT INTO coordinator_auth_link_audit_log");
 		// Act
 		const result = f.store.revokeAuthAccountLink(
 			{ linkId: linkId(f) },
 			{ coordinatorId: f.cfg.coordinatorId },
 		);
 		// Assert
-		await expect(result).rejects.toThrow(/^auth_session_persistence_error$/);
+		try {
+			await expect(result).rejects.toThrow(/^auth_session_persistence_error$/);
+		} finally {
+			restore();
+		}
 		expect(snapshot(f)).toEqual(before);
 		expect(await f.store.readAuthSession(credentialHash, f.cfg)).not.toBeNull();
 	});
@@ -297,12 +300,20 @@ function registerHistoricalReads(backend: Backend) {
 				authClock: () => NOW,
 			});
 			try {
-				const before = sessionRows({ ...h, now: NOW, cfg: h.history.config });
+				const f = {
+					...h,
+					now: NOW,
+					cfg: {
+						...h.history.config,
+						redirectUri: "https://coordinator.example.test/auth/callback",
+					},
+				};
+				const before = sessionRows(f);
 				// Act
 				const result = await h.store.readAuthSession(credentialHash, h.history.config);
 				// Assert
 				expect(result).toBeNull();
-				expect(sessionRows({ ...h, now: NOW, cfg: h.history.config })).toEqual(before);
+				expect(sessionRows(f)).toEqual(before);
 			} finally {
 				h.close();
 			}
@@ -323,7 +334,11 @@ function registerAuditGap(backend: Backend) {
 			},
 			authClock: () => clock.now,
 		});
-		const f = { ...h, now: NOW, cfg: h.history.config };
+		const f = {
+			...h,
+			now: NOW,
+			cfg: { ...h.history.config, redirectUri: "https://coordinator.example.test/auth/callback" },
+		};
 		try {
 			expect(await f.store.readAuthSession(credentialHash, f.cfg)).not.toBeNull();
 			const id = linkId(f);

@@ -7,6 +7,7 @@ import {
 	consumeSigninProof,
 	finalize,
 	NOW,
+	startBrowserProof,
 } from "./coordinator-auth-link-test-fixtures.js";
 import { SESSION_TTL } from "./coordinator-auth-session-test-fixtures.js";
 import { type Backend, setupStore, sqliteD1 } from "./coordinator-auth-store-test-fixtures.js";
@@ -49,7 +50,16 @@ async function existingSessionFixture(
 	const account = { issuer: config.issuer, subject: "opaque-subject-a" };
 	const created = attempt({ attemptId: browser.attemptId, runtimeVerifierHash: "9".repeat(64) });
 	expect(await f.store.createAuthLinkAttempt(created, config)).toMatchObject({ kind: "created" });
-	expect(await f.store.claimAuthLinkAttempt(browser, config)).toMatchObject({ kind: "applied" });
+	const material = await startBrowserProof(
+		{ ...f, cfg: config },
+		{ ...browser, browserStartHash: created.browserStartHash },
+		config,
+	);
+	expect(await f.store.consumeAuthBrowserTransaction(material, config)).toMatchObject({
+		kind: "consumed",
+		purpose: "link",
+		...browser,
+	});
 	expect(await f.store.recordAuthLinkOidcVerified({ ...browser, account }, config)).toMatchObject({
 		kind: "applied",
 	});
@@ -126,6 +136,7 @@ async function setup(backend: Backend = "SQLite", options: { existingSession?: b
 			{
 				purpose: "link",
 				attemptId: "attempt-a",
+				browserStartHash: attempt().browserStartHash,
 				stateHash: createHash("sha256").update(authorization.material.state).digest("hex"),
 				binderHash: parsed.cookieHash,
 				nonce: authorization.material.nonce,
@@ -647,7 +658,7 @@ it("does not clear a pending ceremony even with a genuinely live SESSION", async
 });
 
 describe.each(["SQLite", "D1"] as const)("%s live SESSION completion consumption", (backend) => {
-	it.each(["browser replay", "bound redemption", "legacy redemption"] as const)(
+	it.each(["browser replay", "bound redemption"] as const)(
 		"preserves the current SID and rejects subsequent %s",
 		async (path) => {
 			// Arrange
@@ -700,15 +711,10 @@ describe.each(["SQLite", "D1"] as const)("%s live SESSION completion consumption
 				expect.soft(replay.response.headers.getSetCookie()).toEqual([]);
 				expect.soft(replay.response.headers.get("cache-control")).toBe("no-store");
 			} else {
-				let redeemed: Awaited<ReturnType<typeof f.store.redeemAuthLinkSession>>;
-				if (path === "bound redemption") {
-					redeemed = await f.store.redeemAuthLinkSessionWithBrowserTransaction(
-						redemption,
-						f.config,
-					);
-				} else {
-					redeemed = await f.store.redeemAuthLinkSession(redemption, f.config);
-				}
+				const redeemed = await f.store.redeemAuthLinkSessionWithBrowserTransaction(
+					redemption,
+					f.config,
+				);
 				// Assert
 				expect.soft(redeemed).toMatchObject({ kind: "rejected" });
 			}

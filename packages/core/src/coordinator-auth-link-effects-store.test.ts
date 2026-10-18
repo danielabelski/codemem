@@ -1,4 +1,6 @@
-import { describe, expect } from "vitest";
+import { describe, expect, vi } from "vitest";
+import { startBrowserProof } from "./coordinator-auth-browser-proof-test-fixtures.js";
+import { failAuthStatementRun } from "./coordinator-auth-fault-test-fixture.js";
 import {
 	advance,
 	attempt,
@@ -44,10 +46,16 @@ async function secondConfirmed(
 	});
 	const hash = "2".repeat(64);
 	await f.store.createAuthLinkAttempt(input, f.cfg);
-	await f.store.claimAuthLinkAttempt(
-		{ attemptId: input.attemptId, browserTransactionHash: hash },
-		f.cfg,
-	);
+	const material = await startBrowserProof(f, {
+		attemptId: input.attemptId,
+		browserTransactionHash: hash,
+		browserStartHash: input.browserStartHash,
+	});
+	expect(await f.store.consumeAuthBrowserTransaction(material, f.cfg)).toMatchObject({
+		kind: "consumed",
+		purpose: "link",
+		browserTransactionHash: hash,
+	});
 	await f.store.recordAuthLinkOidcVerified(
 		{
 			attemptId: input.attemptId,
@@ -184,15 +192,13 @@ function registerRollbackTests(test: Test) {
 			await authorize(f);
 			await advance(f, "confirmed");
 			const before = snapshot(f);
-			f.db.exec(`CREATE TEMP TRIGGER fail_link_write BEFORE INSERT ON ${table}
-			WHEN NEW.coordinator_id = 'coordinator-a'
-			BEGIN SELECT RAISE(ABORT, 'test_link_write_failure'); END`);
+			const restore = failAuthStatementRun(f.db, `INSERT INTO ${table}`);
 			// Act
 			const result = f.store.finalizeAuthLinkAttempt(finalize(), f.cfg);
 			// Assert: infrastructure errors are not uniqueness/domain conflicts.
 			await expect(result).rejects.toThrow("auth_link_persistence_error");
 			expect(snapshot(f)).toEqual(before);
-			f.db.exec("DROP TRIGGER fail_link_write");
+			restore();
 			expect(await f.store.finalizeAuthLinkAttempt(finalize(), f.cfg)).toEqual({
 				kind: "applied",
 				status: status("finalized"),
@@ -205,13 +211,29 @@ function registerRollbackTests(test: Test) {
 			// Arrange
 			await authorize(f);
 			await advance(f, "finalized");
-			f.db.exec(`DELETE FROM ${table}`);
 			const before = snapshot(f);
+			const prepare = f.db.prepare.bind(f.db);
+			let intercepted = false;
+			const spy = vi.spyOn(f.db, "prepare").mockImplementation((sql) => {
+				const statement = prepare(sql);
+				if (
+					sql.startsWith("SELECT 1 FROM coordinator_auth_link_attempts t") &&
+					sql.includes(table)
+				) {
+					vi.spyOn(statement, "get").mockImplementation(() => {
+						intercepted = true;
+						return undefined;
+					});
+				}
+				return statement;
+			});
 			// Act
 			const retry = f.store.finalizeAuthLinkAttempt(finalize(), f.cfg);
 			// Assert
 			await expect(retry).rejects.toThrow("auth_link_persistence_incomplete");
+			expect(intercepted).toBe(true);
 			expect(snapshot(f)).toEqual(before);
+			spy.mockRestore();
 		},
 	);
 }

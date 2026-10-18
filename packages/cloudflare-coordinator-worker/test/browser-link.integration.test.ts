@@ -62,6 +62,7 @@ async function setup(destination = "http://127.0.0.1:80/codemem/auth/complete") 
 		attemptId: crypto.randomUUID(),
 		signer: review,
 		runtimeVerifierHash: "d".repeat(64),
+		browserStartHash: "8".repeat(64),
 		loopbackRedirect: destination,
 	};
 	expect(await store.createAuthLinkAttempt(attempt, config)).toMatchObject({ kind: "created" });
@@ -80,6 +81,7 @@ async function setup(destination = "http://127.0.0.1:80/codemem/auth/complete") 
 			{
 				purpose: "link",
 				attemptId: attempt.attemptId,
+				browserStartHash: attempt.browserStartHash,
 				stateHash: createHash("sha256").update(authorization.material.state).digest("hex"),
 				binderHash: parsed.cookieHash,
 				nonce: authorization.material.nonce,
@@ -284,6 +286,7 @@ it("native D1 cancellation and provider failure clear only the proven transactio
 			...f.attempt,
 			attemptId: crypto.randomUUID(),
 			runtimeVerifierHash: "e".repeat(64),
+			browserStartHash: "7".repeat(64),
 		};
 		expect(await f.store.createAuthLinkAttempt(otherAttempt, f.config)).toMatchObject({
 			kind: "created",
@@ -299,7 +302,7 @@ it("native D1 cancellation and provider failure clear only the proven transactio
 			};
 			const start =
 				purpose === "link"
-					? { ...input, purpose, attemptId: otherAttempt.attemptId }
+					? { ...input, purpose, attemptId: otherAttempt.attemptId, browserStartHash: otherAttempt.browserStartHash }
 					: { ...input, purpose };
 			expect(await f.store.startAuthBrowserTransaction(start, f.config)).toMatchObject({
 				kind: "started",

@@ -1,4 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
+import {
+	startBrowserProof,
+	withBrowserHash,
+} from "./coordinator-auth-browser-proof-test-fixtures.js";
+import { materials } from "./coordinator-auth-browser-transaction-test-fixtures.js";
+import { failAuthStatementRun } from "./coordinator-auth-fault-test-fixture.js";
 import { type AuthLinkBackend, AuthLinkOperations } from "./coordinator-auth-link.js";
 import {
 	AUTH_LINK_CREATE_WINDOW_MS,
@@ -25,6 +31,7 @@ import {
 	attempt,
 	authorize,
 	backendTest,
+	browserHash,
 	browserProofConfig,
 	cfg,
 	device,
@@ -364,15 +371,14 @@ function registerMaintenance(test: Test) {
 		await authorize(f);
 		await advance(f, "confirmed");
 		f.now += TTL;
-		f.db.exec(
-			"CREATE TRIGGER abort_maintenance BEFORE UPDATE ON coordinator_auth_link_attempts BEGIN SELECT RAISE(ABORT, 'fixture-failure'); END",
-		);
+		const restore = failAuthStatementRun(f.db, "UPDATE coordinator_auth_link_attempts");
 		const before = allData(f);
 		// Act
 		const result = f.store.maintainAuthLinkAttempts(f.cfg);
 		// Assert
 		await expect(result).rejects.toThrow("auth_link_persistence_error");
 		expect(allData(f)).toEqual(before);
+		restore();
 	});
 }
 
@@ -450,7 +456,9 @@ function registerBoundaries(test: Test) {
 			// Arrange
 			await linked(f);
 			if (state === "session_redeemed")
-				expect((await f.store.redeemAuthLinkSession(redeemInput(), f.cfg)).kind).toBe("issued");
+				expect(
+					(await f.store.redeemAuthLinkSessionWithBrowserTransaction(redeemInput(), f.cfg)).kind,
+				).toBe("issued");
 			f.now += TTL;
 			const before = allData(f);
 			// Act
@@ -605,9 +613,14 @@ function registerBurns(test: Test) {
 		f.now += TTL;
 		f.now = NOW;
 		// Act
-		const result = await transition(f, "claim");
+		const material = await startBrowserProof(f, {
+			attemptId: "attempt-a",
+			browserTransactionHash: browserHash,
+			browserStartHash: attempt().browserStartHash,
+		});
+		const result = await f.store.consumeAuthBrowserTransaction(material, f.cfg);
 		// Assert
-		expect(result.kind).toBe("applied");
+		expect(result.kind).toBe("consumed");
 		expect(rows(f, TABLES[0])[0].state).toBe("browser_claimed");
 	});
 	test("expired commitments remain burned against a new attempt ID", async ({ fixture: f }) => {
@@ -638,31 +651,42 @@ function registerBurns(test: Test) {
 		await f.store.createAuthLinkAttempt(numberedAttempt(1), f.cfg);
 		const before = allData(f);
 		// Act
-		const replay = await f.store.claimAuthLinkAttempt(
-			{ attemptId: "maintenance-1", browserTransactionHash: freshBrowserHash },
-			f.cfg,
+		const replay = await withBrowserHash(freshBrowserHash, () =>
+			f.store.startAuthBrowserTransaction(
+				{
+					...materials(800),
+					purpose: "link",
+					attemptId: "maintenance-1",
+					browserStartHash: numberedAttempt(1).browserStartHash,
+				},
+				f.cfg,
+			),
 		);
 		const replayData = allData(f);
-		const fresh = await f.store.claimAuthLinkAttempt(
-			{ attemptId: "maintenance-1", browserTransactionHash: digest(500) },
-			f.cfg,
-		);
+		const material = await startBrowserProof(f, {
+			attemptId: "maintenance-1",
+			browserTransactionHash: digest(500),
+			browserStartHash: numberedAttempt(1).browserStartHash,
+		});
+		const fresh = await f.store.consumeAuthBrowserTransaction(material, f.cfg);
 		// Assert
-		expectRejected(replay, "attempt_unavailable");
+		expectRejected(replay, "transaction_conflict");
 		expect(replayData).toEqual(before);
-		expect(fresh.kind).toBe("applied");
+		expect(fresh.kind).toBe("consumed");
 		expect(sessionRows(f)).toEqual(before.slice(-2));
 	});
 	test("claimed expired link proof cannot sign in even after subject scrubbing", async ({
 		fixture: f,
 	}) => {
 		// Arrange
-		await linked(f);
+		await linked(f, { signinProof: false });
 		await f.store.createAuthLinkAttempt(numberedAttempt(1), f.cfg);
-		await f.store.claimAuthLinkAttempt(
-			{ attemptId: "maintenance-1", browserTransactionHash: freshBrowserHash },
-			f.cfg,
-		);
+		const material = await startBrowserProof(f, {
+			attemptId: "maintenance-1",
+			browserTransactionHash: freshBrowserHash,
+			browserStartHash: numberedAttempt(1).browserStartHash,
+		});
+		expect((await f.store.consumeAuthBrowserTransaction(material, f.cfg)).kind).toBe("consumed");
 		f.now += TTL;
 		await f.store.maintainAuthLinkAttempts(f.cfg);
 		const before = allData(f);
@@ -675,7 +699,10 @@ function registerBurns(test: Test) {
 		expectRejected(replay, "browser_transaction_used");
 		expect(allData(f)).toEqual(before);
 	});
-	test("racing claim and normal sign-in admits only one browser proof consumer", async ({
+}
+
+function registerClaimRace(test: Test) {
+	test("racing committed link start cannot steal a consumed signin proof", async ({
 		fixture: f,
 	}) => {
 		// Arrange
@@ -683,17 +710,24 @@ function registerBurns(test: Test) {
 		await f.store.createAuthLinkAttempt(numberedAttempt(1), f.cfg);
 		// Act
 		const results = await Promise.all([
-			f.store.claimAuthLinkAttempt(
-				{ attemptId: "maintenance-1", browserTransactionHash: freshBrowserHash },
-				f.cfg,
+			withBrowserHash(freshBrowserHash, () =>
+				f.store.startAuthBrowserTransaction(
+					{
+						...materials(801),
+						purpose: "link",
+						attemptId: "maintenance-1",
+						browserStartHash: numberedAttempt(1).browserStartHash,
+					},
+					f.cfg,
+				),
 			),
 			f.store.signInWithConsumedBrowserTransaction(signInInput(f), browserProofConfig(f)),
 		]);
 		// Assert
-		expect(
-			results.filter((result) => result.kind === "applied" || result.kind === "issued"),
-		).toHaveLength(1);
-		expect(results.filter((result) => result.kind === "rejected")).toHaveLength(1);
+		expect(results.filter((result) => result.kind === "issued")).toHaveLength(1);
+		expect(results.filter((result) => result.kind === "rejected")).toEqual([
+			{ kind: "rejected", error: "transaction_conflict" },
+		]);
 	});
 }
 
@@ -705,6 +739,7 @@ function registerBackend(backend: Backend) {
 	registerBoundaries(test);
 	registerValidation(test);
 	registerBurns(test);
+	registerClaimRace(test);
 	test("exports fixed work and admission limits", ({ fixture: _f }) => {
 		// Arrange
 		const constants = [

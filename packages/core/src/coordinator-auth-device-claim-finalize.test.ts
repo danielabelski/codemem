@@ -42,7 +42,12 @@ function snapshot(f: LinkFixture, options: { unchangedOnly?: boolean } = {}) {
 	return tables
 		.filter(
 			({ name }) =>
-				!options.unchangedOnly || ![...TABLES, "coordinator_auth_device_claims"].includes(name),
+				!options.unchangedOnly ||
+				![
+					...TABLES,
+					"coordinator_auth_device_claims",
+					"coordinator_auth_account_associations",
+				].includes(name),
 		)
 		.map(({ name }) => [name, f.db.prepare(`SELECT * FROM "${name}"`).all()]);
 }

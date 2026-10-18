@@ -1,11 +1,11 @@
 import type { Database as SqliteDatabase } from "better-sqlite3";
 import { afterEach, expect, it } from "vitest";
-import { connectCoordinator } from "./better-sqlite-coordinator-store.js";
 import {
 	AUTH_LIFECYCLE_PREDECESSOR_RECOGNITION_SQL,
 	AUTH_LIFECYCLE_SQLITE_PREDECESSOR_RECOGNITION_SQL,
 	AUTH_LIFECYCLE_SQLITE_TEMP_SCHEMA_CHECK_SQL,
 } from "./coordinator-auth-lifecycle-recognition.js";
+import { frozenV2Database } from "./coordinator-auth-lifecycle-upgrade-test-fixture.js";
 
 const links = "coordinator_auth_account_links";
 const databases: SqliteDatabase[] = [];
@@ -13,7 +13,7 @@ afterEach(() => {
 	for (const db of databases.splice(0)) db.close();
 });
 function setup() {
-	const db = connectCoordinator(":memory:");
+	const db = frozenV2Database();
 	databases.push(db);
 	db.exec(`INSERT INTO main.${links}
 	 (coordinator_id, link_id, issuer, subject, identity_id, attempt_id,

@@ -80,8 +80,8 @@ export interface CoordinatorAuthLinkCreateInput {
 	signer: CoordinatorAuthLinkSigner;
 	runtimeVerifierHash: string;
 	loopbackRedirect: string;
-	/** Required for device claims; trusted attested callers may omit it. */
-	browserStartHash?: string;
+	/** Commitment required for every current browser ceremony. */
+	browserStartHash: string;
 }
 export interface CoordinatorAuthLinkClaimInput {
 	attemptId: string;
@@ -121,6 +121,9 @@ export interface CoordinatorAuthLinkStore {
 		input: CoordinatorAuthLinkCreateInput,
 		config: CoordinatorAuthLinkConfig,
 	): Promise<CoordinatorAuthLinkCreateResult>;
+	/** Retained for exact claim retries. Normal browser claims start atomically
+	 * through startAuthBrowserTransaction, with their committed start proof.
+	 */
 	claimAuthLinkAttempt(
 		input: CoordinatorAuthLinkClaimInput,
 		config: CoordinatorAuthLinkConfig,

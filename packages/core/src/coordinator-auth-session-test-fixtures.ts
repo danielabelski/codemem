@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { expect } from "vitest";
 import {
 	advance,
@@ -27,7 +28,14 @@ export async function linked(f: LinkFixture, options = { signinProof: true }) {
 }
 
 export function redeemInput() {
-	return { attemptId: "attempt-a", browserTransactionHash: browserHash, credentialHash };
+	return {
+		attemptId: "attempt-a",
+		browserTransactionHash: browserHash,
+		credentialHash,
+		binderHash: createHash("sha256")
+			.update(`codemem-test-browser:binder:coordinator-a:attempt-a:${browserHash}`)
+			.digest("hex"),
+	};
 }
 
 export function signInInput(f: LinkFixture) {

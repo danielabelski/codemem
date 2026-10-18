@@ -10,10 +10,15 @@ import {
 	materials,
 	TABLE,
 } from "./coordinator-auth-browser-transaction-test-fixtures.js";
-import type { AuthLinkBackend } from "./coordinator-auth-link.js";
+import { failAuthStatementRun } from "./coordinator-auth-fault-test-fixture.js";
+import { AUTH_ONLY_PREDECESSOR_MIGRATION_NAMES } from "./coordinator-auth-historical-migration-test-fixture.js";
+import { prepareHistoricalAccountDatabase } from "./coordinator-auth-historical-test-fixture.js";
+import { upgradeAuthLifecycleSchema } from "./coordinator-auth-lifecycle-upgrade-sqlite.js";
+import type { AuthLinkBackend, AuthLinkStatement } from "./coordinator-auth-link.js";
 import {
 	backendTest,
 	browserProofConfig,
+	cfg,
 	expectRejected,
 	type LinkFixture,
 	NOW,
@@ -28,7 +33,7 @@ import {
 	sessionRows,
 	signInInput,
 } from "./coordinator-auth-session-test-fixtures.js";
-import type { Backend } from "./coordinator-auth-store-test-fixtures.js";
+import { type Backend, sqliteD1 } from "./coordinator-auth-store-test-fixtures.js";
 
 const SESSIONS = "coordinator_auth_sessions";
 const RECEIPTS = "coordinator_auth_session_receipts";
@@ -60,7 +65,7 @@ function purge(f: LinkFixture, method: Method, options?: unknown, owner: unknown
 	return f.store[method](owner as never, options as never);
 }
 function traced(f: LinkFixture, clock = () => f.now) {
-	const first = vi.fn<AuthLinkBackend["first"]>(
+	const first = vi.fn<(statement: AuthLinkStatement) => Promise<unknown>>(
 		async ({ sql, values }) => f.db.prepare(sql).get(...values) ?? null,
 	);
 	const run = vi.fn<AuthLinkBackend["run"]>(
@@ -69,7 +74,69 @@ function traced(f: LinkFixture, clock = () => f.now) {
 	const batch = vi.fn<AuthLinkBackend["batch"]>(async () => {
 		throw new Error("unexpected_batch");
 	});
-	return { first, run, batch, capability: new AuthSessionOperations({ first, run, batch }, clock) };
+	const backend: AuthLinkBackend = {
+		async first<T>(statement: AuthLinkStatement) {
+			return (await first(statement)) as T | null;
+		},
+		run,
+		batch,
+	};
+	return { first, run, batch, capability: new AuthSessionOperations(backend, clock) };
+}
+// Frozen V2 storage-only cases exercise the retention SQL against arbitrary old
+// metadata. No current store is opened, and no installed guard is disabled.
+function storageTest(backend: Backend): Test {
+	return it.extend<{ fixture: LinkFixture }>({
+		fixture: async ({ task: _task }, use) => {
+			const db = new Database(":memory:");
+			for (const name of AUTH_ONLY_PREDECESSOR_MIGRATION_NAMES) db.exec(migration(name));
+			let now = NOW;
+			const d1 = sqliteD1(db);
+			const persistence: AuthLinkBackend = {
+				async first<T>({ sql, values }: AuthLinkStatement) {
+					if (backend === "D1")
+						return d1
+							.prepare(sql)
+							.bind(...values)
+							.first<T>();
+					return (db.prepare(sql).get(...values) as T | undefined) ?? null;
+				},
+				async run({ sql, values }) {
+					if (backend === "D1") {
+						const result = (await d1
+							.prepare(sql)
+							.bind(...values)
+							.run()) as { meta: { changes: number } };
+						return result.meta.changes;
+					}
+					return db.prepare(sql).run(...values).changes;
+				},
+				async batch() {
+					throw new Error("unexpected_storage_retention_batch");
+				},
+			};
+			const operations = new AuthSessionOperations(persistence, () => now);
+			const f: LinkFixture = {
+				db,
+				cfg: { ...cfg },
+				// Only retention methods are available: this fixture cannot issue credentials.
+				store: Object.fromEntries(
+					methods.map((method) => [method, operations[method].bind(operations)]),
+				) as unknown as LinkFixture["store"],
+				get now() {
+					return now;
+				},
+				set now(value) {
+					now = value;
+				},
+			};
+			try {
+				await use(f);
+			} finally {
+				db.close();
+			}
+		},
+	});
 }
 // Synthetic persisted metadata is not HTTP authentication or provider proof.
 function seed(f: LinkFixture, id = 1, changes: Record<string, unknown> = {}) {
@@ -178,49 +245,54 @@ function registerBoundaries(test: Test) {
 		expect(receipts).toEqual(purged(2));
 		expect(sessionRows(f)).toEqual([[], []]);
 	});
-	test("foreign browser transactions do not block the owner but owner transactions do", async ({
-		fixture: f,
-	}) => {
-		// Arrange
-		await linked(f);
-		const input = await guarded(f);
-		f.now += AGE;
-		// Act
-		const blocked = await purge(f, methods[0]);
-		f.db.prepare(`UPDATE ${TABLE} SET coordinator_id='other'`).run();
-		const allowed = await purge(f, methods[0]);
-		const receipt = await purge(f, methods[1]);
-		// Assert
-		expect(blocked).toEqual(purged());
-		expect(allowed).toEqual(purged(1));
-		expect(receipt).toEqual(purged(1));
-		expect(
-			rows(f, TABLE).find((row) => row.browser_transaction_hash === input.browserTransactionHash),
-		).toMatchObject({ browser_transaction_hash: input.browserTransactionHash });
-	});
+}
+
+function registerProofBlocking(current: Test) {
+	current(
+		"foreign browser transactions do not block the owner but owner transactions do",
+		async ({ fixture: f }) => {
+			// Arrange
+			await linked(f);
+			const input = await guarded(f);
+			f.now += AGE;
+			// Act
+			const blocked = await purge(f, methods[0]);
+			f.db.prepare(`UPDATE ${TABLE} SET coordinator_id='other'`).run();
+			const allowed = await purge(f, methods[0]);
+			const receipt = await purge(f, methods[1]);
+			// Assert
+			expect(blocked).toEqual(purged());
+			expect(allowed).toEqual(purged(1));
+			expect(receipt).toEqual(purged(1));
+			expect(
+				rows(f, TABLE).find((row) => row.browser_transaction_hash === input.browserTransactionHash),
+			).toMatchObject({ browser_transaction_hash: input.browserTransactionHash });
+		},
+	);
+	current(
+		"owner browser transaction preserves an old receipt even with no remaining session",
+		async ({ fixture: f }) => {
+			// Arrange
+			await linked(f);
+			await guarded(f);
+			f.db.exec(`DELETE FROM ${SESSIONS}`);
+			f.now += AGE * 10;
+			const before = snapshot(f);
+			// Act
+			const blocked = await purge(f, methods[1]);
+			const retained = snapshot(f);
+			await f.store.purgeAuthSigninBrowserTransactions(scope);
+			const allowed = await purge(f, methods[1]);
+			// Assert
+			expect(blocked).toEqual(purged());
+			expect(retained).toEqual(before);
+			expect(allowed).toEqual(purged(1));
+			expect(rows(f, RECEIPTS)).toEqual([]);
+		},
+	);
 }
 
 function registerCoherence(test: Test) {
-	test("owner browser transaction preserves an old receipt even with no remaining session", async ({
-		fixture: f,
-	}) => {
-		// Arrange
-		await linked(f);
-		await guarded(f);
-		f.db.exec(`DELETE FROM ${SESSIONS}`);
-		f.now += AGE * 10;
-		const before = snapshot(f);
-		// Act
-		const blocked = await purge(f, methods[1]);
-		const retained = snapshot(f);
-		await f.store.purgeAuthSigninBrowserTransactions(scope);
-		const allowed = await purge(f, methods[1]);
-		// Assert
-		expect(blocked).toEqual(purged());
-		expect(retained).toEqual(before);
-		expect(allowed).toEqual(purged(1));
-		expect(rows(f, RECEIPTS)).toEqual([]);
-	});
 	test.for([
 		{ link_id: "wrong" },
 		{ session_id: "wrong" },
@@ -307,7 +379,7 @@ function registerOrigins(test: Test) {
 		// Arrange
 		await linked(f);
 		const protectedBefore = grants(f);
-		await f.store.redeemAuthLinkSession(redeemInput(), f.cfg);
+		await f.store.redeemAuthLinkSessionWithBrowserTransaction(redeemInput(), f.cfg);
 		const historical = { ...signInInput(f), credentialHash: hash(301) };
 		expect(
 			(await f.store.signInWithConsumedBrowserTransaction(historical, browserProofConfig(f))).kind,
@@ -376,7 +448,7 @@ function registerOrigins(test: Test) {
 	}) => {
 		// Arrange
 		await linked(f);
-		await f.store.redeemAuthLinkSession(redeemInput(), f.cfg);
+		await f.store.redeemAuthLinkSessionWithBrowserTransaction(redeemInput(), f.cfg);
 		const before = sessionRows(f);
 		// Act
 		const active = await Promise.all(methods.map((method) => purge(f, method)));
@@ -483,6 +555,8 @@ function registerReplay(test: Test) {
 		await cleanup(f);
 		const live = [];
 		for (let id = 2; id <= 11; id++) live.push(await guarded(f, id));
+		const firstLive = live[0];
+		if (!firstLive) throw new Error("fixture_live_session_missing");
 		// Act
 		const denied = await f.store.signInWithConsumedBrowserTransaction(
 			await consumedInput(f, 12),
@@ -502,7 +576,7 @@ function registerReplay(test: Test) {
 		expect(rolledBack).toEqual(Array(10).fill(null));
 		expect(await f.store.readAuthSession(old.credentialHash, f.cfg)).toBeNull();
 		expect(
-			await f.store.readAuthSession(live[0].credentialHash, { ...f.cfg, revision: hash(997) }),
+			await f.store.readAuthSession(firstLive.credentialHash, { ...f.cfg, revision: hash(997) }),
 		).toBeNull();
 	});
 }
@@ -745,7 +819,7 @@ function registerFaultsAndSql(test: Test) {
 			// Assert
 			expect(result).toEqual(purged(1, 1));
 			expect(trace.run).toHaveBeenCalledTimes(1);
-			const sql = trace.run.mock.calls[0][0].sql;
+			const sql = trace.run.mock.calls[0]?.[0].sql;
 			expect(sql).toMatch(/^DELETE\s/iu);
 			expect(sql).toMatch(/SELECT[\s\S]*ORDER BY[\s\S]*LIMIT/iu);
 			expect(sql).toMatch(
@@ -762,13 +836,111 @@ function registerFaultsAndSql(test: Test) {
 
 function registerBackend(backend: Backend) {
 	const test = backendTest(backend);
-	registerBoundaries(test);
-	registerCoherence(test);
+	const storage = storageTest(backend);
+	describe("frozen V2 storage-only retention SQL", () => {
+		registerBoundaries(storage);
+		registerCoherence(storage);
+		registerPaging(storage);
+		registerFaultsAndSql(storage);
+	});
+	registerProofBlocking(test);
 	registerOrigins(test);
 	registerReplay(test);
-	registerPaging(test);
 	for (const method of methods) registerValidation(test, method);
-	registerFaultsAndSql(test);
+	registerCurrentRetention(test);
+}
+
+function registerCurrentRetention(test: Test) {
+	test.for(methods)(
+		"V3 %s execution failure preserves every row",
+		async (method, { fixture: f }) => {
+			// Arrange: admitted rows and intact DDL reach the actual delete execution.
+			await linked(f);
+			await guarded(f);
+			f.now += AGE;
+			await f.store.purgeAuthSigninBrowserTransactions(scope);
+			if (method === methods[1]) await purge(f, methods[0]);
+			const table = method === methods[0] ? SESSIONS : RECEIPTS;
+			const before = snapshot(f);
+			const restore = failAuthStatementRun(f.db, `DELETE FROM ${table}`);
+			try {
+				// Act
+				const failure = purge(f, method);
+				// Assert: sanitize the execution fault without mutating permanent evidence.
+				await expect(failure).rejects.toThrow(/^auth_session_persistence_error$/);
+				expect(snapshot(f)).toEqual(before);
+			} finally {
+				restore();
+			}
+			// Act / Assert: the same eligible row deletes after the injected fault is removed.
+			expect(await purge(f, method)).toEqual(purged(1));
+		},
+	);
+	test.for([-1, 0, 1])(
+		"V3 issued rows obey the exact retention boundary %s",
+		async (offset, { fixture: f }) => {
+			// Arrange: the current store issues from consumed matching proof at the intended clock.
+			await linked(f);
+			const input = await guarded(f);
+			const before = sessionRows(f);
+			f.now = NOW + AGE + offset;
+			await f.store.purgeAuthSigninBrowserTransactions(scope);
+			const permanent = snapshot(f, [SESSIONS, RECEIPTS]);
+			// Act
+			const earlyReceipt = await purge(f, methods[1]);
+			const sessions = await purge(f, methods[0]);
+			const receipts = await purge(f, methods[1]);
+			// Assert: even expired issued sessions protect receipts until session cleanup completes.
+			expect(earlyReceipt).toEqual(purged());
+			expect(sessions).toEqual(purged(offset < 0 ? 0 : 1));
+			expect(receipts).toEqual(purged(offset < 0 ? 0 : 1));
+			expect(sessionRows(f)).toEqual(offset < 0 ? before : [[], []]);
+			expect(await f.store.readAuthSession(input.credentialHash, f.cfg)).toBeNull();
+			expect(snapshot(f, [SESSIONS, RECEIPTS])).toEqual(permanent);
+		},
+	);
+	test("V3 issued paging retains unselected rows and every permanent authority record", async ({
+		fixture: f,
+	}) => {
+		// Arrange: three valid issued rows fit below the live-session cap.
+		await linked(f);
+		for (let id = 1; id <= 3; id++) {
+			await guarded(f, id);
+			f.now++;
+		}
+		f.now = NOW + AGE + 3;
+		await f.store.purgeAuthSigninBrowserTransactions(scope);
+		const permanent = snapshot(f, [SESSIONS, RECEIPTS]);
+		const expected = f.db
+			.prepare(`SELECT * FROM ${SESSIONS} ORDER BY expires_at_ms,session_id`)
+			.all();
+		// Act
+		const first = await purge(f, methods[0], { limit: 2 });
+		const remaining = rows(f, SESSIONS);
+		const receipts = await purge(f, methods[1], { limit: 2 });
+		const last = await purge(f, methods[0], { limit: 2 });
+		const lastReceipt = await purge(f, methods[1], { limit: 2 });
+		// Assert
+		expect(first).toEqual(purged(2, 2));
+		expect(remaining).toEqual(expected.slice(2));
+		expect(receipts).toEqual(purged(2, 2));
+		expect(last).toEqual(purged(1, 2));
+		expect(lastReceipt).toEqual(purged(1, 2));
+		expect(sessionRows(f)).toEqual([[], []]);
+		expect(snapshot(f, [SESSIONS, RECEIPTS])).toEqual(permanent);
+	});
+	test("V3 rejects arbitrary raw session metadata before retention can grant deletion authority", async ({
+		fixture: f,
+	}) => {
+		// Arrange: real link authority alone is not a consumed signin proof.
+		await linked(f);
+		const before = snapshot(f);
+		// Act
+		const write = () => seed(f);
+		// Assert: exact admission denial, not a generic SQL failure or a readiness bypass.
+		expect(write).toThrow(/^auth_session_admission_unavailable$/);
+		expect(snapshot(f)).toEqual(before);
+	});
 }
 describe.each(["SQLite", "D1"] as const)(
 	"%s guarded session retention (D1 is SQLite-backed)",
@@ -777,10 +949,17 @@ describe.each(["SQLite", "D1"] as const)(
 
 it.each(methods)("%s zero write metadata grants no credential or authority", async (method) => {
 	// Arrange
-	const first = vi.fn<AuthLinkBackend["first"]>();
+	const first = vi.fn<(statement: AuthLinkStatement) => Promise<unknown>>();
 	const run = vi.fn<AuthLinkBackend["run"]>().mockResolvedValue(0);
 	const batch = vi.fn<AuthLinkBackend["batch"]>();
-	const capability = new AuthSessionOperations({ first, run, batch }, () => NOW + AGE);
+	const capability = new AuthSessionOperations(
+		{
+			first: async <T>(statement: AuthLinkStatement) => (await first(statement)) as T | null,
+			run,
+			batch,
+		},
+		() => NOW + AGE,
+	);
 	// Act
 	const result = await capability[method](scope);
 	// Assert
@@ -854,7 +1033,7 @@ it("versioned migration 24 runs once, keeps historical flags zero and rejects re
 		reference.close();
 	}
 });
-it("SQLite checks old receipt columns while holding an immediate write lock", () => {
+it("explicit SQLite lifecycle upgrade validates its predecessor while holding an immediate write lock", () => {
 	// Arrange: an independent connection can write before startup takes the lock.
 	const directory = mkdtempSync(join(tmpdir(), "codemem-retention-lock-"));
 	const path = join(directory, "fixture.sqlite");
@@ -863,8 +1042,7 @@ it("SQLite checks old receipt columns while holding an immediate write lock", ()
 	let prepareSpy: ReturnType<typeof vi.spyOn> | undefined;
 	const lockErrors: unknown[] = [];
 	try {
-		probe.exec(migration("0018_add_auth_sessions.sql"));
-		probe.exec(migration("0022_add_auth_session_admission_index.sql"));
+		prepareHistoricalAccountDatabase(probe, { authority: "controller_attestation" });
 		probe.exec("BEGIN IMMEDIATE");
 		probe.exec("ROLLBACK");
 		const originalPrepare = Database.prototype.prepare;
@@ -872,7 +1050,7 @@ it("SQLite checks old receipt columns while holding an immediate write lock", ()
 			this: Database.Database,
 			sql: string,
 		) {
-			if (sql === "PRAGMA table_info(coordinator_auth_session_receipts)") {
+			if (sql === "PRAGMA ignore_check_constraints") {
 				try {
 					probe.exec("BEGIN IMMEDIATE");
 					lockErrors.push(null);
@@ -885,7 +1063,8 @@ it("SQLite checks old receipt columns while holding an immediate write lock", ()
 			return originalPrepare.call(this, sql);
 		});
 		// Act: probe at the actual column check, not after an ALTER takes a lock.
-		upgraded = connectCoordinator(path);
+		upgraded = new Database(path);
+		upgradeAuthLifecycleSchema(upgraded);
 		// Assert: deferred or unlocked checks would let this independent writer in.
 		expect(lockErrors).toHaveLength(1);
 		expect(lockErrors[0]).toMatchObject({ code: "SQLITE_BUSY" });
@@ -930,7 +1109,7 @@ function hasRawTransactionBegin(sql: string) {
 			index++;
 			continue;
 		}
-		if ("'\"`[".includes(character)) {
+		if (character !== undefined && "'\"`[".includes(character)) {
 			index = skipQuoted(sql, index);
 			statementStart = false;
 			continue;
@@ -1103,7 +1282,7 @@ it.each([
 		probe.close();
 	}
 });
-it("SQLite warm receipt upgrade uses the read hint without invoking transaction APIs or raw BEGIN", () => {
+it("SQLite warm startup leaves an incomplete historical receipt schema unchanged", () => {
 	// Arrange: cold startup performs the upgrade before transaction instrumentation.
 	const directory = mkdtempSync(join(tmpdir(), "codemem-retention-warm-"));
 	const path = join(directory, "fixture.sqlite");
@@ -1124,18 +1303,17 @@ it("SQLite warm receipt upgrade uses the read hint without invoking transaction 
 		trace = observeWarmStartup(probe);
 		// Act
 		warm = connectCoordinator(path);
-		// Assert: this verifies the helper's fast path, not global lock-free startup.
-		expect(trace.prepareSpy).toHaveBeenCalledWith(retentionReadHint);
+		// Assert: opening is not authorization to repair partial historical auth DDL.
+		expect(trace.prepareSpy).not.toHaveBeenCalledWith(retentionReadHint);
 		expect(trace.prepareSpy).not.toHaveBeenCalledWith(
 			"PRAGMA table_info(coordinator_auth_session_receipts)",
 		);
-		expect(trace.transactionSpy).not.toHaveBeenCalled();
 		expect(trace.sqlCalls.some(hasRawTransactionBegin)).toBe(false);
-		expect(trace.lockErrors).toEqual([null]);
+		expect(trace.lockErrors).toEqual([]);
 		expect(probe.inTransaction).toBe(false);
 		expect(warm.prepare(`SELECT * FROM ${RECEIPTS}`).all()).toEqual(before);
 		expect(before).toHaveLength(2);
-		expect(before).toEqual(legacy.map((row) => ({ ...(row as object), purge_eligible: 0 })));
+		expect(before).toEqual(legacy);
 	} finally {
 		trace?.restore();
 		if (probe.inTransaction) probe.exec("ROLLBACK");
@@ -1144,15 +1322,19 @@ it("SQLite warm receipt upgrade uses the read hint without invoking transaction 
 		rmSync(directory, { recursive: true, force: true });
 	}
 });
-it("SQLite upgrades old 18/22 receipts without reclassifying historical signin rows and reconnects safely", () => {
+it("explicit SQLite lifecycle upgrade preserves historical signin rows and reconnects safely", () => {
 	// Arrange: temporary database is test-owned, never the user's database.
 	const directory = mkdtempSync(join(tmpdir(), "codemem-retention-"));
 	const path = join(directory, "fixture.sqlite");
 	const old = new Database(path);
-	old.exec(migration("0018_add_auth_sessions.sql"));
-	old.exec(migration("0022_add_auth_session_admission_index.sql"));
-	historical(old);
+	prepareHistoricalAccountDatabase(old, {
+		authority: "controller_attestation",
+		session: { credentialHash: hash(900) },
+	});
+	// Original receipts were classified permanent before the current guards existed.
+	old.exec(`UPDATE ${RECEIPTS} SET purge_eligible = 0`);
 	const before = old.prepare(`SELECT * FROM ${RECEIPTS}`).all();
+	upgradeAuthLifecycleSchema(old);
 	old.close();
 	const fresh = connectCoordinator(":memory:");
 	let upgraded: Database.Database | undefined;
@@ -1164,12 +1346,13 @@ it("SQLite upgrades old 18/22 receipts without reclassifying historical signin r
 		upgraded.close();
 		upgraded = connectCoordinator(path);
 		// Assert: token-preserving punctuation normalization keeps every CHECK clause.
-		expect(after).toEqual(before.map((row) => ({ ...(row as object), purge_eligible: 0 })));
+		expect(after).toEqual(before);
+		expect(after).toEqual([expect.objectContaining({ source: "signin", purge_eligible: 0 })]);
 		expect(schema(upgraded)).toEqual(firstSchema);
 		expect(firstSchema).toEqual(schema(fresh));
-		expect((upgraded.pragma(`table_info(${RECEIPTS})`) as { name: string }[]).at(-1)?.name).toBe(
-			"purge_eligible",
-		);
+		expect(
+			(upgraded.pragma(`table_info(${RECEIPTS})`) as { name: string }[]).map(({ name }) => name),
+		).toContain("purge_eligible");
 	} finally {
 		upgraded?.close();
 		fresh.close();

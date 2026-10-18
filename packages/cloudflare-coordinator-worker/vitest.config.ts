@@ -32,6 +32,10 @@ export default defineConfig(async () => {
 		test: {
 			include: ["test/**/*.integration.test.ts"],
 			setupFiles: ["./test/apply-migrations.ts"],
+			// Current exact-DDL checks run real SQLite inspection across 76 native files.
+			// Keep contention predictable; multi-fixture admission tests exceed the 5s default.
+			maxWorkers: 4,
+			testTimeout: 20000,
 		},
 	};
 });

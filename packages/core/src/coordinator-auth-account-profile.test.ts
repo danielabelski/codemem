@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import type { CoordinatorAuthAccountProfileInput } from "./coordinator-auth-account-profile-contract.js";
+import { failAuthStatementRun } from "./coordinator-auth-fault-test-fixture.js";
 import { setupHistoricalStore } from "./coordinator-auth-historical-store-test-fixture.js";
 import {
 	browserProofConfig,
@@ -7,6 +8,7 @@ import {
 	NOW,
 	snapshot,
 } from "./coordinator-auth-link-test-fixtures.js";
+import { CoordinatorAuthSchemaUpgradeRequiredError } from "./coordinator-auth-schema.js";
 import {
 	backendTest,
 	consumeSigninProof,
@@ -34,6 +36,15 @@ const fullProfile = {
 
 function profiles(f: LinkFixture) {
 	return f.db.prepare(`SELECT * FROM ${TABLE} ORDER BY coordinator_id, link_id`).all();
+}
+
+function sourceOrder(f: LinkFixture, sessionId: string) {
+	const proof = f.db
+		.prepare(`SELECT b.browser_sequence FROM coordinator_auth_sessions s
+		JOIN coordinator_auth_browser_transactions b ON b.coordinator_id = s.coordinator_id
+		AND b.browser_transaction_hash = s.browser_transaction_hash WHERE s.session_id = ?`)
+		.get(sessionId) as { browser_sequence: number };
+	return proof.browser_sequence + 1;
 }
 
 function authority(f: LinkFixture) {
@@ -93,6 +104,7 @@ function registerBasics(test: SessionTest) {
 				picture_url: fullProfile.pictureUrl,
 				source_session_id: session.sessionId,
 				source_signed_in_at_ms: issuedAt,
+				source_order: sourceOrder(f, session.sessionId),
 			},
 		]);
 		expect(authority(f)).toEqual(before);
@@ -137,6 +149,7 @@ function registerBasics(test: SessionTest) {
 				picture_url: null,
 				source_session_id: session.sessionId,
 				source_signed_in_at_ms: f.now,
+				source_order: sourceOrder(f, session.sessionId),
 			}),
 		]);
 		expect(authority(f)).toEqual(before);
@@ -160,6 +173,7 @@ function registerBasics(test: SessionTest) {
 			linkId: "other-link",
 			source_session_id: "other-session",
 			source_signed_in_at_ms: 0,
+			source_order: Number.MAX_SAFE_INTEGER,
 		};
 		const before = authority(f);
 		// Act
@@ -174,6 +188,7 @@ function registerBasics(test: SessionTest) {
 				link_id: session.linkId,
 				source_session_id: session.sessionId,
 				source_signed_in_at_ms: f.now,
+				source_order: sourceOrder(f, session.sessionId),
 			}),
 		]);
 		expect(Object.keys(profiles(f)[0] as object).sort()).toEqual([
@@ -183,6 +198,7 @@ function registerBasics(test: SessionTest) {
 			"email_verified",
 			"link_id",
 			"picture_url",
+			"source_order",
 			"source_session_id",
 			"source_signed_in_at_ms",
 		]);
@@ -191,6 +207,43 @@ function registerBasics(test: SessionTest) {
 }
 
 function registerOrdering(test: SessionTest) {
+	test.for([fullProfile, {}])(
+		"browser intent order wins reversed equal-clock completion with %j",
+		async (newestProfile, { fixture: f }) => {
+			// Arrange: both browser intents begin at the same clock; complete the newer one first.
+			await linked(f);
+			await consumeSigninProof(f, "2".repeat(64));
+			const newer = await f.store.signInWithConsumedBrowserTransaction(
+				{
+					...signInInput(f),
+					browserTransactionHash: "2".repeat(64),
+					credentialHash: otherCredentialHash,
+				},
+				browserProofConfig(f),
+			);
+			if (newer.kind !== "issued") throw new Error("fixture_newer_session_not_issued");
+			await record(f, newestProfile, otherCredentialHash);
+			const older = await f.store.signInWithConsumedBrowserTransaction(
+				signInInput(f),
+				browserProofConfig(f),
+			);
+			if (older.kind !== "issued") throw new Error("fixture_older_session_not_issued");
+			const before = { profile: profiles(f), authority: authority(f) };
+			// Act: delayed older completion must not revive older fields, even after an empty snapshot.
+			const stale = await record(f, { displayName: "Stale callback" });
+			const account = await f.store.readAuthSessionAccount(credentialHash, f.cfg);
+			// Assert: ordering comes from persisted browser_sequence, never timestamp or array position.
+			expect(sourceOrder(f, newer.session.sessionId)).toBeGreaterThan(
+				sourceOrder(f, older.session.sessionId),
+			);
+			expect(stale).toEqual({ kind: "not_recorded" });
+			expect(account).toEqual({ session: older.session, profile: newestProfile });
+			expect(profiles(f)).toEqual([
+				expect.objectContaining({ source_order: sourceOrder(f, newer.session.sessionId) }),
+			]);
+			expect({ profile: profiles(f), authority: authority(f) }).toEqual(before);
+		},
+	);
 	test.for(["older", "equal"] as const)(
 		"%s issuance cannot clobber the first/newer writer",
 		async (order, { fixture: f }) => {
@@ -247,7 +300,7 @@ function registerOrdering(test: SessionTest) {
 	}) => {
 		// Arrange
 		await linked(f);
-		const issued = await f.store.redeemAuthLinkSession(redeemInput(), f.cfg);
+		const issued = await f.store.redeemAuthLinkSessionWithBrowserTransaction(redeemInput(), f.cfg);
 		if (issued.kind !== "issued") throw new Error("fixture_session_not_issued");
 		const before = authority(f);
 		// Act
@@ -282,7 +335,11 @@ function registerHistoricalGuards(backend: Backend) {
 			},
 			authClock: () => NOW,
 		});
-		const f = { ...h, cfg: h.history.config, now: NOW };
+		const f = {
+			...h,
+			cfg: { ...h.history.config, redirectUri: "https://coordinator.example.test/auth/callback" },
+			now: NOW,
+		};
 		try {
 			expect(profiles(f)).toEqual([]);
 			const before = authority(f);
@@ -321,7 +378,11 @@ function registerHistoricalGuards(backend: Backend) {
 				},
 				authClock: () => NOW,
 			});
-			const f = { ...h, cfg: h.history.config, now: NOW };
+			const f = {
+				...h,
+				cfg: { ...h.history.config, redirectUri: "https://coordinator.example.test/auth/callback" },
+				now: NOW,
+			};
 			try {
 				expect(profiles(f)).toEqual([]);
 				const before = { profile: profiles(f), authority: authority(f) };
@@ -330,7 +391,7 @@ function registerHistoricalGuards(backend: Backend) {
 				const account = await f.store.readAuthSessionAccount(otherCredentialHash, f.cfg);
 				const session = await f.store.readAuthSession(otherCredentialHash, f.cfg);
 				// Assert
-				expect(result.kind).not.toBe("recorded");
+				expect(result).toEqual({ kind: "not_recorded" });
 				expect(account).toBeNull();
 				expect(session).toBeNull();
 				expect(profiles(f)).toEqual([]);
@@ -377,7 +438,11 @@ function registerGuards(test: SessionTest) {
 			const account = await f.store.readAuthSessionAccount(hash, cfg);
 			const session = await f.store.readAuthSession(hash, cfg);
 			// Assert
-			expect(result.kind).not.toBe("recorded");
+			expect(result).toEqual(
+				change === "disabled"
+					? { kind: "rejected", error: "auth_config_changed" }
+					: { kind: "not_recorded" },
+			);
 			expect(session).toBeNull();
 			expect(account).toBeNull();
 			expect({ profile: profiles(f), authority: authority(f) }).toEqual(before);
@@ -437,7 +502,7 @@ const invalidPictures = [
 	"https://images.example.test/\u202e",
 ] as const;
 
-function registerSanitization(test: SessionTest) {
+function registerSanitization(test: SessionTest, backend: Backend) {
 	test.for(invalidOptional)(
 		"drops malformed display scalar %j without coercion",
 		async (bad, { fixture: f }) => {
@@ -499,28 +564,44 @@ function registerSanitization(test: SessionTest) {
 		});
 		expect(profiles(f)).toEqual([expect.objectContaining({ email_verified: 0 })]);
 	});
-	test("invalid stored metadata is sanitized while session denial remains decisive", async ({
-		fixture: f,
-	}) => {
-		// Arrange: simulate a legacy/corrupted optional display row only.
-		const session = await signedIn(f);
-		await record(f);
-		f.db.exec("PRAGMA ignore_check_constraints = ON");
-		f.db
-			.prepare(
-				`UPDATE ${TABLE} SET display_name = ?, email = ?, email_verified = ?, picture_url = ?`,
-			)
-			.run("bad\u202e", "bad\nemail", 2, "http://unsafe.example.test/a");
-		f.db.exec("PRAGMA ignore_check_constraints = OFF");
-		const before = profiles(f);
-		// Act
-		const valid = await f.store.readAuthSessionAccount(credentialHash, f.cfg);
-		revokeLinkRow(f);
-		const denied = await f.store.readAuthSessionAccount(credentialHash, f.cfg);
-		// Assert
-		expect(valid).toEqual({ session, profile: {} });
-		expect(denied).toBeNull();
-		expect(profiles(f)).toEqual(before);
+	it("historical unsafe display metadata is sanitized while session denial remains decisive", async () => {
+		// Arrange: construct unsafe legacy display fields before installing current guards.
+		const h = setupHistoricalStore(backend, {
+			history: {
+				authority: "controller_attestation",
+				bornAtMs: NOW - 10,
+				session: {
+					credentialHash,
+					profile: {
+						displayName: "bad\u202e",
+						email: "bad\nemail",
+						emailVerified: false,
+						pictureUrl: "https://user:pass@unsafe.example.test/a",
+					},
+				},
+			},
+			authClock: () => NOW,
+		});
+		const f = {
+			...h,
+			now: NOW,
+			cfg: { ...h.history.config, redirectUri: "https://coordinator.example.test/auth/callback" },
+		};
+		try {
+			const session = await f.store.readAuthSession(credentialHash, f.cfg);
+			expect(session).not.toBeNull();
+			const before = profiles(f);
+			// Act
+			const valid = await f.store.readAuthSessionAccount(credentialHash, f.cfg);
+			revokeLinkRow(f);
+			const denied = await f.store.readAuthSessionAccount(credentialHash, f.cfg);
+			// Assert
+			expect(valid).toEqual({ session, profile: {} });
+			expect(denied).toBeNull();
+			expect(profiles(f)).toEqual(before);
+		} finally {
+			h.close();
+		}
 	});
 }
 
@@ -713,7 +794,7 @@ function registerCleanup(test: SessionTest) {
 		const scope = { coordinatorId: f.cfg.coordinatorId };
 		f.db
 			.prepare(
-				`INSERT INTO ${TABLE} SELECT 'other-coordinator', link_id, display_name, email, email_verified, picture_url, source_session_id, source_signed_in_at_ms FROM ${TABLE}`,
+				`INSERT INTO ${TABLE} SELECT 'other-coordinator', link_id, display_name, email, email_verified, picture_url, source_session_id, source_signed_in_at_ms, source_order FROM ${TABLE}`,
 			)
 			.run();
 		const before = authority(f);
@@ -745,18 +826,27 @@ function registerCleanup(test: SessionTest) {
 			await record(f);
 			const input = { linkId: linkId(f) };
 			const scope = { coordinatorId: f.cfg.coordinatorId };
-			if (fault === "absent") f.db.exec(`DROP TABLE ${TABLE}`);
-			else
-				f.db.exec(
-					`CREATE TRIGGER fixture_profile_delete_fault BEFORE DELETE ON ${TABLE} BEGIN SELECT RAISE(ABORT, 'private_backend_detail'); END`,
-				);
-			// Act
+			// Revoke while the current schema is intact; optional cleanup cannot undo it.
 			const revoke = await f.store.revokeAuthAccountLink(input, scope);
+			if (fault === "absent") {
+				f.db.exec(`DROP TABLE ${TABLE}`);
+				const revoked = authority(f);
+				// Act
+				const cleanup = f.store.clearRevokedAuthAccountProfile(input, scope);
+				// Assert: missing current DDL is a readiness failure, not a persistence fault.
+				expect(revoke).toEqual({ kind: "revoked" });
+				await expect(cleanup).rejects.toBeInstanceOf(CoordinatorAuthSchemaUpgradeRequiredError);
+				expect(authority(f)).toEqual(revoked);
+				return;
+			}
+			const restore = failAuthStatementRun(f.db, `DELETE FROM ${TABLE}`);
+			// Act
 			const revoked = authority(f);
 			const cleanup = f.store.clearRevokedAuthAccountProfile(input, scope);
 			// Assert
 			expect(revoke).toEqual({ kind: "revoked" });
 			await expect(cleanup).rejects.toThrow(/^auth_account_profile_persistence_error$/);
+			restore();
 			expect(authority(f)).toEqual(revoked);
 			expect(await f.store.readAuthSession(credentialHash, f.cfg)).toBeNull();
 			if (fault === "delete-abort") expect(profiles(f)).toHaveLength(1);
@@ -808,27 +898,32 @@ function registerCleanup(test: SessionTest) {
 			expect({ profile: profiles(f), authority: authority(f) }).toEqual(before);
 		},
 	);
-	test.for(["INSERT", "UPDATE"] as const)(
-		"SQL %s abort preserves the previously recorded profile and all authority",
-		async (event, { fixture: f }) => {
+}
+
+function registerWriteFaults(test: SessionTest) {
+	test.for(["insert", "replace"] as const)(
+		"SQL upsert %s execution failure preserves profiles and all authority",
+		async (mode, { fixture: f }) => {
 			// Arrange
 			await signedIn(f);
-			await record(f);
+			if (mode === "replace") await record(f);
 			f.now += 1;
 			await secondSignIn(f);
-			const triggerFired = vi.fn(() => null);
-			f.db.function("fixture_profile_fault_fired", triggerFired);
-			// Isolate each trigger so INSERT cannot mask the upsert's UPDATE failure.
-			f.db.exec(
-				`CREATE TRIGGER fixture_profile_${event.toLowerCase()}_fault BEFORE ${event} ON ${TABLE} BEGIN SELECT fixture_profile_fault_fired(); SELECT RAISE(ABORT, 'private_backend_detail'); END`,
-			);
+			const restore = failAuthStatementRun(f.db, `INSERT INTO ${TABLE}`);
 			const before = { profile: profiles(f), authority: authority(f) };
 			// Act
 			const write = record(f, { displayName: "Must not persist" }, otherCredentialHash);
 			// Assert
-			await expect(write).rejects.toThrow(/^auth_account_profile_persistence_error$/);
-			expect(triggerFired).toHaveBeenCalledTimes(1);
+			try {
+				await expect(write).rejects.toThrow(/^auth_account_profile_persistence_error$/);
+			} finally {
+				restore();
+			}
 			expect({ profile: profiles(f), authority: authority(f) }).toEqual(before);
+			expect(await record(f, { displayName: "Recovered" }, otherCredentialHash)).toEqual({
+				kind: "recorded",
+			});
+			expect(profiles(f)).toEqual([expect.objectContaining({ display_name: "Recovered" })]);
 		},
 	);
 }
@@ -839,10 +934,11 @@ function registerBackend(backend: Backend) {
 	registerOrdering(test);
 	registerGuards(test);
 	registerHistoricalGuards(backend);
-	registerSanitization(test);
+	registerSanitization(test, backend);
 	registerInput(test);
 	registerNamespace(test);
 	registerCleanup(test);
+	registerWriteFaults(test);
 }
 
 describe.each(["SQLite", "D1"] as const)(

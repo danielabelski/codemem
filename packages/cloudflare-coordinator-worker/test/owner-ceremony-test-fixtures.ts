@@ -1,6 +1,7 @@
 import { env } from "cloudflare:workers";
 import { createHash } from "node:crypto";
 import type { AuthLinkBackend, AuthLinkStatement } from "../../core/src/coordinator-auth-link.js";
+import { authLifecycleFirstLinkStatements } from "../../core/src/coordinator-auth-lifecycle-first-link.js";
 import { issueBrowserCookie } from "../../core/src/coordinator-browser-credential.js";
 import {
 	importBrowserCsrfKey,
@@ -115,10 +116,7 @@ export async function disposeNativeAuthFixture() {
 	]);
 }
 
-/** Synthetic reviewed historical facts only; never creates enrollment or grants.
- * This is the first-link activation seam: add association/generation/floor writes
- * here when the installed fixture schema and runtime activate V3 together.
- */
+/** Synthetic reviewed first-link facts only; never creates enrollment or grants. */
 export async function seedNativeOwnerAuthority(pins: {
 	coordinatorId: string;
 	issuer: string;
@@ -168,24 +166,25 @@ export async function seedNativeOwnerAuthority(pins: {
 			state: "consumed", nonce: null, pkce_verifier: null, claim_token: hash(`${browserHash}:claim`),
 			created_at_ms: birth - 90, expires_at_ms: birth + 599910, consumed_at_ms: birth - 70,
 		}],
-		["coordinator_auth_account_links", {
-			coordinator_id: pins.coordinatorId, link_id: pins.linkId, issuer: pins.issuer,
-			subject: pins.subject, identity_id: pins.identityId, attempt_id: pins.attemptId,
-			controller_attestation_id: pins.controllerAttestationId, auth_config_revision: pins.revision,
-			created_at_ms: birth, revoked_at_ms: null, authority_kind: "controller_attestation",
-			device_claim_id: null,
-		}],
 		["coordinator_auth_link_audit_log", {
 			...common, link_id: pins.linkId, attempt_id: pins.attemptId,
 			action: "link_created", device_claim_id: null, created_at_ms: birth,
 		}],
 	];
-	await env.COORDINATOR_DB.batch(facts.map(([table, row]) => {
+	const insert = ([table, row]: (typeof facts)[number]) => {
 		const entries = Object.entries(row);
 		return env.COORDINATOR_DB.prepare(
 			`INSERT INTO ${table} (${entries.map(([key]) => key).join(",")}) VALUES (${entries.map(() => "?").join(",")})`,
 		).bind(...entries.map(([, value]) => value));
-	}));
+	};
+	await env.COORDINATOR_DB.batch([
+		...facts.slice(0, 2).map(insert),
+		...authLifecycleFirstLinkStatements({
+			coordinatorId: pins.coordinatorId, issuer: pins.issuer, authConfigRevision: pins.revision,
+			attemptId: pins.attemptId, linkId: pins.linkId, now: birth,
+		}).map(prepare),
+		...facts.slice(2).map(insert),
+	]);
 }
 
 export async function pendingKey() {

@@ -53,7 +53,12 @@ function registerSmoke(test: fixtures.Test) {
 		const before = grants(f);
 		f.now += 60_000;
 		const cfg = config(f);
-		const link = { ...material, purpose: "link" as const, attemptId: input.attemptId };
+		const link = {
+			...material,
+			purpose: "link" as const,
+			attemptId: input.attemptId,
+			browserStartHash: input.browserStartHash,
+		};
 		const resolve = { attemptId: input.attemptId, binderHash: material.binderHash };
 		const wrongBinder = { ...resolve, binderHash: "3".repeat(64) };
 		// Act
