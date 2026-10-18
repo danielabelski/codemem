@@ -5,7 +5,7 @@ import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { createCoordinatorBrowserAccount } from "../../core/src/coordinator-browser-account.js";
 import { createCoordinatorBrowserAuthCallback } from "../../core/src/coordinator-browser-auth-callback.js";
 import {
-	clearBrowserCookie,
+	BROWSER_COOKIE_NAMES,
 	issueBrowserCookie,
 	readBrowserCookie,
 } from "../../core/src/coordinator-browser-credential.js";
@@ -289,10 +289,9 @@ it("native D1 fake-Google flow waits for device proofs, finishes and reads the l
 	expect(complete.response.status).toBe(303);
 	expect(complete.response.headers.get("location")).toBe(`${ORIGIN}/auth/account`);
 	const cookies = complete.response.headers.getSetCookie();
-	expect(cookies).toHaveLength(2);
-	expect(cookies).toContain(clearBrowserCookie("transaction"));
-	const sessionCookie =
-		cookies.find((cookie) => cookie !== clearBrowserCookie("transaction"))?.split(";")[0] ?? "";
+	expect(cookies).toHaveLength(1);
+	expect(cookies[0]).toMatch(/^__Host-codemem-session=/);
+	const sessionCookie = cookies[0].split(";")[0];
 	expect(sessionCookie).not.toBe(staleCookie);
 	const parsed = await readBrowserCookie(sessionCookie, "session");
 	if (parsed.kind !== "present") throw new Error("Returned SESSION missing");
@@ -375,7 +374,7 @@ it("native D1 rejects wrong origin/proof and defers pending completion despite a
 	);
 	// Assert
 	expect(preserved.response.status).toBe(303);
-	expect(preserved.response.headers.getSetCookie()).toEqual([clearBrowserCookie("transaction")]);
+	expect(preserved.response.headers.getSetCookie()).toEqual([]);
 	expect(f.operations.redeemAuthLinkSessionWithBrowserTransaction).not.toHaveBeenCalled();
 	f.operations.readAuthSession.mockClear();
 	// Arrange: same enrolled device starts a second LINK while its prior session remains live.
@@ -476,7 +475,7 @@ it.each(["browser replay", "bound redemption", "wrong-binder redemption"] as con
 		// Assert: no rotation, extension, new receipt or unrelated authority/profile mutation.
 		expect(preserved.response.status).toBe(303);
 		expect(preserved.response.headers.get("location")).toBe(`${ORIGIN}/auth/account`);
-		expect(preserved.response.headers.getSetCookie()).toEqual([clearBrowserCookie("transaction")]);
+		expect(preserved.response.headers.getSetCookie()).toEqual([]);
 		expect(f.operations.redeemAuthLinkSessionWithBrowserTransaction).not.toHaveBeenCalled();
 		expect(f.operations.preserveAuthLinkSessionCompletion).toHaveBeenCalledExactlyOnceWith(
 			{ ...redemption, credentialHash: session.cookieHash },
@@ -657,7 +656,14 @@ it.each(["preserve", "redeem"])(
 		expect(after.profiles).toEqual(before.profiles);
 		expect(after.device).toEqual(before.device);
 		expect((await rows(f))[0].state).toBe("session_redeemed");
-		expect(winner.response.headers.getSetCookie()).toHaveLength(1 + added);
+		expect(winner.response.headers.getSetCookie()).toHaveLength(added);
+		if (added) {
+			const issued = winner.response.headers.getSetCookie()[0];
+			expect(issued).toMatch(new RegExp(`^${BROWSER_COOKIE_NAMES.session}=[A-Za-z0-9_-]{43};`));
+			const session = await readBrowserCookie(issued.split(";")[0], "session");
+			if (session.kind !== "present") throw new Error("Missing winning SESSION");
+			expect(after.sessions.slice(before.sessions.length)).toEqual([expect.objectContaining({ credential_hash: session.cookieHash })]);
+		}
 	},
 );
 

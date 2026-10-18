@@ -7,7 +7,6 @@ import { type Backend, setupStore } from "./coordinator-auth-store-test-fixtures
 import { createCoordinatorBrowserAuthCallback } from "./coordinator-browser-auth-callback.js";
 import {
 	BROWSER_COOKIE_NAMES,
-	clearBrowserCookie,
 	issueBrowserCookie,
 	readBrowserCookie,
 } from "./coordinator-browser-credential.js";
@@ -85,7 +84,7 @@ type Harness = Awaited<ReturnType<typeof harness>>;
 function rows(f: Harness, table = TABLE) {
 	return f.db.prepare(`SELECT * FROM ${table}`).all() as Record<string, unknown>[];
 }
-function authority(f: Harness) {
+function authority(f: Harness, options: { browserAllocation?: boolean } = {}) {
 	const tables = f.db
 		.prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
 		.all() as { name: string }[];
@@ -95,7 +94,14 @@ function authority(f: Harness) {
 		"coordinator_auth_session_receipts",
 		"coordinator_auth_account_profiles",
 	]);
-	return tables.filter(({ name }) => !allowed.has(name)).map(({ name }) => [name, rows(f, name)]);
+	return tables
+		.filter(({ name }) => !allowed.has(name))
+		.map(({ name }) => [
+			name,
+			rows(f, name).filter(
+				(row) => !options.browserAllocation || name !== "sqlite_sequence" || row.name !== TABLE,
+			),
+		]);
 }
 async function ceremony(f: Harness) {
 	const page = await f.start.signInPage(new Request(`${ORIGIN}/auth/sign-in`));
@@ -127,6 +133,9 @@ async function ceremony(f: Harness) {
 	if (!original) throw new Error("Expected matching transaction row");
 	return {
 		cookie,
+		startCookie,
+		csrf,
+		response: start.response,
 		authorization,
 		url: f.oidc.authorize(authorization),
 		original: { ...original },
@@ -184,6 +193,139 @@ function assertProviderProof(observations: ReturnType<typeof providerAfterConsum
 	}
 }
 
+type RetryFault =
+	| "provider-denied"
+	| "provider-nonce"
+	| "unlinked"
+	| "revoked"
+	| "internal-admission";
+async function failedSignin(f: Harness, fault: RetryFault) {
+	if (fault !== "unlinked") await linked({ ...f, store: f.persistence });
+	const c = await ceremony(f);
+	if (fault === "revoked") {
+		// Admin-only store capability is fixture setup, never authority from browser claims.
+		const link = rows(f, "coordinator_auth_account_links")[0];
+		if (!link || typeof link.link_id !== "string") throw new Error("Expected reviewed link");
+		expect(await f.persistence.revokeAuthAccountLink({ linkId: link.link_id }, f.cfg)).toEqual({
+			kind: "revoked",
+		});
+	}
+	if (fault === "provider-denied") {
+		c.url.searchParams.delete("code");
+		c.url.searchParams.set("error", "access_denied");
+	}
+	if (fault === "provider-nonce") f.oidc.claims.nonce = "wrong-nonce";
+	if (fault === "internal-admission")
+		f.store.signInWithConsumedBrowserTransaction.mockRejectedValueOnce(
+			new Error(PROVIDER.clientSecret),
+		);
+	const before = authority(f);
+	const reply = await f.callback(request(c));
+	expect(reply.response.status).toBe(fault === "internal-admission" ? 503 : 403);
+	expect(reply.response.headers.getSetCookie()).toEqual([]);
+	consumed(f, c);
+	expect(rows(f, "coordinator_auth_sessions")).toEqual([]);
+	expect(rows(f, "coordinator_auth_session_receipts")).toEqual([]);
+	expect(authority(f)).toEqual(before);
+	await privateSafe(reply.response, c, reply.outcome);
+	if (fault === "provider-nonce") delete f.oidc.claims.nonce;
+	return { c, reply };
+}
+
+async function staleStartDenied(f: Harness, c: Ceremony, cookie: string) {
+	// Deliberately replay the original nonempty START credential, not its deletion header.
+	const result = await f.start.signInStart(
+		new Request(`${ORIGIN}/auth/sign-in`, {
+			method: "POST",
+			headers: {
+				cookie: `${cookie}; ${c.startCookie}`,
+				origin: ORIGIN,
+				"content-type": "application/x-www-form-urlencoded",
+			},
+			body: new URLSearchParams({ csrf: c.csrf }),
+		}),
+		"trusted-client",
+	);
+	expect(result.response.status).toBe(409);
+	expect(result.outcome).toBe("start_conflict");
+	expect(result.response.headers.getSetCookie()).toEqual([]);
+}
+
+// HTTP cookie-header model only: expiration/deletion headers never become Cookie pairs.
+function callbackCookies() {
+	const cookies = new Map<string, { value: string; expiresAt: number }>();
+	return {
+		apply(response: Response) {
+			for (const header of response.headers.getSetCookie()) {
+				const [pair, ...attributes] = header.split(";").map((value) => value.trim());
+				const separator = pair.indexOf("=");
+				const name = pair.slice(0, separator);
+				const maxAge = attributes.find((value) => /^max-age=/i.test(value))?.slice(8);
+				const expiry = attributes.find((value) => /^expires=/i.test(value))?.slice(8);
+				let expiresAt = expiry === undefined ? Number.POSITIVE_INFINITY : Date.parse(expiry);
+				if (maxAge !== undefined && /^-?\d+$/.test(maxAge)) expiresAt = NOW + Number(maxAge) * 1000;
+				if (expiresAt <= NOW) cookies.delete(name);
+				else cookies.set(name, { value: pair.slice(separator + 1), expiresAt });
+			}
+		},
+		header(now = NOW) {
+			return [...cookies]
+				.filter(([, cookie]) => cookie.expiresAt > now)
+				.map(([name, cookie]) => `${name}=${cookie.value}`)
+				.join("; ");
+		},
+	};
+}
+
+async function retryStart(f: Harness, jar: ReturnType<typeof callbackCookies>) {
+	const page = await f.start.signInPage(
+		new Request(`${ORIGIN}/auth/sign-in`, { headers: { cookie: jar.header() } }),
+	);
+	expect(page.response.status).toBe(200);
+	expect(page.outcome).toBe("signin_page");
+	jar.apply(page.response);
+	const csrf = /name="csrf" value="([A-Za-z0-9_-]+)"/.exec(await page.response.text())?.[1];
+	if (!csrf) throw new Error("Expected fresh retry CSRF form");
+	const credential = await readBrowserCookie(jar.header(), "start");
+	if (credential.kind !== "present") throw new Error("Expected fresh retry START credential");
+	const result = await f.start.signInStart(
+		new Request(`${ORIGIN}/auth/sign-in`, {
+			method: "POST",
+			headers: {
+				cookie: jar.header(),
+				origin: ORIGIN,
+				"content-type": "application/x-www-form-urlencoded",
+			},
+			body: new URLSearchParams({ csrf }),
+		}),
+		"trusted-client",
+	);
+	expect(result.response.status).toBe(200);
+	expect(result.outcome).toBe("signin_started");
+	jar.apply(result.response);
+	expect(await readBrowserCookie(jar.header(), "start")).toMatchObject({ kind: "absent" });
+	const transaction = await readBrowserCookie(jar.header(), "transaction");
+	if (transaction.kind !== "present") throw new Error("Expected replacement retry TXN");
+	expect(transaction.cookieHash).toBe(credential.cookieHash);
+	const href = /href="(https:\/\/accounts\.google\.com\/authorize[^"]+)"/.exec(
+		await result.response.text(),
+	)?.[1];
+	if (!href) throw new Error("Expected retry provider authorization link");
+	const url = new URL(href.replaceAll("&amp;", "&"));
+	const stateHash = createHash("sha256")
+		.update(url.searchParams.get("state") ?? "")
+		.digest("hex");
+	const row = rows(f).find((row) => row.state_hash === stateHash);
+	expect(row).toMatchObject({
+		purpose: "signin",
+		state: "pending",
+		binder_hash: transaction.cookieHash,
+		nonce: expect.any(String),
+		pkce_verifier: expect.any(String),
+	});
+	return { transaction, row };
+}
+
 describe.each(["SQLite", "D1"] as const)(
 	"%s callback uses original durable proof before SDK exchange",
 	(backend) => {
@@ -205,11 +347,10 @@ describe.each(["SQLite", "D1"] as const)(
 			// Assert
 			expect(reply.response.status).toBe(303);
 			expect(reply.response.headers.get("location")).toBe(`${ORIGIN}/auth/account`);
-			expect(cookies).toHaveLength(2);
+			expect(cookies).toHaveLength(1);
 			expect(cookies[0]).toMatch(
 				/^__Host-codemem-session=[A-Za-z0-9_-]{43}; Max-Age=28800; Path=\/; Secure; HttpOnly; SameSite=Lax$/,
 			);
-			expect(cookies[1]).toBe(clearBrowserCookie("transaction"));
 			if (session.kind !== "present") throw new Error("Expected fresh session credential");
 			const raw = cookies[0]?.split(";")[0]?.split("=")[1] ?? "";
 			expect(session.cookieHash).toBe(
@@ -431,7 +572,7 @@ describe("actual SDK rejects token and authorization protocol attacks after cons
 		const reply = await f.callback(request(c));
 		// Assert
 		expect(reply.response.status).toBe(403);
-		expect(reply.response.headers.getSetCookie()).toEqual([clearBrowserCookie("transaction")]);
+		expect(reply.response.headers.getSetCookie()).toEqual([]);
 		consumed(f, c);
 		assertProviderProof(observations, c);
 		if (
@@ -500,7 +641,7 @@ describe("guarded admission and existing session preservation", () => {
 			// Assert
 			expect(reply.response.status).toBe(403);
 			expect(await reply.response.clone().text()).toBe(await generic.response.text());
-			expect(reply.response.headers.getSetCookie()).toEqual([clearBrowserCookie("transaction")]);
+			expect(reply.response.headers.getSetCookie()).toEqual([]);
 			expect(rows(f, "coordinator_auth_sessions")).toEqual(before);
 			expect(f.store.recordAuthAccountProfile).not.toHaveBeenCalled();
 			consumed(f, c);
@@ -538,7 +679,7 @@ describe("guarded admission and existing session preservation", () => {
 			// Assert: no account switch, rotation, false sign-in receipt, or profile write.
 			expect(reply.response.status).toBe(303);
 			expect(reply.response.headers.get("location")).toBe(`${ORIGIN}/auth/account`);
-			expect(reply.response.headers.getSetCookie()).toEqual([clearBrowserCookie("transaction")]);
+			expect(reply.response.headers.getSetCookie()).toEqual([]);
 			expect(f.store.readAuthSession).toHaveBeenCalledWith(old.cookieHash, publicConfig());
 			expect(rows(f, "coordinator_auth_sessions")).toEqual(before);
 			expect(rows(f, "coordinator_auth_session_receipts")).toEqual(receipts);
@@ -568,7 +709,8 @@ describe("guarded admission and existing session preservation", () => {
 			// Assert
 			expect(reply.response.status).toBe(303);
 			expect(reply.outcome).toBe("signed_in_profile_not_recorded");
-			expect(reply.response.headers.getSetCookie()).toHaveLength(2);
+			expect(reply.response.headers.getSetCookie()).toHaveLength(1);
+			expect(reply.response.headers.getSetCookie()[0]).toMatch(/^__Host-codemem-session=/);
 			expect(rows(f, "coordinator_auth_sessions")).toHaveLength(1);
 			await privateSafe(reply.response, c, reply.outcome);
 		},
@@ -614,10 +756,11 @@ describe("callback concurrency and immutable request snapshots", () => {
 		expect(replies.map((r) => r.response.status).sort()).toEqual([
 			303, 403, 403, 403, 403, 403, 403, 403,
 		]);
-		for (const reply of replies)
-			expect(reply.response.headers.getSetCookie()).toHaveLength(
-				reply.response.status === 303 ? 2 : 0,
-			);
+		for (const reply of replies) {
+			const cookies = reply.response.headers.getSetCookie();
+			expect(cookies).toHaveLength(reply.response.status === 303 ? 1 : 0);
+			if (reply.response.status === 303) expect(cookies[0]).toMatch(/^__Host-codemem-session=/);
+		}
 		expect(rows(f, "coordinator_auth_sessions")).toHaveLength(1);
 		expect(f.oidc.fetch.mock.calls.filter(([url]) => url.endsWith("/token"))).toHaveLength(1);
 		assertProviderProof(observations, c);
@@ -653,3 +796,149 @@ describe("callback concurrency and immutable request snapshots", () => {
 		expect(rows(f, "coordinator_auth_sessions")).toHaveLength(1);
 	});
 });
+
+describe.each(["SQLite", "D1"] as const)(
+	"%s failed signin retry with retained browser cookies",
+	(backend) => {
+		it.each([
+			"provider-denied",
+			"provider-nonce",
+			"unlinked",
+			"revoked",
+			"internal-admission",
+		] as const)(
+			"%s consumption permits a fresh credential-bearing start but never reuses the old proof",
+			async (fault) => {
+				// Arrange: exercise the real callback, SDK, store consumption and failure boundary.
+				const f = await harness(backend);
+				const { c, reply } = await failedSignin(f, fault);
+				const jar = callbackCookies();
+				jar.apply(c.response);
+				const retained = jar.header();
+				jar.apply(reply.response);
+				expect(jar.header()).toBe(retained);
+				expect(await readBrowserCookie(jar.header(), "start")).toMatchObject({ kind: "absent" });
+				const txn = await readBrowserCookie(jar.header(), "transaction");
+				if (txn.kind !== "present") throw new Error("Expected retained failed TXN");
+				const before = authority(f, { browserAllocation: true });
+				const history = rows(f);
+				// Act / Assert: failed proof is inactive, but malformed credentials/config stay denied.
+				expect(
+					await f.persistence.readAuthBrowserTransactionActivity(
+						{ binderHash: txn.cookieHash },
+						f.cfg,
+					),
+				).toEqual({ kind: "inactive" });
+				expect(
+					await f.persistence.readAuthBrowserTransactionActivity({ binderHash: "bad" }, f.cfg),
+				).toEqual({ kind: "rejected", error: "invalid_input" });
+				expect(
+					await f.persistence.readAuthBrowserTransactionActivity(
+						{ binderHash: txn.cookieHash },
+						{ ...f.cfg, revision: "b".repeat(64) },
+					),
+				).toEqual({ kind: "rejected", error: "auth_config_changed" });
+				const invalid = await f.start.signInPage(
+					new Request(`${ORIGIN}/auth/sign-in`, {
+						headers: { cookie: `${BROWSER_COOKIE_NAMES.transaction}=bad` },
+					}),
+				);
+				expect(invalid.response.status).toBe(400);
+				expect(invalid.response.headers.getSetCookie()).toEqual([]);
+				await staleStartDenied(f, c, jar.header());
+				expect(rows(f)).toEqual(history);
+				const allocation = f.db
+					.prepare("SELECT seq FROM sqlite_sequence WHERE name=?")
+					.get(TABLE) as { seq: number };
+				// Act: the old TXN stays in the real GET/POST cookie jar beside a newly issued START.
+				const fresh = await retryStart(f, jar);
+				// Assert: exactly one new pending proof, with no history/authority/SID mutation.
+				expect(fresh.transaction.cookieHash).not.toBe(txn.cookieHash);
+				expect(
+					await f.persistence.readAuthBrowserTransactionActivity(
+						{ binderHash: fresh.transaction.cookieHash },
+						f.cfg,
+					),
+				).toEqual({ kind: "active" });
+				expect(rows(f).filter((row) => row.binder_hash !== fresh.transaction.cookieHash)).toEqual(
+					history,
+				);
+				expect(f.db.prepare("SELECT seq FROM sqlite_sequence WHERE name=?").get(TABLE)).toEqual({
+					seq: allocation.seq + 1,
+				});
+				expect(authority(f, { browserAllocation: true })).toEqual(before);
+				f.oidc.fetch.mockClear();
+				const pending = rows(f);
+				// Act: replay both the original request and its old URL with the replacement TXN.
+				for (const cookie of [c.cookie, jar.header()]) {
+					const replay = await f.callback(request(c, cookie));
+					expect(replay.response.status).toBe(403);
+					expect(replay.response.headers.getSetCookie()).toEqual([]);
+					jar.apply(replay.response);
+				}
+				// Assert: no extra exchange, replay, cookie deletion, session or profile grant.
+				expect(f.oidc.fetch).not.toHaveBeenCalled();
+				expect(rows(f)).toEqual(pending);
+				expect(rows(f, "coordinator_auth_sessions")).toEqual([]);
+				expect(rows(f, "coordinator_auth_session_receipts")).toEqual([]);
+				expect(f.store.recordAuthAccountProfile).not.toHaveBeenCalled();
+				expect(await readBrowserCookie(jar.header(), "transaction")).toMatchObject({
+					kind: "present",
+					cookieHash: fresh.transaction.cookieHash,
+				});
+				expect(jar.header(NOW + 86_400_000)).toBe("");
+			},
+		);
+	},
+);
+
+describe.each(["SQLite", "D1"] as const)(
+	"%s ambiguous consumption keeps truthful activity",
+	(backend) => {
+		it.each(["before-commit", "after-commit"] as const)(
+			"%s throw never guesses away a pending transaction",
+			async (stage) => {
+				// Arrange: only the consume operation fails; activity and start use the real store.
+				const f = await harness(backend);
+				const c = await ceremony(f);
+				f.store.consumeAuthBrowserTransaction.mockImplementationOnce(async (...args) => {
+					if (stage === "after-commit") await f.persistence.consumeAuthBrowserTransaction(...args);
+					throw new Error(PROVIDER.clientSecret);
+				});
+				const jar = callbackCookies();
+				jar.apply(c.response);
+				const cookie = jar.header();
+				// Act
+				const reply = await f.callback(request(c));
+				jar.apply(reply.response);
+				const activity = await f.persistence.readAuthBrowserTransactionActivity(
+					{ binderHash: String(c.original.binder_hash) },
+					f.cfg,
+				);
+				// Assert: no provider exchange or cookie mutation on an ambiguous response.
+				expect(reply.response.status).toBe(503);
+				expect(reply.response.headers.getSetCookie()).toEqual([]);
+				expect(jar.header()).toBe(cookie);
+				expect(f.oidc.fetch).not.toHaveBeenCalled();
+				if (stage === "before-commit") {
+					expect(activity).toEqual({ kind: "active" });
+					const blocked = await f.start.signInPage(
+						new Request(`${ORIGIN}/auth/sign-in`, { headers: { cookie } }),
+					);
+					expect(blocked.response.status).toBe(409);
+					expect(blocked.outcome).toBe("signin_in_progress");
+					expect(blocked.response.headers.getSetCookie()).toEqual([]);
+					expect(rows(f).find((row) => row.state_hash === c.original.state_hash)).toEqual(
+						c.original,
+					);
+				} else {
+					expect(activity).toEqual({ kind: "inactive" });
+					consumed(f, c);
+					await retryStart(f, jar);
+				}
+				expect(rows(f, "coordinator_auth_sessions")).toEqual([]);
+				expect(rows(f, "coordinator_auth_session_receipts")).toEqual([]);
+			},
+		);
+	},
+);

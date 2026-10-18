@@ -25,6 +25,7 @@ import {
 	type CoordinatorAuthBrowserConfig,
 	type CoordinatorAuthBrowserTransactionConsumeInput,
 	type CoordinatorAuthBrowserTransactionMaintenanceOptions,
+	type CoordinatorAuthBrowserTransactionPurposeStore,
 	type CoordinatorAuthBrowserTransactionRetirementOptions,
 	type CoordinatorAuthBrowserTransactionScope,
 	type CoordinatorAuthBrowserTransactionStartInput,
@@ -755,7 +756,9 @@ function enrollmentRevocationKeyId(publicKey: string): string | null {
 	return createHash("sha256").update(parsed.blob).digest("hex");
 }
 
-export class BetterSqliteCoordinatorStore implements CoordinatorStore {
+export class BetterSqliteCoordinatorStore
+	implements CoordinatorStore, CoordinatorAuthBrowserTransactionPurposeStore
+{
 	readonly path: string;
 	readonly db: DatabaseType;
 	private readonly authLinks: AuthLinkOperations;
@@ -833,6 +836,12 @@ export class BetterSqliteCoordinatorStore implements CoordinatorStore {
 		config: CoordinatorAuthBrowserConfig,
 	) {
 		return this.authBrowserTransactions.consumeAuthBrowserTransaction(input, config);
+	}
+	async readAuthBrowserTransactionPurpose(
+		input: CoordinatorAuthBrowserTransactionConsumeInput,
+		config: CoordinatorAuthBrowserConfig,
+	) {
+		return this.authBrowserTransactions.readAuthBrowserTransactionPurpose(input, config);
 	}
 	async resolveAuthLinkBrowserTransaction(
 		input: CoordinatorAuthLinkBrowserTransactionResolveInput,

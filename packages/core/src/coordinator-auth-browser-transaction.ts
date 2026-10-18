@@ -308,22 +308,26 @@ export class CoordinatorAuthBrowserTransactions implements CoordinatorAuthBrowse
 		// fails closed, even for an expired row; unrelated coordinators never match.
 		const row = await this.first<{ activity: string }>({
 			sql: `SELECT CASE
- WHEN b.issuer <> ? OR b.auth_config_revision <> ? OR b.redirect_uri <> ? THEN 'config_changed'
+ WHEN b.coordinator_id <> ? OR b.issuer <> ? OR b.auth_config_revision <> ? OR b.redirect_uri <> ? THEN 'config_changed'
  WHEN b.state = 'expired' OR b.expires_at_ms <= ? THEN 'inactive'
+ WHEN b.purpose = 'signin' AND b.state = 'consumed' THEN 'inactive'
  WHEN b.purpose = 'link' AND EXISTS (SELECT 1 FROM coordinator_auth_link_attempts a
  WHERE a.coordinator_id = b.coordinator_id AND a.attempt_id = b.attempt_id
  AND a.browser_transaction_hash = b.browser_transaction_hash AND a.issuer = b.issuer
  AND a.auth_config_revision = b.auth_config_revision
  AND (a.state IN ('finalized','session_redeemed','failed','expired') OR a.expires_at_ms <= ?))
- THEN 'inactive'
- WHEN b.purpose = 'link_change' AND NOT EXISTS (SELECT 1 FROM coordinator_auth_link_change_attempts change_attempt
- WHERE change_attempt.coordinator_id = b.coordinator_id AND change_attempt.attempt_id = b.attempt_id
- AND change_attempt.browser_transaction_hash = b.browser_transaction_hash AND change_attempt.issuer = b.issuer
- AND change_attempt.auth_config_revision = b.auth_config_revision
- AND change_attempt.state IN ('pending','browser_claimed','oidc_verified','confirmed') AND change_attempt.expires_at_ms > ?)
  THEN 'inactive' ELSE 'active' END AS activity
- FROM ${TABLE} b WHERE b.coordinator_id = ? AND b.binder_hash = ?`,
-			values: [c.issuer, c.revision, c.redirectUri, now, now, now, c.coordinatorId, i.binderHash],
+ FROM ${TABLE} b WHERE b.binder_hash = ? ORDER BY (b.coordinator_id = ?) DESC LIMIT 1`,
+			values: [
+				c.coordinatorId,
+				c.issuer,
+				c.revision,
+				c.redirectUri,
+				now,
+				now,
+				i.binderHash,
+				c.coordinatorId,
+			],
 		});
 		if (!row || row.activity === "inactive") return { kind: "inactive" };
 		if (row.activity === "active") return { kind: "active" };

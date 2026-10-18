@@ -14,7 +14,6 @@ import {
 import {
 	type BrowserCookieReadResult,
 	type BrowserCookieSecret,
-	clearBrowserCookie,
 	issueBrowserCookie,
 	readBrowserCookie,
 } from "./coordinator-browser-credential.js";
@@ -184,19 +183,15 @@ function result(
 ): CoordinatorBrowserAuthCallbackResponse {
 	return Object.freeze({ response, outcome });
 }
-function clearTransaction(headers: Headers): void {
-	headers.append("Set-Cookie", clearBrowserCookie("transaction"));
-}
 async function notice(
 	status: number,
 	outcome: CoordinatorBrowserAuthCallbackOutcome,
-	options: { clearTransaction?: boolean; allow?: string } = {},
+	options: { allow?: string } = {},
 ): Promise<CoordinatorBrowserAuthCallbackResponse> {
 	try {
 		const page = await renderAuthBrowserNotice("auth_unavailable");
 		const headers = new Headers(page.headers);
 		if (options.allow) headers.set("Allow", options.allow);
-		if (options.clearTransaction) clearTransaction(headers);
 		return result(new Response(page.body, { status, headers }), outcome);
 	} catch {
 		const headers = new Headers({
@@ -206,7 +201,6 @@ async function notice(
 			"X-Content-Type-Options": "nosniff",
 		});
 		if (options.allow) headers.set("Allow", options.allow);
-		if (options.clearTransaction) clearTransaction(headers);
 		return result(
 			new Response(
 				"Sign-in or linking unavailable. Return to the flow you started and try again.",
@@ -223,7 +217,6 @@ function accountResponse(context: Context, sessionCookie?: string): Response {
 		"Referrer-Policy": "no-referrer",
 	});
 	if (sessionCookie) headers.append("Set-Cookie", sessionCookie);
-	clearTransaction(headers);
 	return new Response(null, { status: 303, headers });
 }
 function callbackState(
@@ -326,7 +319,7 @@ async function signIn(
 	consumed: Consumed,
 	verification: Readonly<Verification>,
 ): Promise<CoordinatorBrowserAuthCallbackResponse> {
-	if (!verification.ok) return notice(403, "verification_failed", { clearTransaction: true });
+	if (!verification.ok) return notice(403, "verification_failed");
 	const existing = await readBrowserCookie(snapshot.cookie, "session");
 	if (existing.kind === "invalid") throw new Error();
 	if (
@@ -345,8 +338,7 @@ async function signIn(
 		},
 		context.storeConfig,
 	);
-	if (persisted.kind !== "issued")
-		return notice(403, "signin_rejected", { clearTransaction: true });
+	if (persisted.kind !== "issued") return notice(403, "signin_rejected");
 	return recordProfile(context, issued.cookieHash, verification, response);
 }
 async function dispatchOwnerCallback(
@@ -369,7 +361,6 @@ async function callback(
 	request: Request,
 	trustedClientKey: string,
 ): Promise<CoordinatorBrowserAuthCallbackResponse> {
-	let clearSigninTransaction = false;
 	try {
 		const snapshot = snapshotRequest(request);
 		if (snapshot.method !== "GET") return await notice(405, "method_not_allowed", { allow: "GET" });
@@ -394,15 +385,14 @@ async function callback(
 			context.storeConfig,
 		);
 		if (consumed.kind !== "consumed") return await notice(403, "transaction_unavailable");
-		clearSigninTransaction = consumed.purpose === "signin";
 		const verification = await verify(context, snapshot, parsed.state, consumed);
 		if (consumed.purpose === "link")
 			return await dispatchLink(context, consumed, cookie, verification);
 		if (consumed.purpose !== "signin") throw new Error();
 		return await signIn(context, snapshot, consumed, verification);
 	} catch {
-		// A consume throw is ambiguous: never claim rollback or clear an unknown purpose.
-		return notice(503, "internal_error", { clearTransaction: clearSigninTransaction });
+		// A stale callback must never clear a newer browser transaction cookie.
+		return notice(503, "internal_error");
 	}
 }
 

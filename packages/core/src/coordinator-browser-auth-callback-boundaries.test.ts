@@ -13,7 +13,6 @@ import {
 import {
 	BROWSER_COOKIE_NAMES,
 	browserCookieValue,
-	clearBrowserCookie,
 	issueBrowserCookie,
 } from "./coordinator-browser-credential.js";
 import { importBrowserCsrfKey } from "./coordinator-browser-csrf.js";
@@ -124,15 +123,18 @@ async function ceremony(f: Harness) {
 function ceremonyRow(f: Harness, c: Awaited<ReturnType<typeof ceremony>>) {
 	return rows(f).find((row) => row.state_hash === c.original.state_hash);
 }
+function expectConsumedCeremony(f: Harness, c: Awaited<ReturnType<typeof ceremony>>) {
+	expect(ceremonyRow(f, c)).toMatchObject({ state: "consumed", nonce: null, pkce_verifier: null });
+}
 function unrelatedRows(f: Harness, c: Awaited<ReturnType<typeof ceremony>>) {
 	return rows(f).filter((row) => row.state_hash !== c.original.state_hash);
 }
 function request(c: { url: URL; cookie: string }) {
 	return new Request(c.url, { headers: { cookie: c.cookie } });
 }
-async function unavailable(response: Response, clear: boolean) {
+async function unavailable(response: Response) {
 	expect(response.status).toBe(503);
-	expect(response.headers.getSetCookie()).toEqual(clear ? [clearBrowserCookie("transaction")] : []);
+	expect(response.headers.getSetCookie()).toEqual([]);
 	expect(response.headers.get("location")).toBeNull();
 	const body = await response.clone().text();
 	for (const secret of [PRIVATE, PROVIDER.clientSecret, "fixture-access-token"])
@@ -348,7 +350,7 @@ describe("runtime purpose and original cookie boundaries fail closed", () => {
 		const reply = await f.callback(request(c));
 		// Assert: an unknown runtime union value grants no authority or cookie cleanup rights.
 		expect(reply.outcome).toBe("internal_error");
-		await unavailable(reply.response, false);
+		await unavailable(reply.response);
 		expect(ceremonyRow(f, c)).toMatchObject({
 			state: "consumed",
 			nonce: null,
@@ -415,7 +417,7 @@ describe("errors distinguish confirmed consumption from ambiguous backend throws
 			// Act
 			const reply = await f.callback(request(c));
 			// Assert
-			await unavailable(reply.response, false);
+			await unavailable(reply.response);
 			if (stage === "before-commit") expect(rows(f)).toEqual(before);
 			else
 				expect(ceremonyRow(f, c)).toMatchObject({
@@ -428,7 +430,7 @@ describe("errors distinguish confirmed consumption from ambiguous backend throws
 		},
 	);
 	it.each(["read-session", "admission", "entropy"])(
-		"confirmed sign-in consumption clears only TXN after %s failure",
+		"confirmed sign-in consumption changes no cookies after %s failure",
 		async (fault) => {
 			// Arrange
 			const f = await harness();
@@ -449,19 +451,15 @@ describe("errors distinguish confirmed consumption from ambiguous backend throws
 			// Act
 			const reply = await f.callback(request(c));
 			// Assert
-			await unavailable(reply.response, true);
-			expect(ceremonyRow(f, c)).toMatchObject({
-				state: "consumed",
-				nonce: null,
-				pkce_verifier: null,
-			});
+			await unavailable(reply.response);
+			expectConsumedCeremony(f, c);
 			expect(unrelatedRows(f, c)).toEqual(unrelated);
 			expect(rows(f, "coordinator_auth_sessions")).toEqual([]);
 			expect(f.store.recordAuthAccountProfile).not.toHaveBeenCalled();
 		},
 	);
 	it.each(["pre-consume", "post-consume"])(
-		"style-digest fallback %s preserves conditional cookie grammar",
+		"style-digest fallback %s never clears a transaction cookie",
 		async (stage) => {
 			// Arrange
 			const f = await harness();
@@ -482,7 +480,7 @@ describe("errors distinguish confirmed consumption from ambiguous backend throws
 			// Act
 			const reply = await f.callback(request(c));
 			// Assert
-			await unavailable(reply.response, stage === "post-consume");
+			await unavailable(reply.response);
 			expect(await reply.response.text()).toBe(
 				"Sign-in or linking unavailable. Return to the flow you started and try again.",
 			);
@@ -497,7 +495,7 @@ describe("errors distinguish confirmed consumption from ambiguous backend throws
 		// Act
 		const reply = await f.callback(request(c));
 		// Assert
-		await unavailable(reply.response, false);
+		await unavailable(reply.response);
 		expect(f.store.consumeAuthBrowserTransaction).not.toHaveBeenCalled();
 		expect(ceremonyRow(f, c)?.state).toBe("pending");
 		expect(f.oidc.fetch).not.toHaveBeenCalled();
@@ -513,6 +511,7 @@ async function linkCeremony(f: Harness) {
 		Buffer.from(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value))).toString(
 			"hex",
 		);
+	const stateHash = await hash(begun.request.material.state);
 	expect(
 		await f.persistence.startAuthBrowserTransaction(
 			{
@@ -520,7 +519,7 @@ async function linkCeremony(f: Harness) {
 				attemptId: "attempt-a",
 				browserStartHash: attempt().browserStartHash,
 				binderHash: txn.cookieHash,
-				stateHash: await hash(begun.request.material.state),
+				stateHash,
 				nonce: begun.request.material.nonce,
 				pkceVerifier: begun.request.material.pkceVerifier,
 			},
@@ -532,7 +531,7 @@ async function linkCeremony(f: Harness) {
 		cookie: txn.setCookie.split(";")[0] ?? "",
 		url: f.oidc.authorize(begun.request.authorizationUrl),
 		hash: txn.cookieHash,
-		original: { ...rows(f)[0] },
+		original: { ...rows(f).find((row) => row.state_hash === stateHash) },
 	};
 }
 
@@ -606,9 +605,12 @@ describe("LINK dispatch is a mandatory captured continuation, not implicit linki
 				c.original.pkce_verifier,
 			])
 				if (typeof secret === "string") expect(encoded).not.toContain(secret);
-			expect(rows(f)[0]).toMatchObject({ state: "consumed", nonce: null, pkce_verifier: null });
+			expectConsumedCeremony(f, c);
 			expect(rows(f, "coordinator_auth_link_attempts")).toEqual(before);
 			expect(before[0]?.state).toBe("browser_claimed");
+			expect(
+				await f.persistence.readAuthBrowserTransactionActivity({ binderHash: c.hash }, f.cfg),
+			).toEqual({ kind: "active" });
 			expect(rows(f, "coordinator_auth_account_links")).toEqual([]);
 			expect(rows(f, "coordinator_auth_sessions")).toEqual([]);
 			expect(f.store.readAuthSession).not.toHaveBeenCalled();
@@ -627,9 +629,13 @@ describe("LINK dispatch is a mandatory captured continuation, not implicit linki
 			// Act
 			const reply = await f.callback(request(c));
 			// Assert
-			await unavailable(reply.response, false);
+			await unavailable(reply.response);
 			expect(f.completeLink).toHaveBeenCalledOnce();
-			expect(rows(f)[0]).toMatchObject({ state: "consumed", nonce: null, pkce_verifier: null });
+			expect(ceremonyRow(f, c)).toMatchObject({
+				state: "consumed",
+				nonce: null,
+				pkce_verifier: null,
+			});
 			expect(rows(f, "coordinator_auth_link_attempts")[0]?.state).toBe("browser_claimed");
 			expect(rows(f, "coordinator_auth_sessions")).toEqual([]);
 			expect(rows(f, "coordinator_auth_account_profiles")).toEqual([]);

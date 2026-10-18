@@ -9,10 +9,10 @@ import {
 	NOW,
 	signer,
 } from "./coordinator-auth-link-test-fixtures.js";
-import { type Backend, setupStore } from "./coordinator-auth-store-test-fixtures.js";
+import { type Backend, setupStore, sqliteD1 } from "./coordinator-auth-store-test-fixtures.js";
 import { createCoordinatorBrowserAuthCallback } from "./coordinator-browser-auth-callback.js";
 import {
-	clearBrowserCookie,
+	BROWSER_COOKIE_NAMES,
 	issueBrowserCookie,
 	readBrowserCookie,
 } from "./coordinator-browser-credential.js";
@@ -24,6 +24,7 @@ import {
 import { createCoordinatorBrowserLinkHandlers } from "./coordinator-browser-link.js";
 import { createCoordinatorOidcClient } from "./coordinator-oidc.js";
 import { oidcFixture, PROVIDER } from "./coordinator-oidc-test-fixtures.js";
+import { D1CoordinatorStore } from "./d1-coordinator-store.js";
 
 const ORIGIN = "https://app.example.test";
 const ATTEMPTS = "coordinator_auth_link_attempts";
@@ -173,6 +174,32 @@ async function setup(
 	};
 }
 type Fixture = Awaited<ReturnType<typeof setup>>;
+
+it("both store adapters route only the current bound browser purpose without consuming proof", async () => {
+	const f = await setup();
+	const d1 = new D1CoordinatorStore(sqliteD1(f.db), { authClock: () => NOW });
+	const input = {
+		stateHash: createHash("sha256").update(f.authorization.material.state).digest("hex"),
+		binderHash: f.parsed.cookieHash,
+	};
+	const before = rows(f, TABLE);
+	for (const store of [f.store, d1]) {
+		expect(await store.readAuthBrowserTransactionPurpose(input, f.config)).toBe("link");
+		expect(
+			await store.readAuthBrowserTransactionPurpose(
+				{ ...input, binderHash: "f".repeat(64) },
+				f.config,
+			),
+		).toBeNull();
+		expect(
+			await store.readAuthBrowserTransactionPurpose(input, {
+				...f.config,
+				revision: "f".repeat(64),
+			}),
+		).toBeNull();
+	}
+	expect(rows(f, TABLE)).toEqual(before);
+});
 function rows(f: Fixture, table = ATTEMPTS) {
 	return f.db.prepare(`SELECT * FROM ${table} ORDER BY rowid`).all() as Record<string, unknown>[];
 }
@@ -246,6 +273,63 @@ async function safe(response: Response, status: number) {
 		/privateCause|fixture-secret|fixture-access-token|fixture-refresh-token/,
 	);
 }
+
+// HTTP Set-Cookie ordering model only; this does not certify browser COOP behavior.
+function applyCookieHeaders(jar: Map<string, string>, response: Response): void {
+	for (const header of response.headers.getSetCookie()) {
+		const pair = header.split(";")[0] ?? "";
+		const separator = pair.indexOf("=");
+		const name = pair.slice(0, separator);
+		if (/(?:^|;)\s*max-age=0(?:;|$)/i.test(header)) jar.delete(name);
+		else jar.set(name, pair.slice(separator + 1));
+	}
+}
+
+it.each(["cancel", "provider-failure"] as const)(
+	"delayed %s HTTP headers retain a newer transaction binder after the old attempt fails",
+	async (action) => {
+		const f = await setup();
+		const committed = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		f.operations.retireAuthBrowserTransactions.mockImplementation(async (...args) => {
+			const result = await f.store.retireAuthBrowserTransactions(...args);
+			committed.resolve();
+			await release.promise;
+			return result;
+		});
+		let pending: Promise<Response>;
+		if (action === "cancel")
+			pending = f.handlers
+				.cancel(post(f, "cancel"), "trusted-client")
+				.then((result) => result.response);
+		else {
+			f.oidc.claims.nonce = "wrong-nonce";
+			pending = f
+				.callback(new Request(f.url, { headers: { cookie: f.header } }))
+				.then((result) => result.response);
+		}
+		await committed.promise;
+		expect(rows(f)[0]).toMatchObject({
+			state: "failed",
+			failure_reason: action === "cancel" ? "browser_cancelled" : "provider_failure",
+		});
+		const newer = await issueBrowserCookie("transaction");
+		const pair = newer.setCookie.split(";")[0] ?? "";
+		const jar = new Map<string, string>([
+			[BROWSER_COOKIE_NAMES.transaction, pair.slice(pair.indexOf("=") + 1)],
+		]);
+		release.resolve();
+		const delayed = await pending;
+		expect(delayed.status).toBe(action === "cancel" ? 200 : 403);
+		expect(delayed.headers.getSetCookie()).toEqual([]);
+		applyCookieHeaders(jar, delayed);
+		const retained = await readBrowserCookie(
+			`${BROWSER_COOKIE_NAMES.transaction}=${jar.get(BROWSER_COOKIE_NAMES.transaction) ?? ""}`,
+			"transaction",
+		);
+		expect(retained).toMatchObject({ kind: "present", cookieHash: newer.cookieHash });
+	},
+);
 
 describe.each(["SQLite", "D1"] as const)("%s bound browser link", (backend) => {
 	it.each(["http://127.0.0.1:80/codemem/auth/complete", "http://[::1]:80/codemem/auth/complete"])(
@@ -465,9 +549,7 @@ it.each(["tampered-destination", "confirm-before-write", "confirm-after-write"])
 			// Assert: no grant was delivered, and cancellation fails the real committed attempt.
 			expect(cancelled.outcome).toBe("link_cancelled");
 			expect(cancelled.response.status).toBe(200);
-			expect(cancelled.response.headers.getSetCookie()).toEqual([
-				clearBrowserCookie("transaction"),
-			]);
+			expect(cancelled.response.headers.getSetCookie()).toEqual([]);
 			expect(rows(f)[0]).toMatchObject({ state: "failed", failure_reason: "browser_cancelled" });
 			expect(rows(f, TABLE)[0]).toMatchObject({ nonce: null, pkce_verifier: null });
 			expect(authority(f)).toEqual(before);
@@ -500,7 +582,7 @@ it.each(["cancel", "provider-failure"])(
 		}
 		// Assert
 		expect(response.status).toBe(action === "cancel" ? 200 : 403);
-		expect(response.headers.getSetCookie()).toEqual([clearBrowserCookie("transaction")]);
+		expect(response.headers.getSetCookie()).toEqual([]);
 		expect(rows(f)[0]).toMatchObject({
 			state: "failed",
 			failure_reason: action === "cancel" ? "browser_cancelled" : "provider_failure",

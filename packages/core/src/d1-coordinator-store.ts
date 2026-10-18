@@ -7,6 +7,7 @@ import {
 	type CoordinatorAuthBrowserConfig,
 	type CoordinatorAuthBrowserTransactionConsumeInput,
 	type CoordinatorAuthBrowserTransactionMaintenanceOptions,
+	type CoordinatorAuthBrowserTransactionPurposeStore,
 	type CoordinatorAuthBrowserTransactionRetirementOptions,
 	type CoordinatorAuthBrowserTransactionScope,
 	type CoordinatorAuthBrowserTransactionStartInput,
@@ -1003,7 +1004,9 @@ async function runProjectInviteBatch(
 	return !initial.consumed_at && changed === 1;
 }
 
-export class D1CoordinatorStore implements CoordinatorStore {
+export class D1CoordinatorStore
+	implements CoordinatorStore, CoordinatorAuthBrowserTransactionPurposeStore
+{
 	readonly db: D1DatabaseLike;
 	private readonly authLinks: AuthLinkOperations;
 	async assertAuthSchemaReady(): Promise<void> {
