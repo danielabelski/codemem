@@ -121,6 +121,9 @@ export interface CoordinatorAuthLinkStore {
 		input: CoordinatorAuthLinkCreateInput,
 		config: CoordinatorAuthLinkConfig,
 	): Promise<CoordinatorAuthLinkCreateResult>;
+	/** Retained for exact claim retries. Normal browser claims start atomically
+	 * through startAuthBrowserTransaction, with their committed start proof.
+	 */
 	claimAuthLinkAttempt(
 		input: CoordinatorAuthLinkClaimInput,
 		config: CoordinatorAuthLinkConfig,

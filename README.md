@@ -1,9 +1,14 @@
 # codemem
 
-Coordinator operators upgrading optional account linking must pause auth writers
-and follow the [explicit auth-schema cutover](docs/contracts/coordinator-auth-protocol.md#operator-cutover).
-`codemem coordinator upgrade-auth-schema --db-path coordinator.sqlite` upgrades an
-existing local coordinator file; `--export-sql` exports D1 SQL without applying it.
+Coordinator account-auth schema changes have a strict boundary. Only a genuinely
+empty SQLite database (with no existing non-`sqlite_` schema objects) bootstraps
+the V3 auth schema automatically. An existing coordinator database never upgrades
+auth objects on open. Existing V3 databases that pass readiness remain usable;
+older or incomplete auth storage reports `coordinator_auth_schema_upgrade_required`
+while ordinary device-signed sync continues. Follow the [V3 lifecycle migration
+boundary](docs/contracts/coordinator-account-management.md#migration-and-activation-boundary).
+`codemem coordinator upgrade-auth-schema` is a legacy authority cutover, not a V3
+remediation, and rejects V3 schemas.
 
 [![CI](https://github.com/kunickiaj/codemem/actions/workflows/ci.yml/badge.svg)](https://github.com/kunickiaj/codemem/actions/workflows/ci.yml)
 [![npm version](https://img.shields.io/npm/v/codemem)](https://www.npmjs.com/package/codemem) [![npm downloads per month](https://img.shields.io/npm/dm/codemem?label=npm%20downloads%2Fmonth)](https://www.npmjs.com/package/codemem) [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)

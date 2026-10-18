@@ -165,34 +165,47 @@ not transfer legacy ownership automatically.
 Eligibility for an existing profile remains unknown until it is checked on the real device. Google confirmation and the
 normal device finish line have not been verified in a live workflow.
 
-## 5. Apply the D1 migrations
+## 5. Bootstrap account auth on a new D1 database
 
-The example Wrangler template already sets `migrations_dir`. For a new database, prefer applying the complete migration
-history through `0031`, which adds the owner-auth audit table, so migration records support later upgrades.
-`packages/cloudflare-coordinator-worker/schema.sql` also includes the complete owner-auth tables and can initialize a
-fresh database; using it directly does not record which migrations were applied.
+For account authentication, a fresh D1 database must be genuinely empty and use
+the current `packages/cloudflare-coordinator-worker/schema.sql` bootstrap. The
+historical `0001`–`0033` migration sequence alone produces the V2 shape (19 of 61
+current readiness checks), not the current account-auth schema.
 
-For a **new, empty database only**, run this from the repository root after setting the real database ID in the ignored
-deployment config:
+Do not run `schema.sql` on an existing D1 database. Do not use a migration replay,
+table drop, restore, role/grant reset, key reset, or history reset to make an
+existing database look fresh. Existing caller, pre-auth, V2, and partial-auth
+databases need the separately reviewed record-preserving lifecycle upgrade in the
+[account-management lifecycle contract](contracts/coordinator-account-management.md#migration-and-activation-boundary).
+It is blocked until an approved and verified execution path exists.
 
-```fish
-pnpm --filter @codemem/cloudflare-coordinator-worker exec wrangler d1 migrations apply codemem-coordinator --remote --config ../../examples/cloudflare-coordinator/wrangler.toml
-```
-
-For a database originally created from `schema.sql`, first compare its schema with the migration history and review
-the migration records. Baseline only the migrations whose changes are already present, then apply the remaining
-migrations; do not replay from `0001` or reset the database to make the migration bookkeeping match.
+This document does not authorize a database bootstrap, migration, restore, or
+deployment. Use the current Worker schema only after the required operator review
+has approved the new empty database and its execution path.
 
 ## 6. Deploy the Worker
 
-### Linked-account display metadata rollout
+### Existing account-auth databases
 
-Migration `0033_add_auth_link_profiles.sql` adds an empty display-only table. Review and apply it before deploying
-upgraded Worker readers and writers; both require the new table and report a schema upgrade error when it is absent.
-Pause auth writers and back up the database first. This change includes
-source SQL only: it does not apply a migration or deploy a Worker. SQLite coordinators create the empty table during
-normal schema initialization. Existing links receive no backfill; they remain without display metadata until an
-explicit verified sign-in refreshes their profile.
+Opening an existing SQLite database does not add or repair account-auth objects;
+only the empty-database bootstrap does so. For D1, the Worker reports
+`coordinator_auth_schema_upgrade_required` for older or incomplete account-auth
+storage while ordinary device-signed sync continues. An existing V3 database
+that passes readiness remains usable. Do not treat the old
+`codemem coordinator upgrade-auth-schema` authority cutover or migration `0033`
+as a V3 remediation: the command rejects V3 and historical migrations do not
+create the current schema.
+
+The V3 lifecycle upgrade must preserve all records and run as one atomic D1
+`db.batch()`. Its 191 statements total 514,744 SQL bytes; the largest statement
+is 24,078 bytes, and the serialized statement array is 536,619 bytes. Every
+statement fits D1's documented 100,000-byte
+per-statement limit, but the production batch statement accounting and aggregate
+batch-size limit are not confirmed. Do not chunk the batch or change billing to
+work around that unknown. Obtain separately approved disposable-binding test
+results or Cloudflare support confirmation first; then require a backup,
+quiesced auth writers, preflight, and operator approval before any live migration
+or deployment.
 
 Only verified callback claims are staged, tied to the exact attempt, issuer, subject, browser transaction and auth
 configuration. Finalization promotes them in the same transaction as the account link. Cancelled, failed, expired,
