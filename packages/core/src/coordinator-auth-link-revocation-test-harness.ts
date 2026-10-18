@@ -48,6 +48,7 @@ function inputs(f: LinkRevocationFixture) {
 		issuer: "https://accounts.example.test",
 		revision: "a".repeat(64),
 		enabled: true,
+		redirectUri: "https://coordinator.example.test/auth/callback",
 	};
 	const signer = {
 		groupId: f.input.groupId,
@@ -60,6 +61,7 @@ function inputs(f: LinkRevocationFixture) {
 		attemptId: `${f.input.deviceId}-attempt`,
 		signer,
 		runtimeVerifierHash: "b".repeat(64),
+		browserStartHash: "f".repeat(64),
 		loopbackRedirect: "http://127.0.0.1:4567/codemem/auth/complete",
 	};
 	const browser = { attemptId: start.attemptId, browserTransactionHash: "c".repeat(64) };
@@ -89,7 +91,27 @@ async function authorize(f: LinkRevocationFixture) {
 }
 async function confirmed(f: LinkRevocationFixture, i: Inputs) {
 	expect(await f.store.createAuthLinkAttempt(i.start, i.cfg)).toMatchObject({ kind: "created" });
-	expect(await f.store.claimAuthLinkAttempt(i.browser, i.cfg)).toMatchObject({ kind: "applied" });
+	const material = {
+		stateHash: "1".repeat(64),
+		binderHash: "2".repeat(64),
+		nonce: "n".repeat(43),
+		pkceVerifier: "p".repeat(43),
+	};
+	expect(
+		await f.store.startAuthBrowserTransaction(
+			{
+				...material,
+				purpose: "link",
+				attemptId: i.start.attemptId,
+				browserStartHash: i.start.browserStartHash,
+			},
+			i.cfg,
+		),
+	).toMatchObject({ kind: "started" });
+	const consumed = await f.store.consumeAuthBrowserTransaction(material, i.cfg);
+	if (consumed.kind !== "consumed") throw new Error("Missing bound revocation fixture proof");
+	i.browser.browserTransactionHash = consumed.browserTransactionHash;
+	i.confirm.browserTransactionHash = consumed.browserTransactionHash;
 	expect(
 		await f.store.recordAuthLinkOidcVerified(
 			{ ...i.browser, account: { issuer: i.cfg.issuer, subject: "subject-a" } },

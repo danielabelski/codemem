@@ -1,5 +1,5 @@
 import { expect } from "vitest";
-import type { CoordinatorAuthLinkConfig } from "./coordinator-auth-link-contract.js";
+import type { CoordinatorAuthBrowserConfig } from "./coordinator-auth-browser-transaction-contract.js";
 import {
 	insertOwnership,
 	OWNERSHIP_TABLE,
@@ -23,7 +23,6 @@ type Transition = "disable" | "remove" | "last group recreate" | "history cleanu
 type Evidence = "ID" | "incoming key" | "current key";
 type Test = ReturnType<typeof revocationHarness>;
 const writers: Writer[] = ["enroll", "add_device", "team_member", "project", "join"];
-const browserHash = "c".repeat(64);
 const completionHash = "d".repeat(64);
 const transitions: Transition[] = ["disable", "remove", "last group recreate", "history cleanup"];
 
@@ -298,6 +297,7 @@ async function separateAuthority(f: LifecycleFixture) {
 		issuer: "https://accounts.example.test",
 		revision: "a".repeat(64),
 		enabled: true,
+		redirectUri: "https://coordinator.example.test/auth/callback",
 	};
 	const evidence = {
 		...signer,
@@ -320,6 +320,7 @@ async function separateAuthority(f: LifecycleFixture) {
 				signer,
 				attemptId: "attempt-a",
 				runtimeVerifierHash: "b".repeat(64),
+				browserStartHash: "f".repeat(64),
 				loopbackRedirect: "http://127.0.0.1:4567/codemem/auth/complete",
 			},
 			cfg,
@@ -327,10 +328,25 @@ async function separateAuthority(f: LifecycleFixture) {
 	).toMatchObject({
 		kind: "created",
 	});
-	await f.store.claimAuthLinkAttempt(
-		{ attemptId: "attempt-a", browserTransactionHash: browserHash },
-		cfg,
-	);
+	const proof = await confirmedAuthorityBrowser(f, cfg);
+	await finalizeAuthoritySession(f, cfg, proof);
+}
+async function confirmedAuthorityBrowser(f: LifecycleFixture, cfg: CoordinatorAuthBrowserConfig) {
+	const material = {
+		stateHash: "1".repeat(64),
+		binderHash: "2".repeat(64),
+		nonce: "n".repeat(43),
+		pkceVerifier: "p".repeat(43),
+	};
+	expect(
+		await f.store.startAuthBrowserTransaction(
+			{ ...material, purpose: "link", attemptId: "attempt-a", browserStartHash: "f".repeat(64) },
+			cfg,
+		),
+	).toMatchObject({ kind: "started" });
+	const consumed = await f.store.consumeAuthBrowserTransaction(material, cfg);
+	if (consumed.kind !== "consumed") throw new Error("Missing bound ownership fixture proof");
+	const browserHash = consumed.browserTransactionHash;
 	await f.store.recordAuthLinkOidcVerified(
 		{
 			attemptId: "attempt-a",
@@ -347,9 +363,16 @@ async function separateAuthority(f: LifecycleFixture) {
 		},
 		cfg,
 	);
-	await finalizeAuthoritySession(f, cfg);
+	return {
+		browserTransactionHash: browserHash,
+		binderHash: material.binderHash,
+	};
 }
-async function finalizeAuthoritySession(f: LifecycleFixture, cfg: CoordinatorAuthLinkConfig) {
+async function finalizeAuthoritySession(
+	f: LifecycleFixture,
+	cfg: CoordinatorAuthBrowserConfig,
+	proof: { browserTransactionHash: string; binderHash: string },
+) {
 	const signer = { ...f.input };
 	expect(
 		await f.store.finalizeAuthLinkAttempt(
@@ -369,10 +392,10 @@ async function finalizeAuthoritySession(f: LifecycleFixture, cfg: CoordinatorAut
 		),
 	).toMatchObject({ kind: "applied" });
 	expect(
-		await f.store.redeemAuthLinkSession(
+		await f.store.redeemAuthLinkSessionWithBrowserTransaction(
 			{
 				attemptId: "attempt-a",
-				browserTransactionHash: browserHash,
+				...proof,
 				credentialHash: "e".repeat(64),
 			},
 			cfg,

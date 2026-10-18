@@ -7,11 +7,10 @@ import {
 	seedAttestationSql,
 	seedEnrollmentSql,
 	seedKeyRevocationSql,
-	seedLinkSql,
 } from "../../cloudflare-coordinator-worker/test/device-claim-eligibility-fixture.js";
 import { AccountManagementStatusOperations } from "./coordinator-account-management-status.js";
+import { AuthAccountProfileOperations } from "./coordinator-auth-account-profile.js";
 import { CoordinatorAuthBrowserTransactions } from "./coordinator-auth-browser-transaction.js";
-import { upgradeAuthLifecycleSchema } from "./coordinator-auth-lifecycle-upgrade-sqlite.js";
 import { insert } from "./coordinator-auth-lifecycle-upgrade-test-fixture.js";
 import type { AuthLinkBackend, AuthLinkStatement } from "./coordinator-auth-link.js";
 import { AuthLinkOperations } from "./coordinator-auth-link.js";
@@ -30,10 +29,10 @@ import {
 import { AuthSessionOperations } from "./coordinator-auth-session.js";
 import { setupStore } from "./coordinator-auth-store-test-fixtures.js";
 import { createCoordinatorBrowserAuthCallback } from "./coordinator-browser-auth-callback.js";
-import { BROWSER_COOKIE_NAMES } from "./coordinator-browser-credential.js";
+import { BROWSER_COOKIE_NAMES, issueBrowserCookie } from "./coordinator-browser-credential.js";
 import { importBrowserCsrfKey } from "./coordinator-browser-csrf.js";
 import { createCoordinatorBrowserLinkChange } from "./coordinator-browser-link-change.js";
-import { EXPECTED_KEY_ID } from "./coordinator-ed25519-key-id-test-fixtures.js";
+import { createCoordinatorOidcClient } from "./coordinator-oidc.js";
 import { oidcFixture, PROVIDER } from "./coordinator-oidc-test-fixtures.js";
 import { createInMemoryRequestRateLimiter } from "./request-rate-limit.js";
 
@@ -43,19 +42,20 @@ afterEach(() => {
 	vi.restoreAllMocks();
 	for (const close of cleanup.splice(0)) close();
 });
-function setup(options: { authority?: "controller_attestation" | "device_claim" } = {}) {
-	const f = setupStore("SQLite");
+async function setup(
+	options: { authority?: "controller_attestation" | "device_claim"; profile?: unknown } = {},
+) {
+	let now = NOW + 10;
+	const f = setupStore("SQLite", { authClock: () => now });
 	cleanup.push(() => {
 		if (f.db.open) f.db.close();
 	});
 	f.db.exec(seedEnrollmentSql);
-	if (options.authority === "device_claim") seedGenesis(f.db);
-	else f.db.exec(seedAttestationSql + seedLinkSql.replaceAll(config.issuer, cfg.issuer));
+	if (options.authority !== "device_claim") f.db.exec(seedAttestationSql);
 	f.db
 		.prepare("UPDATE enrolled_devices SET identity_id = ? WHERE device_id = ?")
 		.run(input.identityId, input.signer.deviceId);
-	upgradeAuthLifecycleSchema(f.db);
-	let now = NOW + 10;
+	await f.store.assertAuthSchemaReady();
 	let beforeBatch: (() => void) | null = null;
 	const errors: unknown[] = [];
 	const run = (s: AuthLinkStatement) => f.db.prepare(s.sql).run(...s.values).changes;
@@ -80,9 +80,16 @@ function setup(options: { authority?: "controller_attestation" | "device_claim" 
 	const browser = new AuthLinkChangeBrowserOperations(backend, () => now);
 	const links = new AuthLinkOperations(backend, () => now);
 	const transactions = new CoordinatorAuthBrowserTransactions(backend, () => now);
+	await seedCurrentLink(
+		links,
+		transactions,
+		options.authority ?? "controller_attestation",
+		options.profile,
+	);
 	const status = new AccountManagementStatusOperations(backend, () => now);
 	const management = createCoordinatorAccountManagementStore(backend, () => now);
 	const sessions = new AuthSessionOperations(backend, () => now);
+	const accountProfiles = new AuthAccountProfileOperations(backend, () => now);
 	return {
 		...f,
 		changes,
@@ -92,6 +99,7 @@ function setup(options: { authority?: "controller_attestation" | "device_claim" 
 		status,
 		management,
 		sessions,
+		accountProfiles,
 		errors,
 		advance: (ms: number) => {
 			now += ms;
@@ -102,73 +110,69 @@ function setup(options: { authority?: "controller_attestation" | "device_claim" 
 	};
 }
 
-function seedGenesis(db: ReturnType<typeof setupStore>["db"]) {
-	const common = {
-		coordinator_id: cfg.coordinatorId,
-		identity_id: input.identityId,
-		group_id: input.signer.groupId,
-		device_id: input.signer.deviceId,
-		public_key: input.signer.publicKey,
-		fingerprint: input.signer.fingerprint,
-		issuer: cfg.issuer,
-		auth_config_revision: cfg.revision,
-		attempt_id: "genesis-a",
+async function seedCurrentLink(
+	links: AuthLinkOperations,
+	transactions: CoordinatorAuthBrowserTransactions,
+	kind: "controller_attestation" | "device_claim",
+	profile?: unknown,
+) {
+	const attemptId = kind === "device_claim" ? "genesis-a" : "historical-attempt";
+	const authority = kind === "device_claim" ? { kind, identityId: input.identityId } : { kind };
+	expect(
+		await links.createAuthLinkAttempt(
+			{
+				...input,
+				attemptId,
+				authority,
+				expectedIdentityId: input.identityId,
+				runtimeVerifierHash: "6".repeat(64),
+				browserStartHash: "7".repeat(64),
+				loopbackRedirect: create().loopbackRedirect,
+			},
+			cfg,
+		),
+	).toMatchObject({ kind: "created" });
+	const material = {
+		stateHash: "8".repeat(64),
+		binderHash: "0".repeat(64),
+		nonce: "n".repeat(43),
+		pkceVerifier: "p".repeat(43),
 	};
-	insert(db, "coordinator_auth_link_attempts", {
-		...common,
-		controller_attestation_id: null,
-		controller_review_receipt_id: null,
-		controller_revision: null,
-		authority_kind: "device_claim",
-		runtime_verifier_hash: "6".repeat(64),
-		browser_start_hash: "7".repeat(64),
-		browser_transaction_hash: "8".repeat(64),
-		completion_secret_hash: "9".repeat(64),
-		loopback_redirect: create().loopbackRedirect,
-		state: "finalized",
-		account_subject: "private-subject",
-		link_id: "link-a",
-		created_at_ms: NOW - 100,
-		claimed_at_ms: NOW - 90,
-		oidc_verified_at_ms: NOW - 80,
-		confirmed_at_ms: NOW - 70,
-		finalized_at_ms: NOW - 60,
-		expires_at_ms: NOW + 599900,
-	});
-	insert(db, "coordinator_auth_device_claims", {
-		...common,
-		claim_id: "link-a",
-		key_id: EXPECTED_KEY_ID,
-		created_at_ms: NOW - 60,
-	});
-	insert(db, "coordinator_auth_account_links", {
-		coordinator_id: cfg.coordinatorId,
-		link_id: "link-a",
-		issuer: cfg.issuer,
-		subject: "private-subject",
-		identity_id: input.identityId,
-		attempt_id: "genesis-a",
-		controller_attestation_id: null,
-		device_claim_id: "link-a",
-		authority_kind: "device_claim",
-		auth_config_revision: cfg.revision,
-		created_at_ms: NOW - 60,
-	});
-	insert(db, "coordinator_auth_link_audit_log", {
-		coordinator_id: cfg.coordinatorId,
-		link_id: "link-a",
-		action: "link_created",
-		attempt_id: "genesis-a",
-		identity_id: input.identityId,
-		group_id: input.signer.groupId,
-		device_id: input.signer.deviceId,
-		fingerprint: input.signer.fingerprint,
-		controller_attestation_id: null,
-		device_claim_id: "link-a",
-		authority_kind: "device_claim",
-		auth_config_revision: cfg.revision,
-		created_at_ms: NOW - 60,
-	});
+	expect(
+		await transactions.startAuthBrowserTransaction(
+			{ ...material, purpose: "link", attemptId, browserStartHash: "7".repeat(64) },
+			cfg,
+		),
+	).toMatchObject({ kind: "started" });
+	const consumed = await transactions.consumeAuthBrowserTransaction(material, cfg);
+	if (consumed.kind !== "consumed") throw new Error("Missing fresh initial-link browser proof");
+	const proof = { attemptId, browserTransactionHash: consumed.browserTransactionHash };
+	expect(
+		await links.recordAuthLinkOidcVerified(
+			{ ...proof, account: { issuer: cfg.issuer, subject: "private-subject" }, profile },
+			cfg,
+		),
+	).toMatchObject({ kind: "applied" });
+	expect(
+		await links.confirmAuthLinkAttempt({ ...proof, completionSecretHash: "9".repeat(64) }, cfg),
+	).toMatchObject({ kind: "applied" });
+	const generatedId = vi.spyOn(globalThis.crypto, "randomUUID").mockReturnValueOnce("link-a");
+	try {
+		expect(
+			await links.finalizeAuthLinkAttempt(
+				{
+					...final,
+					purpose: "coordinator-account-link-v1",
+					attemptId,
+					runtimeVerifierHash: "6".repeat(64),
+					completionSecretHash: "9".repeat(64),
+				},
+				cfg,
+			),
+		).toMatchObject({ kind: "applied" });
+	} finally {
+		generatedId.mockRestore();
+	}
 }
 const create = (intent: CoordinatorAuthLinkChangeIntent = "refresh") => ({
 	...input,
@@ -190,7 +194,7 @@ const final = {
 	completionSecretHash: "d".repeat(64),
 };
 async function verify(
-	f: ReturnType<typeof setup>,
+	f: Awaited<ReturnType<typeof setup>>,
 	intent: CoordinatorAuthLinkChangeIntent = "refresh",
 	profile: unknown = {},
 ) {
@@ -228,7 +232,7 @@ async function verify(
 	return consumed;
 }
 async function confirm(
-	f: ReturnType<typeof setup>,
+	f: Awaited<ReturnType<typeof setup>>,
 	intent: CoordinatorAuthLinkChangeIntent = "refresh",
 	profile: unknown = {},
 ) {
@@ -246,7 +250,9 @@ async function confirm(
 	return consumed;
 }
 it("keeps verified claims private until signed refresh and accepts an empty snapshot", async () => {
-	const f = setup();
+	const f = await setup({
+		profile: { displayName: "Old display", email: "old@example.test", emailVerified: true },
+	});
 	await confirm(f);
 	expect(f.db.prepare("SELECT * FROM coordinator_auth_link_profile_refreshes").all()).toEqual([]);
 	expect(await f.changes.finalizeAuthLinkChangeAttempt(final, cfg)).toMatchObject({
@@ -259,11 +265,21 @@ it("keeps verified claims private until signed refresh and accepts an empty snap
 			display_name: null,
 			email: null,
 			picture_url: null,
-			source_order: 2,
+			source_order: 3,
 			source_attempt_id: "change-a",
 		},
 	);
-	expect(f.db.prepare("SELECT * FROM coordinator_auth_link_profiles").all()).toEqual([]);
+	expect(
+		f.db.prepare("SELECT * FROM coordinator_auth_link_profiles WHERE link_id IS NULL").all(),
+	).toEqual([]);
+	expect(
+		await f.status.readAccountManagementStatus(input.signer, cfg, { identityId: input.identityId }),
+	).toMatchObject({ state: "linked", profile: { state: "verified", verifiedAtMs: NOW + 10 } });
+	const projected = await f.status.readAccountManagementStatus(input.signer, cfg, {
+		identityId: input.identityId,
+	});
+	expect(projected.profile).not.toHaveProperty("displayName");
+	expect(projected.profile).not.toHaveProperty("email");
 	expect(
 		f.db.prepare("SELECT ended_at_ms,revoked_at_ms FROM coordinator_auth_account_links").get(),
 	).toEqual({ ended_at_ms: null, revoked_at_ms: null });
@@ -272,7 +288,7 @@ it("keeps verified claims private until signed refresh and accepts an empty snap
 	});
 });
 it("disconnect requires its hosted proof fence then ends one generation without deleting its association", async () => {
-	const f = setup();
+	const f = await setup();
 	const consumed = await verify(f, "disconnect", { displayName: "Fresh name" });
 	expect(
 		await f.changes.confirmAuthLinkChangeAttempt(
@@ -321,7 +337,7 @@ it.each([
 	"security_revocation",
 	"expiry",
 ])("rechecks %s at the winning finalization", async (change) => {
-	const f = setup();
+	const f = await setup();
 	await confirm(f, "disconnect");
 	if (change === "expiry") f.advance(600000);
 	else {
@@ -346,7 +362,7 @@ it.each([
 	});
 });
 it("rolls back receipt completion when the end write unexpectedly matches zero", async () => {
-	const f = setup();
+	const f = await setup();
 	await confirm(f, "disconnect");
 	f.db.exec(
 		"CREATE TRIGGER ignore_end BEFORE UPDATE ON coordinator_auth_account_links WHEN NEW.ended_at_ms IS NOT NULL BEGIN SELECT RAISE(IGNORE); END",
@@ -360,7 +376,7 @@ it("rolls back receipt completion when the end write unexpectedly matches zero",
 });
 
 it("rolls back a completed refresh receipt when snapshot publication is ignored", async () => {
-	const f = setup();
+	const f = await setup();
 	await confirm(f, "refresh", {});
 	f.db.exec(
 		"CREATE TRIGGER ignore_refresh BEFORE INSERT ON coordinator_auth_link_profile_refreshes BEGIN SELECT RAISE(IGNORE); END",
@@ -380,7 +396,7 @@ it("rolls back a completed refresh receipt when snapshot publication is ignored"
 	).toEqual({ n: 1 });
 });
 it("cancellation discards staging without lifecycle mutation", async () => {
-	const f = setup();
+	const f = await setup();
 	await confirm(f, "disconnect");
 	expect(
 		await f.changes.failAuthLinkChangeAttempt(
@@ -402,7 +418,7 @@ it("cancellation discards staging without lifecycle mutation", async () => {
 });
 
 it("projects server-derived V3 management capabilities and a verified empty profile", async () => {
-	const f = setup();
+	const f = await setup();
 	expect(
 		await f.status.readAccountManagementStatus(input.signer, cfg, { identityId: input.identityId }),
 	).toMatchObject({
@@ -419,7 +435,7 @@ it("projects server-derived V3 management capabilities and a verified empty prof
 });
 
 async function reconnect(
-	f: ReturnType<typeof setup>,
+	f: Awaited<ReturnType<typeof setup>>,
 	attemptId = "reconnect-a",
 	subject = "account-b",
 ) {
@@ -497,7 +513,7 @@ async function reconnect(
 	};
 }
 it("disconnects A then commits a separate fresh B generation and retains A's association", async () => {
-	const f = setup();
+	const f = await setup();
 	await confirm(f, "disconnect");
 	await f.changes.finalizeAuthLinkChangeAttempt(final, cfg);
 	expect(
@@ -532,7 +548,7 @@ it("disconnects A then commits a separate fresh B generation and retains A's ass
 });
 
 it("requires the exact original device claim and reuses its genesis through A-to-B reconnect", async () => {
-	const f = setup({ authority: "device_claim" });
+	const f = await setup({ authority: "device_claim" });
 	await confirm(f, "disconnect");
 	expect(await f.changes.finalizeAuthLinkChangeAttempt(final, cfg)).toMatchObject({
 		kind: "applied",
@@ -573,7 +589,7 @@ it("requires the exact original device claim and reuses its genesis through A-to
 });
 
 it("allows only one of two reconnect finalizations to win the latest-ended generation CAS", async () => {
-	const f = setup();
+	const f = await setup();
 	await confirm(f, "disconnect");
 	await f.changes.finalizeAuthLinkChangeAttempt(final, cfg);
 	const first = await reconnect(f, "reconnect-one", "account-b");
@@ -592,7 +608,7 @@ it("allows only one of two reconnect finalizations to win the latest-ended gener
 	).toEqual({ n: 2 });
 });
 it("a security revocation on ended A blocks active B and new management without exposing profile", async () => {
-	const f = setup({ authority: "device_claim" });
+	const f = await setup({ authority: "device_claim" });
 	await confirm(f, "disconnect");
 	await f.changes.finalizeAuthLinkChangeAttempt(final, cfg);
 	const next = await reconnect(f);
@@ -625,7 +641,7 @@ it("a security revocation on ended A blocks active B and new management without 
 	).toEqual({ ended_at_ms: null });
 });
 it("permits fresh same-issuer revision rotation without rewriting a genesis claim", async () => {
-	const f = setup({ authority: "device_claim" });
+	const f = await setup({ authority: "device_claim" });
 	const rotated = { ...cfg, revision: "9".repeat(64) };
 	const claims = f.db.prepare("SELECT * FROM coordinator_auth_device_claims").all();
 	expect(await f.changes.createAuthLinkChangeAttempt(create(), rotated)).toMatchObject({
@@ -645,7 +661,7 @@ it("permits fresh same-issuer revision rotation without rewriting a genesis clai
 	expect(f.db.prepare("SELECT * FROM coordinator_auth_device_claims").all()).toEqual(claims);
 });
 
-async function signIn(f: ReturnType<typeof setup>, label: string) {
+async function signIn(f: Awaited<ReturnType<typeof setup>>, label: string) {
 	const hash = (purpose: string) =>
 		createHash("sha256").update(`${label}:${purpose}`).digest("hex");
 	const materials = {
@@ -676,28 +692,16 @@ async function signIn(f: ReturnType<typeof setup>, label: string) {
 	};
 }
 it("disconnect revokes every target session and removes all three display sources atomically", async () => {
-	const f = setup();
+	const f = await setup({ profile: { displayName: "Link-time profile" } });
 	const first = await signIn(f, "first");
 	await signIn(f, "second");
-	insert(f.db, "coordinator_auth_account_profiles", {
-		coordinator_id: cfg.coordinatorId,
-		link_id: "link-a",
-		display_name: "Sign-in profile",
-		source_session_id: first.sessionId,
-		source_signed_in_at_ms: NOW + 10,
-		source_order: 2,
-	});
-	insert(f.db, "coordinator_auth_link_profiles", {
-		coordinator_id: cfg.coordinatorId,
-		attempt_id: "historical-attempt",
-		issuer: cfg.issuer,
-		subject: "private-subject",
-		auth_config_revision: cfg.revision,
-		browser_transaction_hash: "a".repeat(64),
-		link_id: "link-a",
-		display_name: "Link-time profile",
-		verified_at_ms: NOW - 10,
-	});
+	expect(
+		await f.accountProfiles.recordAuthAccountProfile(
+			{ credentialHash: first.credentialHash, profile: { displayName: "Sign-in profile" } },
+			cfg,
+		),
+	).toMatchObject({ kind: "recorded" });
+	// Orphaned display-only metadata must also be removed, never used as proof.
 	insert(f.db, "coordinator_auth_link_profile_refreshes", {
 		coordinator_id: cfg.coordinatorId,
 		link_id: "link-a",
@@ -725,19 +729,18 @@ it("disconnect revokes every target session and removes all three display source
 	);
 });
 it("refresh preserves sessions, follows source order instead of timestamps, and retains staging across cleanup", async () => {
-	const f = setup();
+	const f = await setup();
 	await confirm(f, "refresh", { displayName: "Earlier intent" });
+	f.advance(20);
 	const session = await signIn(f, "later-intent");
 	const before = f.db.prepare("SELECT * FROM coordinator_auth_sessions").all();
-	insert(f.db, "coordinator_auth_account_profiles", {
-		coordinator_id: cfg.coordinatorId,
-		link_id: "link-a",
-		display_name: "Later intent",
-		source_session_id: session.sessionId,
-		source_signed_in_at_ms: NOW + 10,
-		source_order: 3,
-	});
-	const cleanup = cleanAuthLinkProfiles(cfg, NOW + 10, 32);
+	expect(
+		await f.accountProfiles.recordAuthAccountProfile(
+			{ credentialHash: session.credentialHash, profile: { displayName: "Later intent" } },
+			cfg,
+		),
+	).toMatchObject({ kind: "recorded" });
+	const cleanup = cleanAuthLinkProfiles(cfg, NOW + 30, 32);
 	f.db.prepare(cleanup.sql).run(...cleanup.values);
 	expect(
 		f.db
@@ -746,13 +749,17 @@ it("refresh preserves sessions, follows source order instead of timestamps, and 
 			)
 			.get(),
 	).toEqual({ n: 1 });
+	f.advance(20);
 	expect(await f.changes.finalizeAuthLinkChangeAttempt(final, cfg)).toMatchObject({
 		kind: "applied",
 	});
 	expect(f.db.prepare("SELECT * FROM coordinator_auth_sessions").all()).toEqual(before);
 	expect(
 		await f.status.readAccountManagementStatus(input.signer, cfg, { identityId: input.identityId }),
-	).toMatchObject({ profile: { state: "verified", displayName: "Later intent" }, state: "linked" });
+	).toMatchObject({
+		profile: { state: "verified", displayName: "Later intent", verifiedAtMs: NOW + 30 },
+		state: "linked",
+	});
 });
 
 function hidden(html: string, name: string): string {
@@ -773,7 +780,7 @@ function browserPost(path: string, cookie: string, body: Record<string, string>)
 }
 async function browserSetup(intent: CoordinatorAuthLinkChangeIntent) {
 	vi.spyOn(Date, "now").mockReturnValue(NOW + 10);
-	const f = setup();
+	const f = await setup();
 	const oidc = oidcFixture({ issuer: cfg.issuer });
 	oidc.claims.sub = "private-subject";
 	const browserConfig = {
@@ -917,4 +924,56 @@ it("does not disclose the target or publish profile data when fresh proof is for
 	expect(f.db.prepare("SELECT ended_at_ms FROM coordinator_auth_account_links").get()).toEqual({
 		ended_at_ms: null,
 	});
+});
+
+it("a completed sign-in callback leaves transaction cookies untouched and permits a fresh start", async () => {
+	vi.spyOn(Date, "now").mockReturnValue(NOW + 10);
+	const f = await setup();
+	const oidc = oidcFixture({ issuer: cfg.issuer });
+	oidc.claims.sub = "private-subject";
+	const browserConfig = {
+		...cfg,
+		clientId: PROVIDER.clientId,
+		clientSecret: PROVIDER.clientSecret,
+	};
+	const provider = await createCoordinatorOidcClient(browserConfig, { fetch: oidc.fetch });
+	if (!provider.ok) throw new Error("Missing fixture provider");
+	const authorization = await provider.client.createAuthorizationRequest();
+	const transaction = await issueBrowserCookie("transaction");
+	const stateHash = createHash("sha256").update(authorization.material.state).digest("hex");
+	expect(
+		await f.store.startAuthBrowserTransaction(
+			{
+				purpose: "signin",
+				stateHash,
+				binderHash: transaction.cookieHash,
+				nonce: authorization.material.nonce,
+				pkceVerifier: authorization.material.pkceVerifier,
+			},
+			cfg,
+		),
+	).toMatchObject({ kind: "started" });
+	const callback = await createCoordinatorBrowserAuthCallback({
+		config: browserConfig,
+		store: f.store,
+		completeLink: async () => {
+			throw new Error("Wrong callback purpose");
+		},
+		oidcOptions: { fetch: oidc.fetch },
+	});
+	if (!callback.ok) throw new Error("Missing fixture callback");
+	const response = await callback.handlers.callback(
+		new Request(oidc.authorize(authorization.authorizationUrl), {
+			headers: { Cookie: transaction.setCookie.split(";")[0] ?? "" },
+		}),
+	);
+	expect(response.response.status).toBe(303);
+	expect(
+		response.response.headers
+			.getSetCookie()
+			.some((cookie) => cookie.startsWith(`${BROWSER_COOKIE_NAMES.transaction}=`)),
+	).toBe(false);
+	expect(
+		await f.store.readAuthBrowserTransactionActivity({ binderHash: transaction.cookieHash }, cfg),
+	).toEqual({ kind: "inactive" });
 });

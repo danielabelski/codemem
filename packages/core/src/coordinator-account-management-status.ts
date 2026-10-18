@@ -21,6 +21,11 @@ import type {
 import { captureAuthLinkConfig, captureAuthLinkSigner } from "./coordinator-auth-link-input.js";
 import { authLinkLiveGenerationSql } from "./coordinator-auth-link-liveness.js";
 import { authDeviceClaimProvenanceSql } from "./coordinator-auth-link-provenance.js";
+import {
+	AUTH_PROFILE_SOURCE_FIELDS_SQL,
+	AUTH_PROFILE_SOURCE_JOINS_SQL,
+	AUTH_PROFILE_SOURCE_VERIFIED_AT_SQL,
+} from "./coordinator-auth-profile-sources.js";
 
 export type CoordinatorAccountProfileV3 =
 	| { state: "unavailable" }
@@ -103,15 +108,8 @@ export class AccountManagementStatusOperations {
 		const row = await this.backend.first<StatusRow>({
 			sql: `${AUTH_DEVICE_CLAIM_INPUT_SQL}, requester AS MATERIALIZED (SELECT p.* FROM claim_input p WHERE (${AUTH_LINK_CHANGE_REQUESTER_SQL}) OR (${AUTH_DEVICE_CLAIM_ELIGIBLE_SQL})),
  history AS MATERIALIZED (SELECT l.* FROM requester p JOIN coordinator_auth_account_links l ON l.coordinator_id = p.coordinator_id AND l.identity_id = p.identity_id ORDER BY l.generation DESC LIMIT 1),
- snapshots AS MATERIALIZED (
- SELECT r.link_id,r.display_name,r.email,r.email_verified,r.picture_url,r.verified_at_ms,r.source_order FROM coordinator_auth_link_profile_refreshes r
- JOIN coordinator_auth_link_change_attempts receipt ON receipt.coordinator_id = r.coordinator_id
- AND receipt.attempt_id = r.source_attempt_id AND receipt.target_link_id = r.link_id
- AND receipt.state = 'completed' AND receipt.intent = 'refresh' AND receipt.browser_sequence+1 = r.source_order
- AND receipt.oidc_verified_at_ms = r.verified_at_ms WHERE r.coordinator_id = ?
- UNION ALL SELECT m.link_id,m.display_name,m.email,m.email_verified,m.picture_url,m.source_signed_in_at_ms,m.source_order FROM coordinator_auth_account_profiles m WHERE m.coordinator_id = ?
- UNION ALL SELECT b.link_id,b.display_name,b.email,b.email_verified,b.picture_url,b.verified_at_ms,b.source_order FROM coordinator_auth_link_profiles b WHERE b.coordinator_id = ? AND b.source_purpose = 'link' AND b.link_id IS NOT NULL),
- current_profile AS MATERIALIZED (SELECT m.* FROM snapshots m JOIN history l ON l.link_id = m.link_id WHERE ${authLinkLiveGenerationSql({ link: "l" })} ORDER BY m.source_order DESC LIMIT 1)
+ current_profile AS MATERIALIZED (SELECT l.link_id,${AUTH_PROFILE_SOURCE_FIELDS_SQL},${AUTH_PROFILE_SOURCE_VERIFIED_AT_SQL}
+ FROM history l ${AUTH_PROFILE_SOURCE_JOINS_SQL} WHERE ${authLinkLiveGenerationSql({ link: "l" })})
  SELECT l.link_id,l.ended_at_ms,l.issuer,
  CASE WHEN l.link_id IS NOT NULL THEN l.authority_kind WHEN ${CURRENT_ATTESTATION} THEN 'controller_attestation' ELSE 'device_claim' END AS authority_kind,
  EXISTS (SELECT 1 FROM coordinator_auth_account_links h WHERE h.coordinator_id = p.coordinator_id AND h.identity_id = p.identity_id AND h.revoked_at_ms IS NOT NULL) AS security_revoked,
@@ -122,7 +120,7 @@ export class AccountManagementStatusOperations {
  CASE WHEN l.link_id IS NULL THEN 0 ELSE (${AUTH_LINK_CONTINUATION_PRIOR_SQL}) END AS reconnectable,
  m.display_name,m.email,m.email_verified,m.picture_url,m.verified_at_ms
  FROM requester p LEFT JOIN history l ON l.coordinator_id = p.coordinator_id LEFT JOIN current_profile m ON m.link_id = l.link_id`,
-			values: [...captured.values, c.coordinatorId, c.coordinatorId, c.coordinatorId],
+			values: captured.values,
 		});
 		if (row?.readable !== 1) return base;
 		const derived = { ...base, identityId: options.identityId, authority: row.authority_kind };

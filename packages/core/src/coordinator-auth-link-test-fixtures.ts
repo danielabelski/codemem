@@ -54,12 +54,13 @@ export const device: Requester = { kind: "device", signer };
 export const browser: Requester = { kind: "browser", browserTransactionHash: browserHash };
 
 export function attempt(overrides: Partial<CreateInput> = {}): CreateInput {
-	// Keep the legacy creation input for tests of direct claims and frozen schemas.
+	// Current linking always commits a private browser start code.
 	return {
 		authority: { kind: "controller_attestation" },
 		attemptId: "attempt-a",
 		signer: { ...signer },
 		runtimeVerifierHash: "b".repeat(64),
+		browserStartHash: fixtureHash(`browser-start:${overrides.attemptId ?? "attempt-a"}`),
 		loopbackRedirect: "http://127.0.0.1:4567/codemem/auth/complete",
 		...overrides,
 	};

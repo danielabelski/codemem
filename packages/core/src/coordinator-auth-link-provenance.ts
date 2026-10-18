@@ -7,6 +7,11 @@ export function authDeviceClaimGenesisSql(options: {
 	link: "l" | "cl" | "genesis";
 	canonicalKeyId?: "?";
 }): string {
+	if (
+		!["l", "cl", "genesis"].includes(options.link) ||
+		(options.canonicalKeyId !== undefined && options.canonicalKeyId !== "?")
+	)
+		throw new Error("auth_link_alias_invalid");
 	// Keep provenance independent of the outer session/browser expression tree.
 	// Native D1 limits expression depth to 100, including correlated subqueries.
 	const l = "pl";
@@ -43,15 +48,26 @@ export function authDeviceClaimProvenanceSql(options: {
 	link: "l" | "cl";
 	canonicalKeyId?: "?";
 }): string {
-	return `((${options.link}.generation = 1 AND ${authDeviceClaimGenesisSql(options)}) OR
- (${options.link}.generation > 1 AND EXISTS (WITH continuation AS MATERIALIZED (
- SELECT nl.coordinator_id,nl.link_id,d.key_id FROM coordinator_auth_account_links nl
+	if (options.link !== "l" && options.link !== "cl") throw new Error("auth_link_alias_invalid");
+	// Keep the unchanged genesis predicate out of the continuation's AND tree.
+	// D1 compiles both generation branches even for an attested outer request.
+	return `EXISTS (WITH proven_link AS MATERIALIZED (
+ SELECT candidate.* FROM coordinator_auth_account_links candidate
+ WHERE candidate.coordinator_id = ${options.link}.coordinator_id AND candidate.link_id = ${options.link}.link_id
+ ), historical_genesis AS MATERIALIZED (
+ SELECT genesis.coordinator_id,genesis.link_id,genesis.device_claim_id,original.key_id
+ FROM proven_link candidate JOIN coordinator_auth_account_links genesis
+ ON genesis.coordinator_id = candidate.coordinator_id AND genesis.device_claim_id = candidate.device_claim_id
+ JOIN coordinator_auth_device_claims original ON original.coordinator_id = genesis.coordinator_id AND original.claim_id = genesis.device_claim_id
+ WHERE genesis.generation = 1 AND ${authDeviceClaimGenesisSql({ link: "genesis" })}
+ ), continuation AS MATERIALIZED (
+ SELECT nl.coordinator_id,nl.link_id,d.key_id FROM proven_link nl
  JOIN coordinator_auth_link_attempts t ON t.coordinator_id = nl.coordinator_id AND t.attempt_id = nl.attempt_id AND t.link_id = nl.link_id
  JOIN coordinator_auth_device_claims d ON d.coordinator_id = nl.coordinator_id AND d.claim_id = nl.device_claim_id
- JOIN coordinator_auth_account_links genesis ON genesis.coordinator_id = d.coordinator_id AND genesis.device_claim_id = d.claim_id AND genesis.attempt_id = d.attempt_id AND genesis.generation = 1
+ JOIN historical_genesis genesis ON genesis.coordinator_id = d.coordinator_id AND genesis.device_claim_id = d.claim_id
  JOIN coordinator_auth_account_links prior ON prior.coordinator_id = nl.coordinator_id AND prior.link_id = t.prior_link_id
  JOIN coordinator_auth_link_audit_log a ON a.coordinator_id = nl.coordinator_id AND a.link_id = nl.link_id AND a.action = 'link_created'
- WHERE nl.coordinator_id = ${options.link}.coordinator_id AND nl.link_id = ${options.link}.link_id
+ WHERE nl.generation > 1
  AND nl.authority_kind = 'device_claim' AND nl.controller_attestation_id IS NULL
  AND t.authority_kind = 'device_claim' AND t.controller_attestation_id IS NULL AND t.controller_review_receipt_id IS NULL AND t.controller_revision IS NULL
  AND t.state IN ('finalized','session_redeemed') AND t.identity_id = nl.identity_id AND t.issuer = nl.issuer
@@ -60,14 +76,17 @@ export function authDeviceClaimProvenanceSql(options: {
  AND t.created_at_ms <= t.claimed_at_ms AND t.claimed_at_ms <= t.oidc_verified_at_ms AND t.oidc_verified_at_ms <= t.confirmed_at_ms
  AND t.confirmed_at_ms <= t.finalized_at_ms AND t.finalized_at_ms < t.expires_at_ms
  AND d.identity_id = t.identity_id AND d.device_id = t.device_id AND d.public_key = t.public_key AND d.fingerprint = t.fingerprint AND d.issuer = t.issuer
- AND ${authDeviceClaimGenesisSql({ link: "genesis" })}
  AND prior.identity_id = nl.identity_id AND prior.generation = t.prior_generation AND prior.generation = nl.generation-1
  AND prior.ended_at_ms IS NOT NULL AND prior.end_reason = 'user_disconnected'
  AND a.attempt_id = t.attempt_id AND a.identity_id = t.identity_id AND a.group_id = t.group_id AND a.device_id = t.device_id
  AND a.fingerprint = t.fingerprint AND a.device_claim_id = d.claim_id AND a.authority_kind = 'device_claim' AND a.controller_attestation_id IS NULL
- AND a.auth_config_revision = t.auth_config_revision AND a.created_at_ms = t.finalized_at_ms)
- SELECT 1 FROM continuation cp WHERE cp.coordinator_id = ${options.link}.coordinator_id AND cp.link_id = ${options.link}.link_id
- ${options.canonicalKeyId ? "AND cp.key_id = ?" : ""})))`;
+ AND a.auth_config_revision = t.auth_config_revision AND a.created_at_ms = t.finalized_at_ms
+ ), proven_generations AS MATERIALIZED (
+ SELECT l.coordinator_id,l.link_id,g.key_id FROM proven_link l JOIN historical_genesis g
+ ON g.coordinator_id = l.coordinator_id AND g.link_id = l.link_id WHERE l.generation = 1
+ UNION ALL SELECT coordinator_id,link_id,key_id FROM continuation)
+ SELECT 1 FROM proven_generations cp WHERE cp.coordinator_id = ${options.link}.coordinator_id AND cp.link_id = ${options.link}.link_id
+ ${options.canonicalKeyId ? "AND cp.key_id = ?" : ""})`;
 }
 
 /** Account management only; privileged enrollment/grant proofs remain attested-only. */

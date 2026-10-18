@@ -103,7 +103,8 @@ export type CoordinatorBrowserAuthStore = CoordinatorBrowserAccountInput["store"
 	CoordinatorBrowserLinkStartInput["store"] &
 	CoordinatorBrowserSigninStartInput["store"] &
 	CoordinatorAccountManagementCapability &
-	Partial<CoordinatorAuthBrowserTransactionPurposeStore & CoordinatorAuthSchemaStore>;
+	CoordinatorAuthBrowserTransactionPurposeStore &
+	Partial<CoordinatorAuthSchemaStore>;
 export type CoordinatorBrowserAuthClientKey = (context: Context) => string | null;
 export interface CoordinatorBrowserAuth {
 	readonly storeConfig: Readonly<CoordinatorAuthBrowserConfig>;

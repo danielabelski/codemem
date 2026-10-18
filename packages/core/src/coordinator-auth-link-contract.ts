@@ -80,8 +80,8 @@ export interface CoordinatorAuthLinkCreateInput {
 	signer: CoordinatorAuthLinkSigner;
 	runtimeVerifierHash: string;
 	loopbackRedirect: string;
-	/** Required for device claims; trusted attested callers may omit it. */
-	browserStartHash?: string;
+	/** Commitment required for every current browser ceremony. */
+	browserStartHash: string;
 }
 export interface CoordinatorAuthLinkClaimInput {
 	attemptId: string;

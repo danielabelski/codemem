@@ -8,6 +8,7 @@ import type { AuthLinkAttemptAuthorityRow } from "./coordinator-auth-link-author
 import { readAuthLinkAttemptAuthority } from "./coordinator-auth-link-authority.js";
 import { authLinkContinuationSource } from "./coordinator-auth-link-continuation.js";
 import type { CoordinatorAuthLinkConfig } from "./coordinator-auth-link-contract.js";
+import { authLinkLiveGenerationSql } from "./coordinator-auth-link-liveness.js";
 import { authDeviceClaimProvenanceSql } from "./coordinator-auth-link-provenance.js";
 import { ed25519KeyIdForRevocation } from "./coordinator-ed25519-key-id-compat.js";
 
@@ -45,12 +46,16 @@ export async function captureAuthLinkSource(
 		sql: "SELECT * FROM coordinator_auth_link_attempts WHERE coordinator_id = ? AND attempt_id = ?",
 		values: [config.coordinatorId, attemptId],
 	});
-	const authority = row && readAuthLinkAttemptAuthority(row);
-	if (!row || !authority) return { sql: "0 = 1", values: [] };
+	if (!row || row.browser_start_hash === null) return { sql: "0 = 1", values: [] };
+	const authority = readAuthLinkAttemptAuthority(row);
+	if (!authority) return { sql: "0 = 1", values: [] };
 	if (pendingContinuation(row))
 		return authLinkContinuationSource(backend, row, attemptId, config, now, alias);
 	if (authority.kind === "controller_attestation")
-		return { sql: `${alias}.authority_kind = 'controller_attestation'`, values: [] };
+		return {
+			sql: `${alias}.authority_kind = 'controller_attestation' AND ${alias}.browser_start_hash IS NOT NULL`,
+			values: [],
+		};
 	if (["finalized", "session_redeemed"].includes(row.state)) {
 		const keyId = await ed25519KeyIdForRevocation(row.public_key);
 		if (!keyId || row.browser_start_hash === null || row.completion_secret_hash === null)
@@ -126,5 +131,5 @@ function currentDeviceSql(t: string): string {
 function authDeviceClaimReceiptSql(t: string): string {
 	return `EXISTS (SELECT 1 FROM coordinator_auth_account_links cl
  WHERE cl.coordinator_id = ${t}.coordinator_id AND cl.link_id = ${t}.link_id AND cl.attempt_id = ${t}.attempt_id
- AND cl.revoked_at_ms IS NULL AND ${authDeviceClaimProvenanceSql({ link: "cl", canonicalKeyId: "?" })})`;
+ AND ${authLinkLiveGenerationSql({ link: "cl" })} AND ${authDeviceClaimProvenanceSql({ link: "cl", canonicalKeyId: "?" })})`;
 }

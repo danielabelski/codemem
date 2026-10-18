@@ -7,23 +7,31 @@ import {
 	consumeSigninProof,
 	finalize,
 	NOW,
+	startBrowserProof,
 } from "./coordinator-auth-link-test-fixtures.js";
 import { SESSION_TTL } from "./coordinator-auth-session-test-fixtures.js";
-import { type Backend, setupStore, sqliteD1 } from "./coordinator-auth-store-test-fixtures.js";
+import {
+	type Backend,
+	enroll,
+	review,
+	setupStore,
+	sqliteD1,
+} from "./coordinator-auth-store-test-fixtures.js";
 import { createCoordinatorBrowserAuthCallback } from "./coordinator-browser-auth-callback.js";
 import {
 	BROWSER_COOKIE_NAMES,
-	clearBrowserCookie,
 	issueBrowserCookie,
 	readBrowserCookie,
 } from "./coordinator-browser-credential.js";
 import { importBrowserCsrfKey, verifyBrowserCsrfToken } from "./coordinator-browser-csrf.js";
 import { createCoordinatorBrowserLinkHandlers } from "./coordinator-browser-link.js";
 import { createCoordinatorBrowserLinkCompletionHandlers } from "./coordinator-browser-link-completion.js";
+import { CANONICAL_PUBLIC_KEY } from "./coordinator-ed25519-key-id-test-fixtures.js";
 import { createCoordinatorOidcClient } from "./coordinator-oidc.js";
 import { oidcFixture, PROVIDER } from "./coordinator-oidc-test-fixtures.js";
 import { D1CoordinatorStore } from "./d1-coordinator-store.js";
 import { createInMemoryRequestRateLimiter } from "./request-rate-limit.js";
+import { fingerprintPublicKey } from "./sync-fingerprint.js";
 
 const ORIGIN = "https://app.example.test";
 const databases: ReturnType<typeof setupStore>["db"][] = [];
@@ -45,11 +53,42 @@ async function existingSessionFixture(
 	config: CoordinatorAuthBrowserConfig,
 ) {
 	// Independent reviewed store link; never fabricate the live session returned by persistence.
+	const controller = review({
+		groupId: "independent-group",
+		deviceId: "independent-device",
+		identityId: "independent-identity",
+		attestationId: "independent-attestation",
+		reviewReceiptId: "independent-review",
+		publicKey: CANONICAL_PUBLIC_KEY,
+		fingerprint: fingerprintPublicKey(CANONICAL_PUBLIC_KEY),
+	});
+	await enroll(f.store, controller);
+	expect(await f.store.createAuthControllerAttestation(controller)).toMatchObject({
+		kind: "created",
+	});
+	const signer = {
+		groupId: controller.groupId,
+		deviceId: controller.deviceId,
+		publicKey: controller.publicKey,
+		fingerprint: controller.fingerprint,
+	};
 	const browser = { attemptId: "independent-attempt", browserTransactionHash: "c".repeat(64) };
-	const account = { issuer: config.issuer, subject: "opaque-subject-a" };
-	const created = attempt({ attemptId: browser.attemptId, runtimeVerifierHash: "9".repeat(64) });
+	const account = { issuer: config.issuer, subject: "independent-subject" };
+	const created = attempt({
+		attemptId: browser.attemptId,
+		runtimeVerifierHash: "9".repeat(64),
+		signer,
+		expectedIdentityId: controller.identityId,
+	});
 	expect(await f.store.createAuthLinkAttempt(created, config)).toMatchObject({ kind: "created" });
-	expect(await f.store.claimAuthLinkAttempt(browser, config)).toMatchObject({ kind: "applied" });
+	const materials = await startBrowserProof(
+		{ ...f, cfg: config },
+		{ ...browser, browserStartHash: created.browserStartHash },
+		config,
+	);
+	expect(await f.store.consumeAuthBrowserTransaction(materials, config)).toMatchObject({
+		kind: "consumed",
+	});
 	expect(await f.store.recordAuthLinkOidcVerified({ ...browser, account }, config)).toMatchObject({
 		kind: "applied",
 	});
@@ -62,6 +101,11 @@ async function existingSessionFixture(
 	const proof = finalize({
 		attemptId: browser.attemptId,
 		runtimeVerifierHash: created.runtimeVerifierHash,
+		signer,
+		groupId: signer.groupId,
+		deviceId: signer.deviceId,
+		fingerprint: signer.fingerprint,
+		identityId: controller.identityId,
 	});
 	expect(await f.store.finalizeAuthLinkAttempt(proof, config)).toMatchObject({ kind: "applied" });
 	const issued = await issueBrowserCookie("session");
@@ -126,6 +170,7 @@ async function setup(backend: Backend = "SQLite", options: { existingSession?: b
 			{
 				purpose: "link",
 				attemptId: "attempt-a",
+				browserStartHash: attempt().browserStartHash,
 				stateHash: createHash("sha256").update(authorization.material.state).digest("hex"),
 				binderHash: parsed.cookieHash,
 				nonce: authorization.material.nonce,
@@ -281,6 +326,86 @@ async function safe(response: Response, status: number) {
 	);
 }
 
+// HTTP Set-Cookie ordering model, not real-browser popup or COOP certification.
+function applyCookieHeaders(jar: Map<string, string>, response: Response): void {
+	for (const header of response.headers.getSetCookie()) {
+		const pair = header.split(";")[0] ?? "";
+		const separator = pair.indexOf("=");
+		const name = pair.slice(0, separator);
+		if (/(?:^|;)\s*max-age=0(?:;|$)/i.test(header)) jar.delete(name);
+		else jar.set(name, pair.slice(separator + 1));
+	}
+}
+function cookieValue(setCookie: string): string {
+	const pair = setCookie.split(";")[0] ?? "";
+	return pair.slice(pair.indexOf("=") + 1);
+}
+
+it.each(["issue", "preserve"] as const)(
+	"delayed %s completion HTTP headers retain a newer transaction without changing SESSION semantics",
+	async (mode) => {
+		const existing = mode === "preserve" ? await liveCompletion("SQLite") : null;
+		const f = existing?.f ?? (await setup());
+		if (!existing) await ready(f);
+		const committed = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		if (existing)
+			f.operations.preserveAuthLinkSessionCompletion.mockImplementation(async (...args) => {
+				const result = await f.store.preserveAuthLinkSessionCompletion(...args);
+				committed.resolve();
+				await release.promise;
+				return result;
+			});
+		else
+			f.operations.redeemAuthLinkSessionWithBrowserTransaction.mockImplementation(
+				async (...args) => {
+					const result = await f.store.redeemAuthLinkSessionWithBrowserTransaction(...args);
+					committed.resolve();
+					await release.promise;
+					return result;
+				},
+			);
+		const pending = f.handlers.complete(
+			post(f, {}, existing?.cookie ?? f.header),
+			"trusted-client",
+		);
+		await committed.promise;
+		expect(rows(f)[0].state).toBe("session_redeemed");
+		const newer = await issueBrowserCookie("transaction");
+		const jar = new Map<string, string>([
+			[BROWSER_COOKIE_NAMES.transaction, cookieValue(newer.setCookie)],
+		]);
+		if (existing) {
+			jar.set(BROWSER_COOKIE_NAMES.session, cookieValue(existing.session.setCookie));
+		}
+		release.resolve();
+		const delayed = await pending;
+		expect(delayed.response.status).toBe(303);
+		expect(delayed.outcome).toBe(mode === "issue" ? "session_issued" : "session_preserved");
+		if (existing) expect(delayed.response.headers.getSetCookie()).toEqual([]);
+		else {
+			expect(delayed.response.headers.getSetCookie()).toHaveLength(1);
+			expect(delayed.response.headers.getSetCookie()[0]).toMatch(
+				new RegExp(`^${BROWSER_COOKIE_NAMES.session}=`),
+			);
+		}
+		applyCookieHeaders(jar, delayed.response);
+		expect(
+			await readBrowserCookie(
+				`${BROWSER_COOKIE_NAMES.transaction}=${jar.get(BROWSER_COOKIE_NAMES.transaction) ?? ""}`,
+				"transaction",
+			),
+		).toMatchObject({ kind: "present", cookieHash: newer.cookieHash });
+		const session = await readBrowserCookie(
+			`${BROWSER_COOKIE_NAMES.session}=${jar.get(BROWSER_COOKIE_NAMES.session) ?? ""}`,
+			"session",
+		);
+		if (session.kind !== "present") throw new Error("Expected issued or preserved SESSION");
+		expect(await f.store.readAuthSession(session.cookieHash, f.config)).not.toBeNull();
+		if (existing) expect(session.cookieHash).toBe(existing.session.cookieHash);
+	},
+);
+
 describe.each(["SQLite", "D1"] as const)("%s browser completion", (backend) => {
 	it("dogfoods Google callback, explicit confirmation, device proofs and bound eight-hour SESSION", async () => {
 		// Arrange
@@ -340,12 +465,9 @@ describe.each(["SQLite", "D1"] as const)("%s browser completion", (backend) => {
 		expect(completed.response.status).toBe(303);
 		expect(completed.response.headers.get("location")).toBe(`${ORIGIN}/auth/account`);
 		const cookies = completed.response.headers.getSetCookie();
-		expect(cookies).toHaveLength(2);
-		expect(cookies).toContain(clearBrowserCookie("transaction"));
-		const session = await readBrowserCookie(
-			cookies.find((value) => value !== clearBrowserCookie("transaction"))?.split(";")[0] ?? "",
-			"session",
-		);
+		expect(cookies).toHaveLength(1);
+		expect(cookies[0]).toMatch(new RegExp(`^${BROWSER_COOKIE_NAMES.session}=`));
+		const session = await readBrowserCookie(cookies[0]?.split(";")[0] ?? "", "session");
 		if (session.kind !== "present") throw new Error("Issued SESSION missing");
 		expect(rows(f, "coordinator_auth_sessions")[0]).toMatchObject({
 			credential_hash: session.cookieHash,
@@ -389,10 +511,9 @@ describe.each(["SQLite", "D1"] as const)("%s returning browser SESSION", (backen
 		expect(result.response.status).toBe(303);
 		expect(result.response.headers.get("location")).toBe(`${ORIGIN}/auth/account`);
 		const cookies = result.response.headers.getSetCookie();
-		expect(cookies).toHaveLength(2);
-		expect(cookies).toContain(clearBrowserCookie("transaction"));
-		const freshHeader =
-			cookies.find((cookie) => cookie !== clearBrowserCookie("transaction"))?.split(";")[0] ?? "";
+		expect(cookies).toHaveLength(1);
+		expect(cookies[0]).toMatch(new RegExp(`^${BROWSER_COOKIE_NAMES.session}=`));
+		const freshHeader = cookies[0]?.split(";")[0] ?? "";
 		expect(freshHeader).not.toBe(staleHeader);
 		const fresh = await readBrowserCookie(freshHeader, "session");
 		if (fresh.kind !== "present") throw new Error("New SESSION missing");
@@ -683,7 +804,7 @@ describe.each(["SQLite", "D1"] as const)("%s live SESSION completion consumption
 			// Assert
 			expect(result.response.status).toBe(303);
 			expect(result.response.headers.get("location")).toBe(`${ORIGIN}/auth/account`);
-			expect(result.response.headers.getSetCookie()).toEqual([clearBrowserCookie("transaction")]);
+			expect(result.response.headers.getSetCookie()).toEqual([]);
 			expect(f.operations.redeemAuthLinkSessionWithBrowserTransaction).not.toHaveBeenCalled();
 			expect(f.operations.preserveAuthLinkSessionCompletion).toHaveBeenCalledExactlyOnceWith(
 				{ ...redemption, credentialHash: issued.cookieHash },
@@ -700,17 +821,15 @@ describe.each(["SQLite", "D1"] as const)("%s live SESSION completion consumption
 				expect.soft(replay.response.headers.getSetCookie()).toEqual([]);
 				expect.soft(replay.response.headers.get("cache-control")).toBe("no-store");
 			} else {
-				let redeemed: Awaited<ReturnType<typeof f.store.redeemAuthLinkSession>>;
 				if (path === "bound redemption") {
-					redeemed = await f.store.redeemAuthLinkSessionWithBrowserTransaction(
+					const redeemed = await f.store.redeemAuthLinkSessionWithBrowserTransaction(
 						redemption,
 						f.config,
 					);
+					expect.soft(redeemed).toMatchObject({ kind: "rejected" });
 				} else {
-					redeemed = await f.store.redeemAuthLinkSession(redemption, f.config);
+					expect("redeemAuthLinkSession" in f.store).toBe(false);
 				}
-				// Assert
-				expect.soft(redeemed).toMatchObject({ kind: "rejected" });
 			}
 			expect.soft(authority(f)).toEqual(before);
 		},
@@ -780,7 +899,7 @@ describe.each(["SQLite", "D1"] as const)("%s preserve completion guards", (backe
 describe.each(["SQLite", "D1"] as const)(
 	"%s preservation delivery and competing completions",
 	(backend) => {
-		it("waits for the real preservation write before delivering the prebuilt TXN clear", async () => {
+		it("waits for the real preservation write before returning a cookie-free redirect", async () => {
 			// Arrange: pause only the preservation call, after the independent live read.
 			const { f, cookie } = await liveCompletion(backend);
 			const before = authority(f);
@@ -807,7 +926,7 @@ describe.each(["SQLite", "D1"] as const)(
 			const result = await pending;
 			// Assert
 			expect(result.response.status).toBe(303);
-			expect(result.response.headers.getSetCookie()).toEqual([clearBrowserCookie("transaction")]);
+			expect(result.response.headers.getSetCookie()).toEqual([]);
 			expect(rows(f)[0].state).toBe("session_redeemed");
 			expect(authority(f)).toEqual(before);
 		});
@@ -858,7 +977,9 @@ describe.each(["SQLite", "D1"] as const)(
 				expect(authority(f).slice(0, 2)).toEqual(before.slice(0, 2));
 				expect(authority(f).slice(4)).toEqual(before.slice(4));
 				expect(rows(f)[0].state).toBe("session_redeemed");
-				expect(winner.response.headers.getSetCookie()).toHaveLength(1 + added);
+				expect(winner.response.headers.getSetCookie()).toHaveLength(added);
+				for (const cookie of winner.response.headers.getSetCookie())
+					expect(cookie).toMatch(new RegExp(`^${BROWSER_COOKIE_NAMES.session}=`));
 				if (!added) expect(authority(f)).toEqual(before);
 			},
 		);
@@ -952,9 +1073,11 @@ it("double submits through two store wrappers issue one SESSION and never clobbe
 	expect(
 		results.find((result) => result.response.status === 403)?.response.headers.getSetCookie(),
 	).toEqual([]);
-	expect(
-		results.find((result) => result.response.status === 303)?.response.headers.getSetCookie(),
-	).toHaveLength(2);
+	const issuedCookies = results
+		.find((result) => result.response.status === 303)
+		?.response.headers.getSetCookie();
+	expect(issuedCookies).toHaveLength(1);
+	expect(issuedCookies?.[0]).toMatch(new RegExp(`^${BROWSER_COOKIE_NAMES.session}=`));
 	expect(rows(f, "coordinator_auth_sessions")).toHaveLength(1);
 	expect(rows(f, "coordinator_auth_session_receipts")).toHaveLength(1);
 });

@@ -7,6 +7,7 @@ import {
 	type CoordinatorAuthBrowserConfig,
 	type CoordinatorAuthBrowserTransactionConsumeInput,
 	type CoordinatorAuthBrowserTransactionMaintenanceOptions,
+	type CoordinatorAuthBrowserTransactionPurposeStore,
 	type CoordinatorAuthBrowserTransactionRetirementOptions,
 	type CoordinatorAuthBrowserTransactionScope,
 	type CoordinatorAuthBrowserTransactionStartInput,
@@ -64,7 +65,6 @@ import { AuthSessionOperations } from "./coordinator-auth-session.js";
 import type {
 	CoordinatorAuthAccountSignInInput,
 	CoordinatorAuthBoundLinkSessionRedeemInput,
-	CoordinatorAuthLinkSessionRedeemInput,
 	CoordinatorAuthSessionPurgeOptions,
 	CoordinatorAuthSessionScope,
 } from "./coordinator-auth-session-contract.js";
@@ -1008,7 +1008,9 @@ async function runProjectInviteBatch(
 	return !initial.consumed_at && changed === 1;
 }
 
-export class D1CoordinatorStore implements CoordinatorStore {
+export class D1CoordinatorStore
+	implements CoordinatorStore, CoordinatorAuthBrowserTransactionPurposeStore
+{
 	readonly db: D1DatabaseLike;
 	private readonly authLinks: AuthLinkOperations;
 	readonly accountManagement: CoordinatorAccountManagementStore;
@@ -1115,12 +1117,6 @@ export class D1CoordinatorStore implements CoordinatorStore {
 		return this.authBrowserTransactions.maintainAuthBrowserTransactions(scope, options);
 	}
 
-	async redeemAuthLinkSession(
-		input: CoordinatorAuthLinkSessionRedeemInput,
-		config: CoordinatorAuthLinkConfig,
-	) {
-		return this.authSessions.redeemAuthLinkSession(input, config);
-	}
 	async redeemAuthLinkSessionWithBrowserTransaction(
 		input: CoordinatorAuthBoundLinkSessionRedeemInput,
 		config: CoordinatorAuthBrowserConfig,
@@ -1144,12 +1140,6 @@ export class D1CoordinatorStore implements CoordinatorStore {
 		options?: CoordinatorAuthSessionPurgeOptions,
 	) {
 		return this.authSessions.purgeAuthGuardedSigninReceipts(scope, options);
-	}
-	async signInWithAuthAccount(
-		input: CoordinatorAuthAccountSignInInput,
-		config: CoordinatorAuthLinkConfig,
-	) {
-		return this.authSessions.signInWithAuthAccount(input, config);
 	}
 	async signInWithConsumedBrowserTransaction(
 		input: CoordinatorAuthAccountSignInInput,

@@ -163,10 +163,12 @@ export async function authLinkContinuationSource(
 	);
 	if (!source) return { sql: "0 = 1", values: [] };
 	return {
-		sql: `EXISTS (${source.sql} SELECT 1 FROM continuation_target l JOIN continuation_requester p ON p.coordinator_id = l.coordinator_id
+		sql: `EXISTS (${source.sql}, continuation_bound AS MATERIALIZED (
+ SELECT 1 FROM continuation_target l JOIN continuation_requester p ON p.coordinator_id = l.coordinator_id
  WHERE ${alias}.coordinator_id = p.coordinator_id AND ${alias}.identity_id = p.identity_id AND ${alias}.group_id = p.group_id AND ${alias}.device_id = p.device_id
  AND ${alias}.public_key = p.public_key AND ${alias}.fingerprint = p.fingerprint AND ${alias}.issuer = p.issuer AND ${alias}.auth_config_revision = p.revision
- AND ${alias}.prior_link_id = l.link_id AND ${alias}.prior_generation = l.generation AND ${alias}.authority_kind = l.authority_kind)`,
+ AND ${alias}.prior_link_id = l.link_id AND ${alias}.prior_generation = l.generation AND ${alias}.authority_kind = l.authority_kind)
+ SELECT 1 FROM continuation_bound)`,
 		values: source.values,
 	};
 }
@@ -251,15 +253,6 @@ export async function finalizeAuthLinkContinuation(
 			assertAuthLinkChangeWrite(),
 			...continuationBirthStatements(i, c, linkId, now),
 			promoteAuthLinkProfile(c.coordinatorId, i.attemptId, linkId),
-			{
-				sql: `UPDATE coordinator_auth_link_profiles AS p SET source_order = (
- SELECT b.browser_sequence+1 FROM coordinator_auth_browser_transactions b
- WHERE b.coordinator_id = p.coordinator_id AND b.attempt_id = p.attempt_id AND b.purpose = 'link'
- AND b.browser_transaction_hash = p.browser_transaction_hash AND b.issuer = p.issuer
- AND b.auth_config_revision = p.auth_config_revision AND b.state = 'consumed')
- WHERE p.coordinator_id = ? AND p.attempt_id = ? AND p.link_id = ? AND p.source_purpose = 'link'`,
-				values: [c.coordinatorId, i.attemptId, linkId],
-			},
 		]);
 	} catch {
 		return { kind: "rejected", error: "attempt_unavailable" };

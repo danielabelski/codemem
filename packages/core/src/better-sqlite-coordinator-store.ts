@@ -18,16 +18,14 @@ import type { Database as DatabaseType } from "better-sqlite3";
 import Database from "better-sqlite3";
 import { AccountLinkStatusOperations } from "./coordinator-account-link-status.js";
 import {
-	AUTH_ACCOUNT_PROFILE_SCHEMA_SQL,
 	AuthAccountProfileOperations,
 	type CoordinatorAuthAccountProfileInput,
 } from "./coordinator-auth-account-profile.js";
-import { upgradeAuthBrowserOwnerPurposeSchema } from "./coordinator-auth-browser-schema-upgrade.js";
 import {
-	AUTH_BROWSER_TXN_SCHEMA_SQL,
 	type CoordinatorAuthBrowserConfig,
 	type CoordinatorAuthBrowserTransactionConsumeInput,
 	type CoordinatorAuthBrowserTransactionMaintenanceOptions,
+	type CoordinatorAuthBrowserTransactionPurposeStore,
 	type CoordinatorAuthBrowserTransactionRetirementOptions,
 	type CoordinatorAuthBrowserTransactionScope,
 	type CoordinatorAuthBrowserTransactionStartInput,
@@ -57,7 +55,7 @@ import {
 	isAuthControllerId,
 	isAuthControllerUniqueError,
 } from "./coordinator-auth-controller.js";
-import { COORDINATOR_AUTH_DEVICE_CLAIM_SCHEMA_SQL } from "./coordinator-auth-device-claim-schema.js";
+import { AUTH_LIFECYCLE_FRESH_SCHEMA_SQL } from "./coordinator-auth-lifecycle-fresh-schema.js";
 import {
 	type AuthLinkBackend,
 	AuthLinkOperations,
@@ -67,36 +65,28 @@ import {
 	type CoordinatorAccountManagementStore,
 	createCoordinatorAccountManagementStore,
 } from "./coordinator-auth-link-change-store.js";
-import {
-	AUTH_LINK_BROWSER_START_COLUMN_SQL,
-	AUTH_LINK_SCHEMA_SQL,
-	type CoordinatorAuthLinkClaimInput,
-	type CoordinatorAuthLinkConfig,
-	type CoordinatorAuthLinkConfirmInput,
-	type CoordinatorAuthLinkCreateInput,
-	type CoordinatorAuthLinkFailInput,
-	type CoordinatorAuthLinkFinalizeInput,
-	type CoordinatorAuthLinkMaintenanceOptions,
-	type CoordinatorAuthLinkOidcInput,
-	type CoordinatorAuthLinkOptions,
-	type CoordinatorAuthLinkRequester,
+import type {
+	CoordinatorAuthLinkClaimInput,
+	CoordinatorAuthLinkConfig,
+	CoordinatorAuthLinkConfirmInput,
+	CoordinatorAuthLinkCreateInput,
+	CoordinatorAuthLinkFailInput,
+	CoordinatorAuthLinkFinalizeInput,
+	CoordinatorAuthLinkMaintenanceOptions,
+	CoordinatorAuthLinkOidcInput,
+	CoordinatorAuthLinkOptions,
+	CoordinatorAuthLinkRequester,
 } from "./coordinator-auth-link-contract.js";
-import { AUTH_LINK_PROFILE_SCHEMA_SQL } from "./coordinator-auth-link-profile.js";
 import {
-	AUTH_SCHEMA_READINESS_SQL,
-	AUTH_SCHEMA_READY_COUNT,
 	assertCoordinatorAuthSchema,
 	withCoordinatorAuthSchema,
 } from "./coordinator-auth-schema.js";
 import { AuthSessionOperations } from "./coordinator-auth-session.js";
-import {
-	AUTH_SESSION_RETENTION_COLUMN_SQL,
-	AUTH_SESSION_SCHEMA_SQL,
-	type CoordinatorAuthAccountSignInInput,
-	type CoordinatorAuthBoundLinkSessionRedeemInput,
-	type CoordinatorAuthLinkSessionRedeemInput,
-	type CoordinatorAuthSessionPurgeOptions,
-	type CoordinatorAuthSessionScope,
+import type {
+	CoordinatorAuthAccountSignInInput,
+	CoordinatorAuthBoundLinkSessionRedeemInput,
+	CoordinatorAuthSessionPurgeOptions,
+	CoordinatorAuthSessionScope,
 } from "./coordinator-auth-session-contract.js";
 import {
 	BOOTSTRAP_AUTHORIZATION_SOURCE_SQL,
@@ -461,89 +451,23 @@ function insertBootstrapGrantSync(
 	return rowToRecord<CoordinatorBootstrapGrant>(row);
 }
 
-function upgradeAuthSessionRetentionSchema(db: DatabaseType): void {
-	const present = db
-		.prepare(
-			"SELECT 1 FROM pragma_table_info('coordinator_auth_session_receipts') WHERE name = 'purge_eligible'",
-		)
-		.get();
-	if (present) return;
-	db.transaction(() => {
-		const columns = db.prepare("PRAGMA table_info(coordinator_auth_session_receipts)").all() as {
-			name: string;
-		}[];
-		if (columns.length === 0 || columns.some((column) => column.name === "purge_eligible")) return;
-		db.exec(
-			`ALTER TABLE coordinator_auth_session_receipts ADD COLUMN ${AUTH_SESSION_RETENTION_COLUMN_SQL}`,
-		);
-	}).immediate();
-}
-
-function upgradeAuthLinkBrowserStartSchema(db: DatabaseType): void {
-	const present = db
-		.prepare(
-			"SELECT 1 FROM pragma_table_info('coordinator_auth_link_attempts') WHERE name = 'browser_start_hash'",
-		)
-		.get();
-	if (present) return;
-	db.transaction(() => {
-		const columns = db.prepare("PRAGMA table_info(coordinator_auth_link_attempts)").all() as {
-			name: string;
-		}[];
-		if (columns.length === 0 || columns.some((column) => column.name === "browser_start_hash"))
-			return;
-		db.exec(
-			`ALTER TABLE coordinator_auth_link_attempts ADD COLUMN ${AUTH_LINK_BROWSER_START_COLUMN_SQL}`,
-		);
-	}).immediate();
-}
-
 function initializeDeviceLedgerSchemas(db: DatabaseType): void {
 	db.exec(COORDINATOR_DEVICE_OWNERSHIP_SCHEMA_SQL);
 	db.exec(DEVICE_REVOCATION_SCHEMA_SQL);
 	db.exec(COORDINATOR_OWNER_ENROLLMENT_SCHEMA_SQL);
 }
 
-function initializeAuthBrowserSchema(db: DatabaseType): void {
-	upgradeAuthBrowserOwnerPurposeSchema(db);
-	db.exec(AUTH_BROWSER_TXN_SCHEMA_SQL);
-}
-
-function initializeAuthLinkSchema(db: DatabaseType): void {
-	const ready = db.prepare(AUTH_SCHEMA_READINESS_SQL).get() as { ready: number };
-	if (ready.ready === AUTH_SCHEMA_READY_COUNT) return;
-	const existing = db
-		.prepare(
-			"SELECT sql FROM sqlite_master WHERE type='table' AND name='coordinator_auth_link_attempts'",
-		)
-		.get() as { sql: string } | undefined;
-	if (existing && !existing.sql.includes("authority_kind")) {
-		upgradeAuthLinkBrowserStartSchema(db);
-		db.exec(AUTH_LINK_SCHEMA_SQL);
-		return;
-	}
-	db.transaction(() => {
-		upgradeAuthLinkBrowserStartSchema(db);
-		db.exec(AUTH_LINK_SCHEMA_SQL);
-		const explicit = db
-			.prepare(
-				"SELECT 1 FROM pragma_table_info('coordinator_auth_link_attempts') WHERE name = 'authority_kind'",
-			)
-			.get();
-		if (explicit) db.exec(COORDINATOR_AUTH_DEVICE_CLAIM_SCHEMA_SQL);
-	}).immediate();
-}
-
 function initializeSchema(db: DatabaseType): void {
+	// Inspect before any optional-auth DDL. Only an empty database is fresh:
+	// existing caller or partial auth storage requires explicit operator setup.
+	db.transaction(() => {
+		if (db.prepare("SELECT 1 FROM sqlite_master WHERE name NOT GLOB 'sqlite_*' LIMIT 1").get())
+			return;
+		db.exec(AUTH_CONTROLLER_SCHEMA_SQL);
+		db.exec(AUTH_LIFECYCLE_FRESH_SCHEMA_SQL);
+	}).immediate();
 	db.exec(IDENTITY_GROUP_GRANT_SCHEMA_SQL);
 	initializeDeviceLedgerSchemas(db);
-	db.exec(AUTH_CONTROLLER_SCHEMA_SQL);
-	initializeAuthLinkSchema(db);
-	upgradeAuthSessionRetentionSchema(db);
-	db.exec(AUTH_SESSION_SCHEMA_SQL);
-	db.exec(AUTH_ACCOUNT_PROFILE_SCHEMA_SQL);
-	db.exec(AUTH_LINK_PROFILE_SCHEMA_SQL);
-	initializeAuthBrowserSchema(db);
 	db.exec(`
 		CREATE TABLE IF NOT EXISTS groups (
 			group_id TEXT PRIMARY KEY,
@@ -836,7 +760,9 @@ function enrollmentRevocationKeyId(publicKey: string): string | null {
 	return createHash("sha256").update(parsed.blob).digest("hex");
 }
 
-export class BetterSqliteCoordinatorStore implements CoordinatorStore {
+export class BetterSqliteCoordinatorStore
+	implements CoordinatorStore, CoordinatorAuthBrowserTransactionPurposeStore
+{
 	readonly path: string;
 	readonly db: DatabaseType;
 	private readonly authLinks: AuthLinkOperations;
@@ -920,6 +846,12 @@ export class BetterSqliteCoordinatorStore implements CoordinatorStore {
 	) {
 		return this.authBrowserTransactions.consumeAuthBrowserTransaction(input, config);
 	}
+	async readAuthBrowserTransactionPurpose(
+		input: CoordinatorAuthBrowserTransactionConsumeInput,
+		config: CoordinatorAuthBrowserConfig,
+	) {
+		return this.authBrowserTransactions.readAuthBrowserTransactionPurpose(input, config);
+	}
 	async resolveAuthLinkBrowserTransaction(
 		input: CoordinatorAuthLinkBrowserTransactionResolveInput,
 		config: CoordinatorAuthBrowserConfig,
@@ -951,12 +883,6 @@ export class BetterSqliteCoordinatorStore implements CoordinatorStore {
 		return this.authBrowserTransactions.maintainAuthBrowserTransactions(scope, options);
 	}
 
-	async redeemAuthLinkSession(
-		input: CoordinatorAuthLinkSessionRedeemInput,
-		config: CoordinatorAuthLinkConfig,
-	) {
-		return this.authSessions.redeemAuthLinkSession(input, config);
-	}
 	async redeemAuthLinkSessionWithBrowserTransaction(
 		input: CoordinatorAuthBoundLinkSessionRedeemInput,
 		config: CoordinatorAuthBrowserConfig,
@@ -980,12 +906,6 @@ export class BetterSqliteCoordinatorStore implements CoordinatorStore {
 		options?: CoordinatorAuthSessionPurgeOptions,
 	) {
 		return this.authSessions.purgeAuthGuardedSigninReceipts(scope, options);
-	}
-	async signInWithAuthAccount(
-		input: CoordinatorAuthAccountSignInInput,
-		config: CoordinatorAuthLinkConfig,
-	) {
-		return this.authSessions.signInWithAuthAccount(input, config);
 	}
 	async signInWithConsumedBrowserTransaction(
 		input: CoordinatorAuthAccountSignInInput,

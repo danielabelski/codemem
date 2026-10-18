@@ -12,6 +12,7 @@ import {
 	AUTH_LINK_MAX_CREATES_PER_DEVICE_WINDOW,
 	AUTH_LINK_MAX_UNFINISHED_PER_COORDINATOR,
 } from "./coordinator-auth-link-contract.js";
+import { authLinkLiveGenerationSql } from "./coordinator-auth-link-liveness.js";
 import { parseCoordinatorAuthLoopback } from "./coordinator-auth-loopback.js";
 import {
 	decodeCoordinatorAuthProof32,
@@ -524,7 +525,7 @@ async function persistVerified(
 	account: { issuer: string; subject: string },
 ): Promise<OwnerAttempt | null> {
 	const link = await context.backend.first<OwnerAccountLink>({
-		sql: `SELECT * FROM coordinator_auth_account_links WHERE coordinator_id = ? AND issuer = ? AND subject = ? AND revoked_at_ms IS NULL AND authority_kind = 'controller_attestation'`,
+		sql: `SELECT l.* FROM coordinator_auth_account_links l WHERE l.coordinator_id = ? AND l.issuer = ? AND l.subject = ? AND ${authLinkLiveGenerationSql({ link: "l" })} AND l.authority_kind = 'controller_attestation'`,
 		values: [context.c.coordinatorId, account.issuer, account.subject],
 	});
 	if (!link || !isAuthControllerId(link.controller_attestation_id)) return null;
@@ -568,7 +569,7 @@ function verifiedStatement(
  AND b.state = 'consumed' AND b.claim_token = ? AND b.nonce IS NULL AND b.pkce_verifier IS NULL)
  AND EXISTS (SELECT 1 FROM coordinator_auth_account_links l WHERE l.coordinator_id = a.coordinator_id
  AND l.link_id = ? AND l.issuer = a.issuer AND l.subject = ? AND l.identity_id = ? AND l.attempt_id = ?
- AND l.authority_kind = 'controller_attestation' AND l.controller_attestation_id = ? AND l.auth_config_revision = ? AND l.created_at_ms = ? AND l.revoked_at_ms IS NULL)
+ AND l.authority_kind = 'controller_attestation' AND l.controller_attestation_id = ? AND l.auth_config_revision = ? AND l.created_at_ms = ? AND ${authLinkLiveGenerationSql({ link: "l" })})
  AND (${CALLBACK_GRANTS_SQL}) = ?
  AND ${NO_COLLISION_SQL}`,
 		values: [

@@ -27,7 +27,12 @@ import type {
 	CoordinatorAuthLinkConfig,
 	CoordinatorAuthLinkSigner,
 } from "./coordinator-auth-link-contract.js";
+import { authLinkLiveGenerationSql } from "./coordinator-auth-link-liveness.js";
 import { authDeviceClaimProvenanceSql } from "./coordinator-auth-link-provenance.js";
+import {
+	AUTH_PROFILE_SOURCE_FIELDS_SQL,
+	AUTH_PROFILE_SOURCE_JOINS_SQL,
+} from "./coordinator-auth-profile-sources.js";
 import { authPersistenceError } from "./coordinator-auth-schema.js";
 import { ed25519KeyIdForRevocation } from "./coordinator-ed25519-key-id-compat.js";
 
@@ -45,6 +50,7 @@ interface StatusRow {
 	link_id: string | null;
 	issuer: string | null;
 	revoked_at_ms: number | null;
+	ended_at_ms: number | null;
 	display_name: unknown;
 	email: unknown;
 	email_verified: unknown;
@@ -78,6 +84,10 @@ function claimConflicts(row: StatusRow): boolean {
 	);
 }
 
+function validStatusAuthority(row: StatusRow): boolean {
+	return row.valid === 1 && row.controller_count <= 1;
+}
+
 function projectStatus(
 	base: Extract<CoordinatorAccountLinkStatus, { state: "review_required" | "conflict" }>,
 	row: StatusRow | null,
@@ -87,13 +97,14 @@ function projectStatus(
 	if (!row) return base;
 	if (claimConflicts(row))
 		return { ...base, state: "conflict", identityId: null, authority: null, account: null };
-	if (row.valid !== 1 || row.controller_count > 1) return base;
+	if (!validStatusAuthority(row)) return base;
 	const derived = { ...base, identityId: row.identity_id, authority: row.authority };
 	if (row.link_id === null) {
 		if (row.identity_id !== identityId) return base;
 		return { ...derived, state: "unlinked", account: null };
 	}
 	if (row.revoked_at_ms !== null) return { ...derived, state: "revoked", account: null };
+	if (row.ended_at_ms !== null) return base;
 	if (row.issuer !== config.issuer) return { ...base, state: "conflict" };
 	if (row.identity_id !== identityId) return { ...derived, state: "linked", account: null };
 	const account: NonNullable<CoordinatorAccountLinkStatus["account"]> = {};
@@ -186,7 +197,8 @@ export class AccountLinkStatusOperations implements CoordinatorAccountLinkStatus
    AND (${AUTH_DEVICE_CLAIM_REQUESTER_ATTESTATION_COMPATIBLE_SQL}
    AND ${AUTH_DEVICE_CLAIM_REQUESTER_INVITE_COMPATIBLE_SQL})
    AND (${AUTH_DEVICE_CLAIM_REQUESTER_LINK_COMPATIBLE_SQL})),
-  claims AS MATERIALIZED (SELECT d.identity_id, l.link_id, l.issuer, l.revoked_at_ms,
+   claims AS MATERIALIZED (SELECT d.identity_id, l.link_id, l.issuer,
+ (SELECT min(history.revoked_at_ms) FROM coordinator_auth_account_links history WHERE history.coordinator_id = d.coordinator_id AND history.identity_id = d.identity_id) AS revoked_at_ms,l.ended_at_ms,
  CASE WHEN l.identity_id = d.identity_id
  AND EXISTS (SELECT 1 FROM enrolled_devices e JOIN groups g ON g.group_id = e.group_id
  WHERE e.group_id = p.group_id AND e.device_id = p.device_id AND e.public_key = p.public_key
@@ -204,35 +216,31 @@ export class AccountLinkStatusOperations implements CoordinatorAccountLinkStatus
  AND ${authDeviceClaimProvenanceSql({ link: "l" })}))
  THEN 1 ELSE 0 END AS valid
  FROM claim_input p JOIN coordinator_auth_device_claims d ON d.coordinator_id = p.coordinator_id
- LEFT JOIN coordinator_auth_account_links l ON l.coordinator_id = d.coordinator_id AND l.device_claim_id = d.claim_id
+  LEFT JOIN coordinator_auth_account_links l ON l.coordinator_id = d.coordinator_id AND l.device_claim_id = d.claim_id
+ AND l.generation = (SELECT max(latest.generation) FROM coordinator_auth_account_links latest WHERE latest.coordinator_id = d.coordinator_id AND latest.identity_id = d.identity_id)
  WHERE d.device_id = p.device_id OR d.key_id = p.key_id
  OR (d.identity_id = p.identity_id AND EXISTS (SELECT 1 FROM status_assignment))),
  candidates AS (
  SELECT *, 'device_claim' AS authority FROM claims
- UNION ALL SELECT a.controller_identity_id, l.link_id, l.issuer, l.revoked_at_ms, 1, 'controller_attestation'
+  UNION ALL SELECT a.controller_identity_id, l.link_id, l.issuer,
+ (SELECT min(history.revoked_at_ms) FROM coordinator_auth_account_links history WHERE history.coordinator_id = l.coordinator_id AND history.identity_id = l.identity_id),l.ended_at_ms,1, 'controller_attestation'
  FROM controller a LEFT JOIN coordinator_auth_account_links l ON l.coordinator_id = ?
  AND l.identity_id = a.controller_identity_id AND l.authority_kind = 'controller_attestation'
  AND l.controller_attestation_id IS NOT NULL AND l.device_claim_id IS NULL
+ AND l.generation = (SELECT max(latest.generation) FROM coordinator_auth_account_links latest WHERE latest.coordinator_id = l.coordinator_id AND latest.identity_id = l.identity_id)
  WHERE NOT EXISTS (SELECT 1 FROM claims)
- UNION ALL SELECT p.identity_id, NULL, NULL, NULL, 1, 'device_claim' FROM claim_input p
+  UNION ALL SELECT p.identity_id, NULL, NULL, NULL, NULL, 1, 'device_claim' FROM claim_input p
  WHERE NOT EXISTS (SELECT 1 FROM claims) AND NOT EXISTS (SELECT 1 FROM controller)
  AND ${AUTH_DEVICE_CLAIM_ELIGIBLE_SQL})
  SELECT a.*, (SELECT count(*) FROM claims) AS claim_count,
  (SELECT count(*) FROM controller) AS controller_count,
  (SELECT controller_identity_id FROM controller LIMIT 1) AS controller_identity,
-  CASE WHEN m.link_id IS NOT NULL THEN m.display_name ELSE b.display_name END AS display_name,
-  CASE WHEN m.link_id IS NOT NULL THEN m.email ELSE b.email END AS email,
-  CASE WHEN m.link_id IS NOT NULL THEN m.email_verified ELSE b.email_verified END AS email_verified,
-  CASE WHEN m.link_id IS NOT NULL THEN m.picture_url ELSE b.picture_url END AS picture_url
+   ${AUTH_PROFILE_SOURCE_FIELDS_SQL}
   FROM candidates a
   LEFT JOIN coordinator_auth_account_links l ON l.coordinator_id = ? AND l.link_id = a.link_id
   AND l.identity_id = a.identity_id AND a.identity_id = ? AND l.issuer = a.issuer
-  AND l.revoked_at_ms IS NULL
-  LEFT JOIN coordinator_auth_account_profiles m ON m.coordinator_id = l.coordinator_id
-  AND m.link_id = l.link_id
-  LEFT JOIN coordinator_auth_link_profiles b ON b.coordinator_id = l.coordinator_id
-  AND b.link_id = l.link_id AND b.attempt_id = l.attempt_id AND b.issuer = l.issuer
-  AND b.subject = l.subject AND b.auth_config_revision = l.auth_config_revision LIMIT 1`,
+   AND ${authLinkLiveGenerationSql({ link: "l" })}
+   ${AUTH_PROFILE_SOURCE_JOINS_SQL} LIMIT 1`,
 				values: [
 					...captured.values,
 					...authLinkControllerSourceValues(c, s),

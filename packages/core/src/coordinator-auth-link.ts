@@ -6,6 +6,7 @@ import {
 	AUTH_DEVICE_CLAIM_INPUT_SQL,
 	captureDeviceClaimEligibility,
 } from "./coordinator-auth-device-claim-eligibility.js";
+import { authLifecycleFirstLinkStatements } from "./coordinator-auth-lifecycle-first-link.js";
 import { readAuthLinkAttemptAuthority } from "./coordinator-auth-link-authority.js";
 import {
 	createAuthLinkContinuationAttempt,
@@ -126,7 +127,7 @@ function captureCreateInput(value: unknown):
 			attemptId: string;
 			runtimeVerifierHash: string;
 			loopbackRedirect: string;
-			browserStartHash: string | null;
+			browserStartHash: string;
 			authority: CoordinatorAuthLinkCreateInput["authority"];
 			expectedIdentityId: string | null;
 	  })
@@ -149,7 +150,7 @@ function captureCreateInput(value: unknown):
 			authority.kind === "device_claim" &&
 			authority.identityId !== expectedIdentityId) ||
 		browserStartHash === false ||
-		(authority.kind === "device_claim" && browserStartHash === null) ||
+		browserStartHash === null ||
 		!isAuthControllerId(i.attemptId) ||
 		!isHash(i.runtimeVerifierHash) ||
 		!parseCoordinatorAuthLoopback(i.loopbackRedirect).ok
@@ -576,7 +577,7 @@ export class AuthLinkOperations implements CoordinatorAuthLinkStore {
 				authority: i.authority,
 				runtimeVerifierHash: i.runtimeVerifierHash,
 				loopbackRedirect: i.loopbackRedirect,
-				...(i.browserStartHash ? { browserStartHash: i.browserStartHash } : {}),
+				browserStartHash: i.browserStartHash,
 				...(i.expectedIdentityId ? { expectedIdentityId: i.expectedIdentityId } : {}),
 			},
 			c,
@@ -840,13 +841,18 @@ export class AuthLinkOperations implements CoordinatorAuthLinkStore {
 		if (!c.enabled) return rejected("auth_config_changed");
 		const now = authLinkNow(this.clock);
 		const update = {
-			sql: `UPDATE coordinator_auth_link_attempts SET state = 'browser_claimed', browser_transaction_hash = ?, claimed_at_ms = ? WHERE attempt_id = ? AND ${LIVE_CONFIG} AND expires_at_ms > ? AND state = 'pending' AND browser_start_hash IS NULL AND browser_transaction_hash IS NULL AND NOT EXISTS (SELECT 1 FROM coordinator_auth_session_receipts r WHERE r.coordinator_id = coordinator_auth_link_attempts.coordinator_id AND r.browser_transaction_hash = ?)`,
+			sql: `UPDATE coordinator_auth_link_attempts SET state = 'browser_claimed', browser_transaction_hash = ?, claimed_at_ms = ? WHERE attempt_id = ? AND ${LIVE_CONFIG} AND expires_at_ms > ? AND state = 'pending' AND browser_start_hash IS NOT NULL AND browser_transaction_hash IS NULL AND NOT EXISTS (SELECT 1 FROM coordinator_auth_session_receipts r WHERE r.coordinator_id = coordinator_auth_link_attempts.coordinator_id AND r.browser_transaction_hash = ?)
+ AND EXISTS (SELECT 1 FROM coordinator_auth_browser_transactions proof
+ WHERE proof.coordinator_id = coordinator_auth_link_attempts.coordinator_id AND proof.attempt_id = coordinator_auth_link_attempts.attempt_id
+ AND proof.browser_transaction_hash = ? AND proof.purpose = 'link' AND proof.state IN ('pending','consumed')
+ AND proof.issuer = coordinator_auth_link_attempts.issuer AND proof.auth_config_revision = coordinator_auth_link_attempts.auth_config_revision)`,
 			values: [
 				i.browserTransactionHash,
 				now,
 				i.attemptId,
 				...configValues(c),
 				now,
+				i.browserTransactionHash,
 				i.browserTransactionHash,
 			],
 		};
@@ -858,7 +864,7 @@ export class AuthLinkOperations implements CoordinatorAuthLinkStore {
 			configMatches(row, c) &&
 			row.expires_at_ms > now &&
 			row.state === "browser_claimed" &&
-			row.browser_start_hash == null &&
+			row.browser_start_hash !== null &&
 			row.browser_transaction_hash === i.browserTransactionHash
 		)
 			return { kind: "existing", status: status(row, now) };
@@ -1063,7 +1069,7 @@ export class AuthLinkOperations implements CoordinatorAuthLinkStore {
 				promoteAuthLinkProfile(c.coordinatorId, i.attemptId, linkId),
 			]);
 		} catch (error) {
-			if (isAuthControllerUniqueError(error)) return rejected("link_conflict");
+			if (isAuthLinkConflict(error)) return rejected("link_conflict");
 			throw authPersistenceError(error, "auth_link_persistence_error");
 		}
 		return this.finalizeReceipt(i, c, now, linkId);
@@ -1088,10 +1094,7 @@ export class AuthLinkOperations implements CoordinatorAuthLinkStore {
 				promoteAuthLinkProfile(c.coordinatorId, i.attemptId, linkId),
 			]);
 		} catch (error) {
-			if (
-				isAuthControllerUniqueError(error) ||
-				String(error).includes("auth_device_claim_collision")
-			)
+			if (isAuthLinkConflict(error) || String(error).includes("auth_device_claim_collision"))
 				return rejected("link_conflict");
 			throw authPersistenceError(error, "auth_link_persistence_error");
 		}
@@ -1196,13 +1199,14 @@ function deviceFinalizeStatements(
  FROM coordinator_auth_link_attempts WHERE ${winning}`,
 			values: [keyId, ...values],
 		},
-		{
-			sql: `INSERT INTO coordinator_auth_account_links
- (coordinator_id,link_id,issuer,subject,identity_id,attempt_id,controller_attestation_id,device_claim_id,auth_config_revision,created_at_ms,authority_kind)
- SELECT coordinator_id,link_id,issuer,account_subject,identity_id,attempt_id,NULL,link_id,auth_config_revision,finalized_at_ms,'device_claim'
- FROM coordinator_auth_link_attempts WHERE ${winning}`,
-			values,
-		},
+		...authLifecycleFirstLinkStatements({
+			coordinatorId: c.coordinatorId,
+			issuer: c.issuer,
+			authConfigRevision: c.revision,
+			attemptId: i.attemptId,
+			linkId,
+			now,
+		}),
 		{
 			sql: `INSERT INTO coordinator_auth_link_audit_log
  (coordinator_id,link_id,action,attempt_id,identity_id,group_id,device_id,fingerprint,controller_attestation_id,device_claim_id,auth_config_revision,created_at_ms,authority_kind)
@@ -1263,7 +1267,7 @@ function finalizeStatements(
 ): AuthLinkStatement[] {
 	const authorityGuard = authority ? AUTHORITY : "0 = 1";
 	const consume: AuthLinkStatement = {
-		sql: `UPDATE coordinator_auth_link_attempts SET state = 'finalized', link_id = ?, finalized_at_ms = ? WHERE attempt_id = ? AND ${LIVE_CONFIG} AND state = 'confirmed' AND expires_at_ms > ? AND group_id = ? AND identity_id = ? AND device_id = ? AND fingerprint = ? AND public_key = ? AND runtime_verifier_hash = ? AND completion_secret_hash = ? AND ${authorityGuard}`,
+		sql: `UPDATE coordinator_auth_link_attempts SET state = 'finalized', link_id = ?, finalized_at_ms = ? WHERE attempt_id = ? AND ${LIVE_CONFIG} AND state = 'confirmed' AND browser_start_hash IS NOT NULL AND expires_at_ms > ? AND group_id = ? AND identity_id = ? AND device_id = ? AND fingerprint = ? AND public_key = ? AND runtime_verifier_hash = ? AND completion_secret_hash = ? AND ${authorityGuard}`,
 		values: [
 			linkId,
 			now,
@@ -1280,15 +1284,31 @@ function finalizeStatements(
 			...(authority ?? []),
 		],
 	};
-	const link: AuthLinkStatement = {
-		sql: `INSERT INTO coordinator_auth_account_links (coordinator_id, link_id, issuer, subject, identity_id, attempt_id, controller_attestation_id, auth_config_revision, created_at_ms, authority_kind) SELECT coordinator_id, link_id, issuer, account_subject, identity_id, attempt_id, controller_attestation_id, auth_config_revision, finalized_at_ms, 'controller_attestation' FROM coordinator_auth_link_attempts WHERE attempt_id = ? AND ${LIVE_CONFIG} AND link_id = ? AND state = 'finalized'`,
-		values: [i.attemptId, ...configValues(c), linkId],
-	};
 	const audit: AuthLinkStatement = {
 		sql: `INSERT INTO coordinator_auth_link_audit_log (coordinator_id, link_id, action, attempt_id, identity_id, group_id, device_id, fingerprint, controller_attestation_id, auth_config_revision, created_at_ms, authority_kind) SELECT t.coordinator_id, t.link_id, 'link_created', t.attempt_id, t.identity_id, t.group_id, t.device_id, t.fingerprint, t.controller_attestation_id, t.auth_config_revision, t.finalized_at_ms, 'controller_attestation' FROM coordinator_auth_link_attempts t JOIN coordinator_auth_account_links l ON l.coordinator_id = t.coordinator_id AND l.link_id = t.link_id AND l.authority_kind = 'controller_attestation' WHERE t.authority_kind = 'controller_attestation' AND t.attempt_id = ? AND t.coordinator_id = ? AND t.issuer = ? AND t.auth_config_revision = ? AND ? = 1 AND t.link_id = ?`,
 		values: [i.attemptId, ...configValues(c), linkId],
 	};
-	return [consume, link, audit];
+	return [
+		consume,
+		...authLifecycleFirstLinkStatements({
+			coordinatorId: c.coordinatorId,
+			issuer: c.issuer,
+			authConfigRevision: c.revision,
+			attemptId: i.attemptId,
+			linkId,
+			now,
+		}),
+		audit,
+	];
+}
+
+function isAuthLinkConflict(error: unknown): boolean {
+	return (
+		isAuthControllerUniqueError(error) ||
+		/auth_account_(?:link|association)_(?:collision|unavailable)|NOT NULL constraint failed: coordinator_auth_account_links.generation/u.test(
+			String(error),
+		)
+	);
 }
 const RECEIPT_SQL = `SELECT 1 FROM coordinator_auth_link_attempts t
  JOIN coordinator_auth_account_links l ON l.coordinator_id = t.coordinator_id AND l.link_id = t.link_id

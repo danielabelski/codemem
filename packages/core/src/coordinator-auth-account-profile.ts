@@ -10,6 +10,10 @@ import { isCoordinatorAccountIssuer } from "./coordinator-auth-contract.js";
 import { isAuthControllerId } from "./coordinator-auth-controller.js";
 import type { AuthLinkBackend, AuthLinkStatement } from "./coordinator-auth-link.js";
 import type { CoordinatorAuthLinkConfig } from "./coordinator-auth-link-contract.js";
+import {
+	AUTH_PROFILE_SOURCE_FIELDS_SQL,
+	AUTH_PROFILE_SOURCE_JOINS_SQL,
+} from "./coordinator-auth-profile-sources.js";
 import { authPersistenceError } from "./coordinator-auth-schema.js";
 import {
 	AUTH_SESSION_LINK_MATCH_SQL,
@@ -138,29 +142,26 @@ interface AccountRow {
 const SESSION_FROM_SQL = `FROM coordinator_auth_sessions s
  JOIN coordinator_auth_account_links l ON ${AUTH_SESSION_LINK_MATCH_SQL}`;
 const PROFILE_WRITE_SQL = `INSERT INTO coordinator_auth_account_profiles
- (coordinator_id, link_id, display_name, email, email_verified, picture_url, source_session_id, source_signed_in_at_ms)
- SELECT s.coordinator_id, s.link_id, ?, ?, ?, ?, s.session_id, s.created_at_ms
+ (coordinator_id, link_id, display_name, email, email_verified, picture_url, source_session_id, source_signed_in_at_ms,source_order)
+ SELECT s.coordinator_id, s.link_id, ?, ?, ?, ?, s.session_id, s.created_at_ms,proof.browser_sequence+1
  ${SESSION_FROM_SQL}
  JOIN coordinator_auth_session_receipts r ON r.coordinator_id = s.coordinator_id
  AND r.session_id = s.session_id AND r.browser_transaction_hash = s.browser_transaction_hash
  AND r.link_id = s.link_id AND r.auth_config_revision = s.auth_config_revision AND r.created_at_ms = s.created_at_ms
+ JOIN coordinator_auth_browser_transactions proof ON proof.coordinator_id = r.coordinator_id
+ AND proof.browser_transaction_hash = r.browser_transaction_hash AND proof.purpose = 'signin'
+ AND proof.state = 'consumed' AND proof.auth_config_revision = r.auth_config_revision AND proof.issuer = l.issuer
+ AND proof.browser_sequence > l.signin_sequence_floor
  WHERE ${AUTH_SESSION_LIVE_GUARD_SQL} AND r.source = 'signin' AND r.attempt_id IS NULL
  AND ? < s.created_at_ms + ${AUTH_ACCOUNT_PROFILE_WRITE_WINDOW_MS}
  ON CONFLICT(coordinator_id, link_id) DO UPDATE SET
  display_name = excluded.display_name, email = excluded.email,
  email_verified = excluded.email_verified, picture_url = excluded.picture_url,
- source_session_id = excluded.source_session_id, source_signed_in_at_ms = excluded.source_signed_in_at_ms
- WHERE excluded.source_signed_in_at_ms > coordinator_auth_account_profiles.source_signed_in_at_ms`;
+ source_session_id = excluded.source_session_id, source_signed_in_at_ms = excluded.source_signed_in_at_ms,source_order = excluded.source_order
+ WHERE excluded.source_order > coordinator_auth_account_profiles.source_order`;
 const PROFILE_READ_SQL = `SELECT s.session_id, s.identity_id, s.link_id, s.issuer, s.subject, s.expires_at_ms,
- CASE WHEN p.link_id IS NOT NULL THEN p.display_name ELSE b.display_name END AS display_name,
- CASE WHEN p.link_id IS NOT NULL THEN p.email ELSE b.email END AS email,
- CASE WHEN p.link_id IS NOT NULL THEN p.email_verified ELSE b.email_verified END AS email_verified,
- CASE WHEN p.link_id IS NOT NULL THEN p.picture_url ELSE b.picture_url END AS picture_url
- ${SESSION_FROM_SQL} LEFT JOIN coordinator_auth_account_profiles p
- ON p.coordinator_id = s.coordinator_id AND p.link_id = s.link_id
- LEFT JOIN coordinator_auth_link_profiles b ON b.coordinator_id = l.coordinator_id AND b.link_id = l.link_id
- AND b.attempt_id = l.attempt_id AND b.issuer = l.issuer AND b.subject = l.subject
- AND b.auth_config_revision = l.auth_config_revision
+ ${AUTH_PROFILE_SOURCE_FIELDS_SQL}
+ ${SESSION_FROM_SQL} ${AUTH_PROFILE_SOURCE_JOINS_SQL}
  WHERE ${AUTH_SESSION_LIVE_GUARD_SQL}`;
 const PROFILE_RECORDED_SQL = `SELECT 1 ${SESSION_FROM_SQL}
  JOIN coordinator_auth_account_profiles p ON p.coordinator_id = s.coordinator_id AND p.link_id = s.link_id

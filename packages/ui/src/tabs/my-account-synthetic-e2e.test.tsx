@@ -3,7 +3,11 @@ import { createServer, request } from "node:http";
 import { createRequire } from "node:module";
 import type { AddressInfo } from "node:net";
 import { resolve } from "node:path";
-import type { CoordinatorAccountLinkStatusRead, linkCoordinatorAccount } from "@codemem/core";
+import type {
+	CoordinatorAccountLinkStatusRead,
+	changeCoordinatorAccount,
+	linkCoordinatorAccount,
+} from "@codemem/core";
 import { CoordinatorAccountLinkError } from "@codemem/core";
 import { render } from "preact";
 import { act } from "preact/test-utils";
@@ -19,6 +23,8 @@ import type { RecipientPolicyIntentGraphV1 } from "../lib/api/sync";
 // protected production router/registry. Only coordinator, profile and popup are fake.
 // This does not exercise Google, a real browser popup, capture, or peer sync.
 const PRIVATE = "https://coordinator.example.test/auth/link/start?request=synthetic-private";
+const PRIVATE_CHANGE =
+	"https://coordinator.example.test/auth/link-change/start?request=synthetic-private-change";
 const PATH = "/api/account/link-operations";
 const requireServer = createRequire(
 	resolve(import.meta.dirname, "../../../viewer-server/package.json"),
@@ -54,19 +60,27 @@ const graph: RecipientPolicyIntentGraphV1 = {
 	identityDevices: [],
 	projectRecipients: [],
 };
-type RemoteState = "unlinked" | "linked" | "review_required" | "conflict" | "revoked";
+type RemoteState =
+	| "unlinked"
+	| "disconnected"
+	| "linked"
+	| "review_required"
+	| "conflict"
+	| "revoked";
 function remote(state: RemoteState = "unlinked"): CoordinatorAccountLinkStatusRead {
 	const subject = {
-		version: 2 as const,
+		version: 3 as const,
 		coordinatorId: "coordinator-a",
 		groupId: context.groupId,
 		deviceId: context.deviceId,
 		fingerprint: context.fingerprint,
+		profile: { state: "unavailable" as const },
+		actions: { connect: false, disconnect: false, refresh: false },
 	};
 	if (state === "review_required" || state === "conflict")
 		return {
 			kind: "status",
-			status: { ...subject, state, identityId: null, authority: null, account: null },
+			status: { ...subject, state, identityId: null, authority: null },
 		};
 	return {
 		kind: "status",
@@ -74,9 +88,21 @@ function remote(state: RemoteState = "unlinked"): CoordinatorAccountLinkStatusRe
 			...subject,
 			identityId: context.identityId,
 			authority: "device_claim",
-			...(state === "linked"
-				? { state, account: { displayName: "Synthetic person", email: "fake@example.test" } }
-				: { state, account: null }),
+			state,
+			profile:
+				state === "linked"
+					? {
+							state: "verified",
+							verifiedAtMs: 1,
+							displayName: "Synthetic person",
+							email: "fake@example.test",
+						}
+					: { state: "unavailable" },
+			actions: {
+				connect: state === "unlinked" || state === "disconnected",
+				disconnect: state === "linked",
+				refresh: state === "linked",
+			},
 		},
 	};
 }
@@ -151,8 +177,14 @@ async function httpBridge(app: ReturnType<typeof createAccountGuard>["routes"]) 
 	await once(server, "listening");
 	const port = (server.address() as AddressInfo).port;
 	const origin = `http://127.0.0.1:${port}`;
-	const seen: { path: string; method: string; headers: Headers; status: number; body: string }[] =
-		[];
+	const seen: {
+		path: string;
+		method: string;
+		headers: Headers;
+		status: number;
+		body: string;
+		requestBody: string | null;
+	}[] = [];
 	const pending = new Set<Promise<Response>>();
 	function send(path: string, init: RequestInit = {}) {
 		// This is the simulated document origin. Never derive it from arbitrary input.
@@ -179,6 +211,7 @@ async function httpBridge(app: ReturnType<typeof createAccountGuard>["routes"]) 
 							headers,
 							status: res.statusCode ?? 500,
 							body,
+							requestBody: typeof init.body === "string" ? init.body : null,
 						});
 						resolve(
 							new Response(body, {
@@ -208,21 +241,97 @@ async function httpBridge(app: ReturnType<typeof createAccountGuard>["routes"]) 
 	}
 	return { port, origin, seen, pending, send };
 }
-async function fixture() {
-	const readContext = vi.fn((_group?: string): AccountContextResult => structuredClone(ready));
-	const readRemoteStatus = vi.fn(async (): Promise<CoordinatorAccountLinkStatusRead> => remote());
+function syntheticCoordinator() {
+	let coordinator = remote();
+	const readRemoteStatus = vi.fn(
+		async (): Promise<CoordinatorAccountLinkStatusRead> => structuredClone(coordinator),
+	);
 	const done = deferred<Awaited<ReturnType<typeof linkCoordinatorAccount>>>();
 	const started = deferred<Parameters<typeof linkCoordinatorAccount>[0]>();
+	type RuntimeOptions =
+		| Parameters<typeof linkCoordinatorAccount>[0]
+		| Parameters<typeof changeCoordinatorAccount>[0];
+	const runs: {
+		intent: "connect" | "disconnect" | "refresh";
+		options: RuntimeOptions;
+		finish(): void;
+	}[] = [];
 	let abortError: Error | null = new CoordinatorAccountLinkError("link_stopped");
+	let browserUrl: string | undefined;
 	const link = vi.fn<typeof linkCoordinatorAccount>((options) => {
+		const completion =
+			runs.length === 0 ? done : deferred<Awaited<ReturnType<typeof linkCoordinatorAccount>>>();
+		runs.push({ intent: "connect", options, finish: () => completion.resolve(finalResult) });
 		started.resolve(options);
 		options.signal?.addEventListener("abort", () => {
-			if (abortError) done.reject(abortError);
+			if (abortError) completion.reject(abortError);
 		});
-		options.onBrowserStart?.(PRIVATE);
-		return done.promise;
+		options.onBrowserStart?.(browserUrl ?? PRIVATE);
+		return completion.promise;
 	});
-	const registry = createAccountLinkRegistry({ readContext, link });
+	const change = vi.fn<typeof changeCoordinatorAccount>((options) => {
+		const completion = deferred<Awaited<ReturnType<typeof changeCoordinatorAccount>>>();
+		runs.push({
+			intent: options.intent,
+			options,
+			finish: () => completion.resolve({ ...finalResult, state: "completed" }),
+		});
+		options.signal?.addEventListener("abort", () => {
+			if (abortError) completion.reject(abortError);
+		});
+		options.onBrowserStart?.(browserUrl ?? PRIVATE_CHANGE);
+		return completion.promise;
+	});
+	// Coordinator effects below are synthetic: only an explicitly completed, current,
+	// non-cancelled matching ceremony changes the fake coordinator's status.
+	function complete(
+		intent: "connect" | "disconnect" | "refresh",
+		options: { emptyProfile?: boolean } = {},
+	) {
+		const run = runs.at(-1);
+		if (
+			!run ||
+			run.intent !== intent ||
+			run.options.signal?.aborted ||
+			!run.options.assertCurrentContext?.()
+		)
+			throw new Error("Synthetic ceremony is not current");
+		if (
+			coordinator.kind !== "status" ||
+			(intent === "connect"
+				? !["unlinked", "disconnected"].includes(coordinator.status.state)
+				: coordinator.status.state !== "linked")
+		)
+			throw new Error("Synthetic intent is not allowed");
+		coordinator = remote(intent === "disconnect" ? "disconnected" : "linked");
+		if (options.emptyProfile && coordinator.kind === "status")
+			coordinator.status.profile = { state: "verified", verifiedAtMs: 2 };
+		run.finish();
+	}
+	return {
+		readRemoteStatus,
+		done,
+		started,
+		link,
+		change,
+		complete,
+		finishPending() {
+			done.resolve(finalResult);
+			for (const run of runs) run.finish();
+		},
+		setAbortError(error: Error | null) {
+			abortError = error;
+		},
+		setBrowserUrl(url: string) {
+			browserUrl = url;
+		},
+	};
+}
+async function fixture() {
+	const readContext = vi.fn((_group?: string): AccountContextResult => structuredClone(ready));
+	const runtime = syntheticCoordinator();
+	const { readRemoteStatus, link, change } = runtime;
+	const registry = createAccountLinkRegistry({ readContext, link, change });
 	const address = { host: "127.0.0.1", port: 0 };
 	const options = { getListenerAddress: () => address, readContext, readRemoteStatus, registry };
 	// Same middleware and router order as registerAccountRoutes; no store is involved.
@@ -236,7 +345,7 @@ async function fixture() {
 	address.port = port;
 	cleanup.push(async () => {
 		// Release even an intentionally uncooperative late-completion fixture.
-		done.resolve(finalResult);
+		runtime.finishPending();
 		await registry.close();
 	});
 	vi.stubGlobal(
@@ -276,6 +385,7 @@ async function fixture() {
 	}
 	function noLeaks() {
 		expect(mount.innerHTML).not.toContain(PRIVATE);
+		expect(mount.innerHTML).not.toContain(PRIVATE_CHANGE);
 		expect(mount.innerHTML).not.toContain(context.dbPath);
 		const session = seen.find((entry) => entry.path === "/api/account/session");
 		if (session) expect(mount.innerHTML).not.toContain(JSON.parse(session.body).csrfToken);
@@ -286,14 +396,17 @@ async function fixture() {
 				.map((entry) => entry.body)
 				.join(""),
 		).not.toContain(PRIVATE);
+		expect(
+			seen
+				.filter((entry) => !entry.path.endsWith("/browser-url"))
+				.map((entry) => entry.body)
+				.join(""),
+		).not.toContain(PRIVATE_CHANGE);
 		expect(seen.map((entry) => entry.path).join("")).not.toContain("synthetic-private");
 	}
 	return {
+		...runtime,
 		readContext,
-		readRemoteStatus,
-		done,
-		started,
-		link,
 		registry,
 		send,
 		seen,
@@ -306,9 +419,6 @@ async function fixture() {
 		poll,
 		drain,
 		noLeaks,
-		setAbortError(error: Error | null) {
-			abortError = error;
-		},
 	};
 }
 
@@ -368,8 +478,203 @@ describe("My Account synthetic end-to-end over protected loopback HTTP", () => {
 		expect(f.popup.location.replace).toHaveBeenCalledWith(PRIVATE);
 		expect(f.popup.close).toHaveBeenCalledTimes(1);
 		expect(mount.textContent).toContain("fake@example.test");
-		expect(button("Link Google account").disabled).toBe(true);
+		expect(
+			[...mount.querySelectorAll("button")].some(
+				(node) => node.textContent === "Link Google account",
+			),
+		).toBe(false);
+		expect(button("Refresh profile").disabled).toBe(false);
+		expect(button("Unlink Google account").disabled).toBe(false);
 		expect(mount.textContent).not.toContain("Open Google sign-in");
+		f.noLeaks();
+	});
+});
+
+describe("My Account management through Viewer HTTP with a synthetic coordinator", () => {
+	it("connects, replaces verified profile with an empty snapshot, disconnects, and connects again", async () => {
+		// Arrange: only coordinator ceremonies/status and popup are fake, not Viewer authorization.
+		const f = await fixture();
+		await f.show();
+		// Act / Assert: connecting requires an explicit gesture and completed matching ceremony.
+		await f.click("Link Google account");
+		expect(mount.textContent).not.toContain("fake@example.test");
+		f.complete("connect");
+		await f.poll();
+		expect(mount.textContent).toContain("fake@example.test");
+		expect(button("Refresh profile").disabled).toBe(false);
+		// Act / Assert: refresh uses a distinct change ceremony and clears all earlier fields.
+		await f.click("Refresh profile");
+		await f.poll();
+		expect(f.change).toHaveBeenCalledTimes(1);
+		expect(f.change.mock.calls[0]?.[0]).toMatchObject({
+			intent: "refresh",
+			expectedIdentityId: context.identityId,
+			expectedCoordinatorId: "coordinator-a",
+		});
+		expect(f.popup.location.replace).toHaveBeenLastCalledWith(PRIVATE_CHANGE);
+		f.complete("refresh", { emptyProfile: true });
+		await f.poll();
+		expect(mount.textContent).not.toContain("fake@example.test");
+		expect(mount.textContent).not.toContain("Synthetic person");
+		expect(mount.querySelector(".my-account-profile strong")?.textContent).toBe("Google account");
+		expect(mount.textContent).toContain(
+			"This Google account is linked to the local Codemem Identity",
+		);
+		const refreshed = f.seen
+			.filter((entry) => entry.path.startsWith("/api/account/link-status"))
+			.at(-1);
+		expect(JSON.parse(refreshed?.body ?? "null")).toMatchObject({
+			version: 1,
+			remote: { state: "linked", profile: { state: "verified", verifiedAtMs: 2 } },
+			actions: { connect: false, disconnect: true, refresh: true },
+		});
+		// Act / Assert: unlink completion returns disconnected, preserving the selected local Identity.
+		await f.click("Unlink Google account");
+		f.complete("disconnect");
+		await f.poll();
+		expect(mount.textContent).toContain("Google account disconnected");
+		expect(mount.textContent).toContain(context.identityLabel);
+		expect(button("Link Google account").disabled).toBe(false);
+		expect(mount.textContent).not.toContain("Refresh profile");
+		// Act / Assert: reconnect is another operation, never an automatic unlink/relink side effect.
+		await f.click("Link Google account");
+		f.complete("connect");
+		await f.poll();
+		expect(mount.textContent).toContain("fake@example.test");
+		expect(f.link).toHaveBeenCalledTimes(2);
+		expect(f.change.mock.calls.map(([options]) => options.intent)).toEqual([
+			"refresh",
+			"disconnect",
+		]);
+		const starts = f.seen.filter((entry) => entry.path === PATH && entry.method === "POST");
+		expect(starts.map((entry) => entry.status)).toEqual([202, 202, 202, 202]);
+		expect(starts.map((entry) => JSON.parse(entry.requestBody ?? "null"))).toEqual(
+			["connect", "refresh", "disconnect", "connect"].map((intent) => ({
+				groupId: context.groupId,
+				contextId: context.contextId,
+				authority: "device_claim",
+				coordinatorId: "coordinator-a",
+				intent,
+			})),
+		);
+		// No browser-nominated account, target link, generation or callback is sent to Viewer.
+		expect(f.readContext()).toEqual(ready);
+		f.noLeaks();
+	});
+});
+
+describe("My Account synthetic management cancellation and private handoffs", () => {
+	it.each(["refresh", "disconnect"] as const)(
+		"cancelling %s does not unlink or silently retry",
+		async (intent) => {
+			// Arrange
+			const f = await fixture();
+			await f.show();
+			await f.click("Link Google account");
+			f.complete("connect");
+			await f.poll();
+			await f.click(intent === "refresh" ? "Refresh profile" : "Unlink Google account");
+			// Act
+			await f.click(intent === "refresh" ? "Cancel profile refresh" : "Cancel unlinking");
+			await f.poll();
+			await f.click("Check status");
+			// Assert: cancelling the active change does not complete it or create a second change.
+			expect(f.change.mock.calls[0]?.[0].signal?.aborted).toBe(true);
+			expect(f.registry.forContext(context.contextId)).toMatchObject({
+				intent,
+				state: "cancelled",
+				failure: "link_stopped",
+			});
+			expect(mount.textContent).toContain("fake@example.test");
+			expect(mount.textContent).not.toContain("Google account disconnected");
+			expect(f.change).toHaveBeenCalledTimes(1);
+			expect(f.link).toHaveBeenCalledTimes(1);
+			f.noLeaks();
+		},
+	);
+	it.each([
+		PRIVATE,
+		"https://foreign.example.test/auth/link-change/start?request=synthetic-private-change",
+	])("rejects a mismatched private change handoff %s", async (url) => {
+		// Arrange: start from a linked account; the fake change runtime emits a wrong-purpose/origin URL.
+		const f = await fixture();
+		await f.show();
+		await f.click("Link Google account");
+		f.complete("connect");
+		await f.poll();
+		f.setBrowserUrl(url);
+		f.popup.location.replace.mockClear();
+		const deliveriesBefore = f.seen.filter((entry) => entry.path.endsWith("/browser-url")).length;
+		// Act
+		await f.click("Refresh profile");
+		await f.poll();
+		// Assert: production registry rejects the URL, not the mock transport.
+		expect(f.registry.forContext(context.contextId)).toMatchObject({
+			intent: "refresh",
+			state: "failed",
+			failure: "invalid_response",
+			browserUrlAvailable: false,
+		});
+		expect(f.change.mock.calls[0]?.[0].signal?.aborted).toBe(true);
+		expect(f.popup.location.replace).not.toHaveBeenCalled();
+		expect(f.seen.filter((entry) => entry.path.endsWith("/browser-url"))).toHaveLength(
+			deliveriesBefore,
+		);
+		expect(mount.innerHTML).not.toContain(url);
+		expect(
+			f.seen
+				.filter((entry) => !entry.path.endsWith("/browser-url"))
+				.map((entry) => entry.body)
+				.join(""),
+		).not.toContain(url);
+		expect(mount.textContent).toContain("fake@example.test");
+		f.noLeaks();
+	});
+});
+
+async function authorizedStart(
+	f: Awaited<ReturnType<typeof fixture>>,
+	changes: Record<string, unknown>,
+) {
+	const token = f.seen.find((entry) => entry.path === "/api/account/session");
+	if (!token) throw new Error("Expected real account session bootstrap");
+	return f.send(PATH, {
+		method: "POST",
+		headers: {
+			Origin: f.origin,
+			"Content-Type": "application/json",
+			"X-Codemem-Account-Csrf": JSON.parse(token.body).csrfToken,
+		},
+		body: JSON.stringify({
+			groupId: context.groupId,
+			contextId: context.contextId,
+			coordinatorId: "coordinator-a",
+			authority: "device_claim",
+			intent: "connect",
+			...changes,
+		}),
+	});
+}
+
+describe("My Account management rejects browser-nominated authority", () => {
+	it.each([
+		[{ intent: "refresh" }, 409, "account_link_not_allowed"],
+		[{ intent: "disconnect" }, 409, "account_link_not_allowed"],
+		[{ intent: "unlink" }, 400, "account_invalid_request"],
+		[{ contextId: "stale-context" }, 409, "account_context_changed"],
+		[{ targetLinkId: "browser-picked-link" }, 400, "account_invalid_request"],
+	] as const)("denies %j without starting a ceremony", async (body, status, error) => {
+		// Arrange: use the production CSRF bootstrap and an unlinked canonical V3 status.
+		const f = await fixture();
+		await f.show();
+		// Act
+		const response = await authorizedStart(f, body);
+		// Assert
+		expect(response.status).toBe(status);
+		expect(await response.json()).toMatchObject({ error });
+		expect(f.link).not.toHaveBeenCalled();
+		expect(f.change).not.toHaveBeenCalled();
+		expect(f.registry.hasActive()).toBe(false);
 		f.noLeaks();
 	});
 });
@@ -388,7 +693,13 @@ describe("My Account synthetic end-to-end terminal states and context lifetime",
 			act(() => tabs[1].click());
 			// Assert
 			expect(tabs[1].getAttribute("aria-selected")).toBe("true");
-			expect(button("Link Google account").disabled).toBe(true);
+			expect(
+				[...mount.querySelectorAll("button")].some((node) =>
+					["Link Google account", "Refresh profile", "Unlink Google account"].includes(
+						node.textContent ?? "",
+					),
+				),
+			).toBe(false);
 			expect(mount.textContent).toContain(
 				{
 					review_required: "Check the selected profile and group",
@@ -397,7 +708,9 @@ describe("My Account synthetic end-to-end terminal states and context lifetime",
 				}[state],
 			);
 			if (state === "review_required") {
-				const details = mount.querySelector("details");
+				const details = mount.querySelector<HTMLDetailsElement>(
+					"details.recipient-policy-management-details",
+				);
 				expect(details?.open).toBe(false);
 				expect(details?.querySelector("summary")?.textContent).toBe("What to check before linking");
 				expect(details?.textContent).toMatch(
@@ -418,23 +731,33 @@ describe("My Account synthetic end-to-end terminal states and context lifetime",
 		async (outcome) => {
 			// Arrange
 			const f = await fixture();
-			if (outcome === "outcome_unknown")
+			if (outcome === "outcome_unknown") {
 				f.setAbortError(
 					Object.assign(new CoordinatorAccountLinkError("cancellation_unconfirmed"), {
 						cause: PRIVATE,
 					}),
 				);
+			}
 			await f.show();
 			await f.click("Link Google account");
+			if (outcome === "outcome_unknown")
+				f.readRemoteStatus.mockResolvedValue({
+					kind: "unavailable",
+					code: "coordinator_unreachable",
+				});
 			// Act
 			await f.click("Cancel linking");
 			await f.poll();
 			// Assert
 			expect((await f.started.promise).signal?.aborted).toBe(true);
+			expect(f.registry.forContext(context.contextId)).toMatchObject({
+				intent: "connect",
+				state: outcome,
+			});
 			expect(mount.textContent).toContain(
 				outcome === "cancelled"
 					? "Cancellation was reported"
-					: "couldn’t confirm whether linking finished",
+					: "couldn’t confirm whether the account operation finished",
 			);
 			expect(mount.textContent).not.toContain("fake@example.test");
 			expect(f.seen.some((entry) => entry.path.endsWith("/cancel") && entry.status === 202)).toBe(
@@ -443,6 +766,9 @@ describe("My Account synthetic end-to-end terminal states and context lifetime",
 			f.noLeaks();
 		},
 	);
+});
+
+describe("My Account synthetic end-to-end late context completion", () => {
 	it("does not relabel a late old-context completion as the newly selected Identity", async () => {
 		// Arrange: runtime deliberately ignores cancellation until explicitly completed.
 		const f = await fixture();
@@ -477,7 +803,13 @@ describe("My Account synthetic end-to-end terminal states and context lifetime",
 			"The earlier link finished for its original Identity. Check status there to confirm.",
 		);
 		expect(mount.textContent).not.toContain("fake@example.test");
-		expect(button("Link Google account").disabled).toBe(true);
+		expect(
+			[...mount.querySelectorAll("button")].some((node) =>
+				["Link Google account", "Refresh profile", "Unlink Google account"].includes(
+					node.textContent ?? "",
+				),
+			),
+		).toBe(false);
 		expect(f.link).toHaveBeenCalledOnce();
 		f.noLeaks();
 	});
@@ -513,6 +845,7 @@ describe("My Account synthetic end-to-end request authority", () => {
 					contextId: context.contextId,
 					authority: "device_claim",
 					coordinatorId: "coordinator-a",
+					intent: "connect",
 				}),
 			});
 			const delivery = await f.send(`${PATH}/00000000-0000-4000-8000-000000000000/browser-url`, {
@@ -560,6 +893,7 @@ describe("My Account synthetic end-to-end request authority", () => {
 					contextId: context.contextId,
 					authority: "device_claim",
 					coordinatorId: "coordinator-a",
+					intent: "connect",
 				}),
 			});
 			expect(authorized.status).toBe(202);

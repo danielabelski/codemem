@@ -31,12 +31,14 @@ export async function startBrowserProof(
 	if (input.attemptId === undefined) {
 		startInput = { ...materials, purpose: "signin" };
 	} else {
-		startInput = { ...materials, purpose: "link", attemptId: input.attemptId };
-		if (input.browserStartHash !== undefined) {
-			startInput.browserStartHash = input.browserStartHash;
-		}
+		startInput = {
+			...materials,
+			purpose: "link",
+			attemptId: input.attemptId,
+			browserStartHash: input.browserStartHash ?? fixtureHash(`browser-start:${input.attemptId}`),
+		};
 	}
-	// V2 draws its hash before its first await. Fake only that synchronous draw.
+	// Transaction creation draws its hash before its first await; pin only that draw.
 	const entropy = vi
 		.spyOn(globalThis.crypto, "getRandomValues")
 		.mockReturnValueOnce(Uint8Array.from(Buffer.from(input.browserTransactionHash, "hex")));
