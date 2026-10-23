@@ -19,6 +19,7 @@ export {
 	type ValidatedBatch,
 	writeValidatedBatch,
 } from "./validated-vector-index-mutations.js";
+export { repairBatch } from "./validated-vector-index-repair.js";
 export {
 	type AuditProgress,
 	type CandidateVersion,
