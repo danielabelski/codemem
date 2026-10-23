@@ -16,6 +16,10 @@
 
 import { createHash } from "node:crypto";
 import type { Database } from "./db.js";
+import {
+	getExperimentalSemanticExecutor,
+	isSemanticIdentityChangedError,
+} from "./experiments/semantic-executor-seam.js";
 import { buildFilterClausesWithContext } from "./filters.js";
 import { inferMemoryRole, readArtifactClass } from "./memory-quality.js";
 import { fusePackCandidates } from "./pack-fusion.js";
@@ -2876,16 +2880,10 @@ export async function buildMemoryPackAsync(
 	let semResults: MemoryResult[] = [];
 	const semanticQuery = sanitizeSearchQuery(context).clean_query;
 	try {
-		const raw = await semanticSearch(
-			store.db,
-			semanticQuery,
-			limit,
-			filters ?? null,
-			ownershipFilterContext(store),
-			automaticSummarySessionId(store, automaticContext),
-		);
+		const raw = await packSemanticSearch(store, semanticQuery, limit, filters, automaticContext);
 		semResults = semanticMemoryResults(raw);
-	} catch {
+	} catch (error) {
+		if (isSemanticIdentityChangedError(error)) throw error;
 		// Semantic search failure is non-fatal — fall through to FTS-only
 	}
 
@@ -2910,16 +2908,10 @@ export async function buildMemoryPackWithTraceAsync(
 	let semResults: MemoryResult[] = [];
 	const semanticQuery = sanitizeSearchQuery(context).clean_query;
 	try {
-		const raw = await semanticSearch(
-			store.db,
-			semanticQuery,
-			limit,
-			filters ?? null,
-			ownershipFilterContext(store),
-			automaticSummarySessionId(store, automaticContext),
-		);
+		const raw = await packSemanticSearch(store, semanticQuery, limit, filters, automaticContext);
 		semResults = semanticMemoryResults(raw);
-	} catch {
+	} catch (error) {
+		if (isSemanticIdentityChangedError(error)) throw error;
 		// Semantic search failure is non-fatal — fall through to FTS-only.
 	}
 
@@ -2944,16 +2936,10 @@ export async function buildMemoryPackTraceAsync(
 	let semResults: MemoryResult[] = [];
 	const semanticQuery = sanitizeSearchQuery(context).clean_query;
 	try {
-		const raw = await semanticSearch(
-			store.db,
-			semanticQuery,
-			limit,
-			filters ?? null,
-			ownershipFilterContext(store),
-			automaticSummarySessionId(store, automaticContext),
-		);
+		const raw = await packSemanticSearch(store, semanticQuery, limit, filters, automaticContext);
 		semResults = semanticMemoryResults(raw);
-	} catch {
+	} catch (error) {
+		if (isSemanticIdentityChangedError(error)) throw error;
 		// Semantic search failure is non-fatal — fall through to FTS-only
 	}
 
@@ -2964,4 +2950,24 @@ export async function buildMemoryPackTraceAsync(
 		compressionMode: renderOptions?.compressionMode,
 		automaticContext,
 	}).trace;
+}
+
+function packSemanticSearch(
+	store: StoreHandle,
+	query: string,
+	limit: number,
+	filters: MemoryFilters | undefined,
+	automaticContext: AutomaticContext | null | undefined,
+): Promise<import("./vectors.js").SemanticSearchResult[]> {
+	const executor = getExperimentalSemanticExecutor(store);
+	if (executor)
+		return executor.search({ query, limit, filters: filters ?? null, automaticContext });
+	return semanticSearch(
+		store.db,
+		query,
+		limit,
+		filters ?? null,
+		ownershipFilterContext(store),
+		automaticSummarySessionId(store, automaticContext),
+	);
 }
