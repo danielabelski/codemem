@@ -140,6 +140,15 @@ function authenticationUnavailableResponse(): Response {
 	});
 }
 
+function recipientInviteContext(
+	opts: CreateCoordinatorAppOptions,
+	token: string,
+): { token: string; coordinatorId?: string } {
+	const ready = opts.browserAuth?.kind === "ready" ? opts.browserAuth : undefined;
+	const config = ready?.auth.storeConfig ?? opts.authLink?.config;
+	return config ? { token, coordinatorId: config.coordinatorId } : { token };
+}
+
 function accountChangeOptions(
 	opts: CreateCoordinatorAppOptions,
 ): CoordinatorDeviceAccountChangeOptions | undefined {
@@ -2542,7 +2551,7 @@ export function createCoordinatorApp(
 				}
 				try {
 					const acceptance = await store.consumeRecipientInvite({
-						token,
+						...recipientInviteContext(opts, token),
 						inviteKind: invite.invite_kind as "team_member" | "add_device",
 						identityId,
 						deviceId,
