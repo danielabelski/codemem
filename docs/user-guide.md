@@ -376,9 +376,12 @@ Set `CODEMEM_EMBEDDING_DISABLED=1` before starting Codemem to skip the upgrade
 and semantic retrieval. Keyword search continues to work. This is useful when
 you need to keep an older runtime on the database temporarily.
 
-Semantic results use only validated vectors. A model change, rebuild, or repair
-can temporarily return keyword-only results while Codemem checks or recreates
-vectors. Cleanup removes vectors with invalid numeric values or unusable metadata,
+Semantic results use only validated vectors. A model change or rebuild can
+temporarily return keyword-only results while Codemem finishes validation.
+After that audit, valid rows remain searchable even when other stored vectors
+need repair.
+
+Cleanup removes vectors with invalid numeric values or unusable metadata,
 without changing source memories. Rows from undeclared models remain available
 for a later model transition. Use `codemem embed --dry-run`, then `codemem embed`,
 to backfill missing vectors.

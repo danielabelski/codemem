@@ -11,6 +11,7 @@ import {
 	rankValidatedIndex,
 	readCandidateVersions,
 	readCatalog,
+	readSearchableModelLabels,
 	startAudit,
 	writeValidatedBatch,
 } from "./validated-vector-index.js";
@@ -245,7 +246,7 @@ it("keeps the full unknown and null model catalog while blocking invalid legacy 
 			{ model: null, count: 1 },
 		]),
 	);
-	expect(rankValidatedIndex(fixture.db, request(fixture))).toBeNull();
+	expect(readSearchableModelLabels(fixture.db, progress.catalog)).toEqual([MODEL]);
 	expect(fixture.snapshot().memories).toEqual(memories);
 });
 it.each(["replace", "delete"] as const)(

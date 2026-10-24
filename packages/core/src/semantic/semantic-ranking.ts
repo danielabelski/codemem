@@ -145,12 +145,19 @@ function candidateScope(
 	const layout = resolveVectorLayout(db);
 	if (layout.kind === "absent") throw new Error("vector_table_required");
 	const vectorTable = layout.physicalName;
+	const validitySql = options.indexedRows ? "AND audit_state='valid'" : "";
 	if (options.acceptedIds === null) {
-		return { ...authorized, acceptedSql: "", acceptedParams: [], rowidSource, vectorTable };
+		return {
+			...authorized,
+			acceptedSql: validitySql,
+			acceptedParams: [],
+			rowidSource,
+			vectorTable,
+		};
 	}
 	return {
 		...authorized,
-		acceptedSql: "AND rowid IN (SELECT value FROM json_each(?))",
+		acceptedSql: `${validitySql} AND rowid IN (SELECT value FROM json_each(?))`,
 		acceptedParams: [options.acceptedIds],
 		rowidSource,
 		vectorTable,

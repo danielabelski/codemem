@@ -18,9 +18,12 @@ uses its own read snapshot and recomputes visibility, continuity, and compatible
 models. It does not construct a store, accept SQL or executable code, read a
 private key, or inherit the parent environment.
 
-Only validated vectors supply semantic evidence. A model change or repair can
-make a request use keyword retrieval until validation completes. Maintenance
-removes derived rows with invalid numeric values or unusable metadata so normal
+Only validated vectors supply semantic evidence. Building generations use keyword
+retrieval until validation completes. A completed audit can serve valid rows while
+other derived rows await repair; invalid rows are excluded before native KNN or
+scalar distance evaluation.
+
+Maintenance removes derived rows with invalid numeric values or unusable metadata so normal
 backfill can recreate them. It retains rows rejected for their model until an
 explicit model transition. Source memories are not rewritten.
 

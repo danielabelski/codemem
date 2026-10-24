@@ -88,6 +88,31 @@ export function requireCatalog(db: Database): VectorCatalog {
 	return catalog;
 }
 
+/** Completed audits can supply valid evidence while other derived rows await repair. */
+export function isSearchableVectorCatalog(
+	db: Database,
+	catalog: VectorCatalog | null,
+): catalog is VectorCatalog {
+	if (catalog?.writerVersion !== 1) return false;
+	if (catalog.status === "ready") return catalog.models.some(({ count }) => count > 0);
+	if (catalog.status !== "needsrepair") return false;
+	return Boolean(
+		db.prepare("SELECT 1 FROM validated_vector_rows WHERE audit_state='valid' LIMIT 1").get(),
+	);
+}
+
+export function readSearchableModelLabels(
+	db: Database,
+	catalog: VectorCatalog,
+): Array<string | null> {
+	const labels = catalog.models.map(({ model }) => model);
+	if (catalog.status !== "needsrepair") return labels;
+	const valid = db.prepare(
+		"SELECT 1 FROM validated_vector_rows WHERE model IS ? AND audit_state='valid' LIMIT 1",
+	);
+	return labels.filter((model) => Boolean(valid.get(model)));
+}
+
 export function requireWriter(version: number): void {
 	if (version !== 1) throw new TypeError("validated_writer_version_required");
 }
@@ -129,6 +154,8 @@ export function initializeValidatedIndex(
 			 ON validated_vector_rows(model,memory_id);
 			CREATE INDEX IF NOT EXISTS validated_vector_rows_state
 			 ON validated_vector_rows(audit_state,rowid);
+			CREATE INDEX IF NOT EXISTS validated_vector_rows_model_state_memory
+			 ON validated_vector_rows(model,audit_state,memory_id);
 		`);
 		db.prepare(`INSERT OR IGNORE INTO validated_vector_state
 			(id,generation_id,revision,writer_version,status) VALUES(1,?,0,1,'building')`).run(

@@ -31,7 +31,9 @@ CREATE TABLE IF NOT EXISTS validated_vector_rows (
 CREATE INDEX IF NOT EXISTS validated_vector_rows_model_memory
  ON validated_vector_rows(model,memory_id);
 CREATE INDEX IF NOT EXISTS validated_vector_rows_state
- ON validated_vector_rows(audit_state,rowid);`;
+ ON validated_vector_rows(audit_state,rowid);
+CREATE INDEX IF NOT EXISTS validated_vector_rows_model_state_memory
+ ON validated_vector_rows(model,audit_state,memory_id);`;
 
 export const VECTOR_COMPATIBILITY_DDL = `
 CREATE VIEW memory_vectors AS

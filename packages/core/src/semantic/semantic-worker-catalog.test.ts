@@ -20,7 +20,7 @@ import {
 } from "./validated-vector-index.js";
 
 describe.each(["absent", "building", "needsrepair", "empty"] as const)(
-	"semantic worker unavailable catalog: %s",
+	"semantic worker catalog without eligible evidence: %s",
 	(state) => {
 		const f = useSemanticWorkerFixture({ initializeIndex: state !== "absent" });
 		it("returns no semantic candidates without starting a worker or loading embeddings", async () => {
@@ -32,9 +32,7 @@ describe.each(["absent", "building", "needsrepair", "empty"] as const)(
 			if (state === "needsrepair") {
 				invalidateValidatedIndex(f.store.db);
 				// Unsupported legacy maintenance is explicit: invalidate first, then audit before reuse.
-				f.store.db
-					.prepare("UPDATE memory_vectors SET model = 'fixture-unknown-model' WHERE memory_id = ?")
-					.run(f.ids.hidden);
+				f.store.db.prepare("UPDATE memory_vectors SET model = 'fixture-unknown-model'").run();
 				startAudit(f.store.db, {
 					knownModels: [resolveEmbeddingClientVectorIdentityLabel(f.client)],
 				});

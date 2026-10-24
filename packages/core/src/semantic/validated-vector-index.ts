@@ -8,8 +8,10 @@ import {
 } from "./semantic-ranking.js";
 import {
 	type CandidateVersion,
+	isSearchableVectorCatalog,
 	readCandidateVersions,
 	readCatalog,
+	readSearchableModelLabels,
 	snapshot,
 } from "./validated-vector-index-state.js";
 
@@ -24,8 +26,10 @@ export {
 	type CandidateVersion,
 	initializeValidatedIndex,
 	invalidateValidatedIndex,
+	isSearchableVectorCatalog,
 	readCandidateVersions,
 	readCatalog,
+	readSearchableModelLabels,
 	type VectorCatalog,
 } from "./validated-vector-index-state.js";
 
@@ -40,10 +44,10 @@ export interface IndexedRanking extends RankingResult {
 export function rankValidatedIndex(db: Database, request: RankingRequest): IndexedRanking | null {
 	return snapshot(db, () => {
 		const catalog = readCatalog(db);
-		if (catalog?.status !== "ready") return null;
+		if (!isSearchableVectorCatalog(db, catalog)) return null;
 		const models = resolveCatalogModels(
 			request.query.model,
-			catalog.models.map((entry) => entry.model),
+			readSearchableModelLabels(db, catalog),
 			catalog.migration,
 		);
 		if (!models.length) return null;

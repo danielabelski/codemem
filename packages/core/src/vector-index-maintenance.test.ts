@@ -436,6 +436,87 @@ describe("vector maintenance derived-row pruning", () => {
 	});
 });
 
+describe("vector maintenance repair eligibility cache", () => {
+	it("reuses a model-only rejection census across valid writes but rechecks a new generation", async () => {
+		// Arrange: the undeclared row has a bad norm that becomes repairable only after declaration.
+		const goodId = fixture.memory();
+		const good = fixture.rawVector(goodId, vector(1));
+		const badId = fixture.memory();
+		const unknown = fixture.rawVector(badId, vector(3), 0, "undeclared-model");
+		ensureVectorIndexReady(fixture.db, { configuredModel: MODEL });
+		const source = fixture.db.prepare("SELECT * FROM memory_items ORDER BY id").all();
+		const bytes = fixture.db
+			.prepare("SELECT embedding FROM memory_vectors WHERE rowid=?")
+			.pluck()
+			.get(BigInt(good)) as Buffer;
+		const before = readState(fixture.db);
+		const changes = fixture.db.prepare("SELECT total_changes()").pluck().get();
+		const prepare = vi.spyOn(fixture.db, "prepare");
+		const transactions = vi.spyOn(fixture.db, "transaction");
+		const eligibilityReads = () =>
+			prepare.mock.calls.filter(([sql]) => /reason\s+IS\s+NOT\s+'model'/i.test(sql)).length;
+		const driver = maintenance();
+
+		// Act: only the first admission should scan the generation's invalid-row reasons.
+		driver.schedule();
+		expect(eligibilityReads()).toBe(1);
+		for (let request = 0; request < 3; request++) driver.schedule();
+		expect(driver.requiresAsyncClose).toBe(false);
+		expect(eligibilityReads()).toBe(1);
+		expect(transactions).not.toHaveBeenCalled();
+		expect(fixture.db.prepare("SELECT total_changes()").pluck().get()).toBe(changes);
+		fixture.db
+			.transaction(() =>
+				prepareVectorWrites(fixture.db)({
+					insert: {
+						model: MODEL,
+						expectedCount: 1,
+						rows: [
+							{ memoryId: goodId, chunkIndex: 1, contentHash: "valid-addition", vector: vector(1) },
+						],
+					},
+				}),
+			)
+			.immediate();
+		transactions.mockClear();
+		const afterWrite = readState(fixture.db);
+		for (let request = 0; request < 3; request++) driver.schedule();
+
+		// Assert: revision alone cannot invalidate a census of unchanged invalid rows.
+		expect(afterWrite.revision).toBeGreaterThan(before.revision);
+		expect(afterWrite.generation_id).toBe(before.generation_id);
+		expect(afterWrite.invalid_count).toBe(before.invalid_count);
+		expect(eligibilityReads()).toBe(1);
+		expect(driver.requiresAsyncClose).toBe(false);
+		expect(transactions).not.toHaveBeenCalled();
+		expect(getMaintenanceJob(fixture.db, "vector_index_validation")).toBeNull();
+		transactions.mockRestore();
+		startAudit(fixture.db, { knownModels: [MODEL, "undeclared-model"] });
+		auditBatch(fixture.db, { limit: 250 });
+		const declared = readState(fixture.db);
+		expect(declared.generation_id).not.toBe(before.generation_id);
+		expect(declared.invalid_count).toBe(before.invalid_count);
+		expect(
+			fixture.db.prepare("SELECT reason FROM validated_vector_rows WHERE rowid=?").get(unknown),
+		).toEqual({ reason: "norm" });
+		driver.schedule();
+		await checkpoint(() => readState(fixture.db).status === "ready");
+		await driver.close();
+		expect(eligibilityReads()).toBeGreaterThan(1);
+		expect(
+			fixture.db.prepare("SELECT rowid FROM memory_vectors WHERE memory_id=?").all(badId),
+		).toEqual([]);
+		expect(version(badId, "undeclared-model").count).toBe(0);
+		const retained = fixture.db
+			.prepare("SELECT embedding FROM memory_vectors WHERE rowid=?")
+			.pluck()
+			.get(BigInt(good)) as Buffer;
+		expect(retained.equals(bytes)).toBe(true);
+		expect(readCatalog(fixture.db)?.models).toEqual([{ model: MODEL, count: 2 }]);
+		expect(fixture.db.prepare("SELECT * FROM memory_items ORDER BY id").all()).toEqual(source);
+	});
+});
+
 describe("production recovery of whitespace-only legacy content hashes", () => {
 	it.each([
 		["tab", "\t"],

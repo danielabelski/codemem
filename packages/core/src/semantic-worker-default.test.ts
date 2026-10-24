@@ -10,9 +10,13 @@ import type { EmbeddingClient } from "./embeddings.js";
 import {
 	_resetEmbeddingRuntimeFactory,
 	_setEmbeddingRuntimeFactory,
+	getEmbeddingClient,
 	MemoryStore,
+	resolveEmbeddingVectorIdentityLabel,
 	storeVectors,
 } from "./index.js";
+import { createFixture } from "./semantic/semantic-ranking.test-helper.js";
+import { readCatalog } from "./semantic/validated-vector-index-state.js";
 
 const query = "refresh authentication keys";
 const title = "Credential rotation";
@@ -108,6 +112,54 @@ async function seed(current: MemoryStore): Promise<number> {
 	await storeVectors(current.db, id, title, body);
 	return id;
 }
+
+async function servesValidRowsAfterMixedLegacyUpgrade(): Promise<void> {
+	// Arrange: only raw legacy fixture bootstrap/seeding precedes an ordinary production store open.
+	vi.stubEnv("CODEMEM_EMBEDDING_DISABLED", "0");
+	const client = await getEmbeddingClient();
+	expect(client).not.toBeNull();
+	const model = resolveEmbeddingVectorIdentityLabel("fixture/offline-semantic", revision);
+	const legacy = createFixture(directory);
+	const valid = legacy.memory();
+	const unknown = legacy.memory();
+	legacy.db
+		.prepare("UPDATE memory_items SET actor_id=?,origin_device_id=?,project='fixture'")
+		.run("local:semantic-default", "semantic-default");
+	legacy.rawVector(valid, unitVector(), 0, model);
+	legacy.rawVector(unknown, unitVector(), 0, "unknown-legacy-model");
+	const before = legacy.snapshot();
+	legacy.db.close();
+	const current = new MemoryStore(legacy.path, {
+		keysDir: join(directory, "keys"),
+		runtimeSigningKey: { deviceId: "semantic-default", publicKey: CANONICAL_PUBLIC_KEY },
+	});
+	store = current;
+	expect(readCatalog(current.db)).toMatchObject({ status: "needsrepair" });
+	const prepare = vi.spyOn(current.db, "prepare");
+	// Act: the default worker must search audited eligible rows without an attached executor.
+	const results = await current.semanticSearchAsync({
+		query,
+		limit: 1,
+		filters: { project: "fixture" },
+	});
+	const parentSql = prepare.mock.calls.map(([sql]) => sql);
+	// Assert: unknown bytes and source rows remain intact; repair is not a prerequisite for valid evidence.
+	expect(results.map((row) => row.id)).toEqual([valid]);
+	expect(parentSql.some((sql) => /vec_distance_l2\s*\(/i.test(sql))).toBe(false);
+	expect(current.db.prepare("SELECT rowid, * FROM memory_vectors ORDER BY rowid").all()).toEqual(
+		before.vectors,
+	);
+	expect(current.db.prepare("SELECT * FROM memory_items ORDER BY id").all()).toEqual(
+		before.memories,
+	);
+	expect(readCatalog(current.db)).toMatchObject({ status: "needsrepair" });
+	expect(globalThis.fetch).not.toHaveBeenCalled();
+}
+
+it(
+	"default file retrieval uses valid evidence after a mixed legacy catalog auto-upgrades to needsrepair",
+	servesValidRowsAfterMixedLegacyUpgrade,
+);
 
 function effects(current: MemoryStore) {
 	return {

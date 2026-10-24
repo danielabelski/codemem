@@ -80,6 +80,7 @@ export class VectorIndexMaintenance {
 	private failure: { error: unknown } | undefined;
 	private closing = false;
 	private progress: BatchProgress | undefined;
+	private noRepairRowsAt: { generationId: string; invalidCount: number } | undefined;
 
 	constructor(
 		private readonly db: Database,
@@ -95,7 +96,7 @@ export class VectorIndexMaintenance {
 		try {
 			const state = withoutBusyWait(this.db, () => readState(this.db));
 			if (state.status === "ready" || !state.audit_started) return;
-			if (state.status === "needsrepair" && !hasRepairRows(this.db)) return;
+			if (state.status === "needsrepair" && this.hasOnlyModelRejections(state)) return;
 		} catch (error) {
 			if (!isBusy(error)) throw error;
 		}
@@ -110,6 +111,19 @@ export class VectorIndexMaintenance {
 		this.closing = true;
 		await this.pending;
 		if (this.failure) throw this.failure.error;
+	}
+
+	private hasOnlyModelRejections(state: State): boolean {
+		const previous = this.noRepairRowsAt;
+		if (
+			previous?.generationId === state.generation_id &&
+			previous.invalidCount === state.invalid_count
+		)
+			return true;
+		if (hasRepairRows(this.db)) return false;
+		// Valid writes cannot add rejected rows; audits rotate the generation before reclassifying them.
+		this.noRepairRowsAt = { generationId: state.generation_id, invalidCount: state.invalid_count };
+		return true;
 	}
 
 	private stopped(): boolean {
