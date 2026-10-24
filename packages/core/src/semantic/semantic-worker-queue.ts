@@ -22,6 +22,7 @@ export interface QueueOptions {
 	readinessMs?: number;
 	requestMs?: number;
 	shutdownMs?: number;
+	onCircuitOpen?(code: SemanticWorkerErrorCode): void;
 }
 
 export type SemanticWorkerErrorCode =
@@ -73,7 +74,8 @@ export function createSemanticWorkerQueue(options: QueueOptions): SemanticWorker
 	return new WorkerQueue({ ...options, maxPending, readinessMs, requestMs, shutdownMs });
 }
 
-type ResolvedOptions = Required<QueueOptions>;
+type ResolvedOptions = Required<Omit<QueueOptions, "onCircuitOpen">> &
+	Pick<QueueOptions, "onCircuitOpen">;
 
 class WorkerQueue implements SemanticWorkerQueue {
 	private worker: WorkerTransport | undefined;
@@ -218,6 +220,11 @@ class WorkerQueue implements SemanticWorkerQueue {
 		if (this.circuit || this.exited) return;
 		this.circuit = code;
 		clearTimeout(this.readinessTimer);
+		try {
+			this.options.onCircuitOpen?.(code);
+		} catch {
+			// Diagnostics must not prevent active and pending callers from settling.
+		}
 		this.active?.finish(null, new SemanticWorkerError(code));
 		for (const job of this.pending.splice(0)) job.finish(null, new SemanticWorkerError(code));
 		void this.terminate();

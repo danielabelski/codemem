@@ -440,28 +440,43 @@ describe("vector coverage paging results", () => {
 	});
 });
 
+async function storesVectorsWithIntegerMetadata(): Promise<void> {
+	// Arrange: supported writers require a retained source memory, including this exact integer ID.
+	const sourceId = insertInjectedBackfillMemory(db);
+	db.prepare("UPDATE memory_items SET id = ?, title = ?, body_text = ? WHERE id = ?").run(
+		123,
+		"Title",
+		"Body",
+		sourceId,
+	);
+	vi.mocked(embeddings.embedTexts).mockResolvedValue([new Float32Array(384)]);
+
+	// Act
+	await expect(storeVectors(db, 123, "Title", "Body")).resolves.toBeUndefined();
+
+	const row = db
+		.prepare(
+			"SELECT memory_id, chunk_index, content_hash, model FROM memory_vectors WHERE memory_id = ?",
+		)
+		.get(123) as
+		| { memory_id: number; chunk_index: number; content_hash: string; model: string }
+		| undefined;
+
+	// Assert
+	expect(row).toMatchObject({
+		memory_id: 123,
+		chunk_index: 0,
+		model: "test-model",
+	});
+	expect(row?.content_hash).toMatch(/^[a-f0-9]{64}$/);
+}
+
 describe("vectors", () => {
 	useVectorFixture();
-	it("stores vectors with integer metadata columns via sqlite-vec workaround", async () => {
-		vi.mocked(embeddings.embedTexts).mockResolvedValue([new Float32Array(384)]);
-
-		await expect(storeVectors(db, 123, "Title", "Body")).resolves.toBeUndefined();
-
-		const row = db
-			.prepare(
-				"SELECT memory_id, chunk_index, content_hash, model FROM memory_vectors WHERE memory_id = ?",
-			)
-			.get(123) as
-			| { memory_id: number; chunk_index: number; content_hash: string; model: string }
-			| undefined;
-
-		expect(row).toMatchObject({
-			memory_id: 123,
-			chunk_index: 0,
-			model: "test-model",
-		});
-		expect(row?.content_hash).toMatch(/^[a-f0-9]{64}$/);
-	});
+	it(
+		"stores vectors with integer metadata columns via sqlite-vec workaround",
+		storesVectorsWithIntegerMetadata,
+	);
 
 	it("rejects non-integer memory ids instead of truncating them", async () => {
 		vi.mocked(embeddings.embedTexts).mockResolvedValue([new Float32Array(384)]);
@@ -2141,13 +2156,23 @@ describe("memory_vectors bootstrap on fresh databases", () => {
 	it("creates memory_vectors via auto-bootstrap when constructing MemoryStore against a fresh path", async () => {
 		const dbPath = join(tmpDir, "vectors-fresh.sqlite");
 		// No pre-seeding — constructor discovers an uninitialized file and
-		// runs ensureSchemaBootstrapped, which must now create memory_vectors.
+		// runs ensureSchemaBootstrapped and creates the physical store plus its compatibility view.
 		const store = new MemoryStore(dbPath);
 		try {
-			const tableRow = store.db
-				.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'memory_vectors'")
-				.get() as { name: string } | undefined;
-			expect(tableRow?.name).toBe("memory_vectors");
+			const vectorObjects = store.db
+				.prepare(
+					"SELECT name, type FROM sqlite_master WHERE name IN ('memory_vectors', 'memory_vectors_v1') ORDER BY name",
+				)
+				.all();
+			expect(vectorObjects).toEqual([
+				{ name: "memory_vectors", type: "view" },
+				{ name: "memory_vectors_v1", type: "table" },
+			]);
+			expect(
+				store.db
+					.prepare("SELECT status, writer_version FROM validated_vector_state WHERE id=1")
+					.get(),
+			).toEqual({ status: "ready", writer_version: 1 });
 
 			// Unguarded model-resolution query must succeed on a fresh DB.
 			expect(() => resolveSemanticSearchModel(store.db, "test-model")).not.toThrow();

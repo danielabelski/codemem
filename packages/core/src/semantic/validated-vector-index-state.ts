@@ -1,8 +1,9 @@
-/** Fixture-owned format-v1 metadata. Raw/older writers require explicit invalidation and rebuild. */
+/** Persisted format-v1 metadata. Raw/older writers require invalidation and rebuild. */
 import { randomUUID } from "node:crypto";
 import { type Database, tableExists } from "../db.js";
 import type { MaintenanceJobSnapshot } from "../maintenance-jobs.js";
 import { readModelJob } from "./semantic-ranking.js";
+import type { AuditStateStatements, CountStatements } from "./validated-vector-index-statements.js";
 
 export interface VectorCatalog {
 	generationId: string;
@@ -49,15 +50,6 @@ export interface AuditProgress {
 		model?: string | null;
 		action?: "pruned";
 	}[];
-}
-export interface RepairInput {
-	rowid: number;
-	memoryId: number;
-	chunkIndex: number;
-	previousModel: string | null;
-	contentHash: string;
-	title: string;
-	bodyText: string;
 }
 
 export function snapshot<T>(db: Database, read: () => T): T {
@@ -168,39 +160,29 @@ export function finishMutation(db: Database): VectorCatalog {
 }
 
 export function changeCounts(
-	db: Database,
+	statements: CountStatements,
 	memoryId: number,
 	model: string | null,
 	delta: number,
 ): void {
 	const nullKey = Number(model === null);
 	const key = model ?? "";
-	db.prepare(`INSERT OR IGNORE INTO validated_vector_models(model_null,model_key,model,count)
-		VALUES(?,?,?,0)`).run(nullKey, key, model);
-	db.prepare(
-		`UPDATE validated_vector_models SET count=count+? WHERE model_null=? AND model_key=?`,
-	).run(delta, nullKey, key);
-	db.prepare(`INSERT OR IGNORE INTO validated_vector_versions(memory_id,model_null,model_key,model,version,count)
-		VALUES(?,?,?,?,0,0)`).run(memoryId, nullKey, key, model);
-	db.prepare(`UPDATE validated_vector_versions SET version=version+1,count=count+?
-		WHERE memory_id=? AND model_null=? AND model_key=?`).run(delta, memoryId, nullKey, key);
+	statements.insertModel.run(nullKey, key, model);
+	statements.updateModelCount.run(delta, nullKey, key);
+	statements.insertVersion.run(memoryId, nullKey, key, model);
+	statements.updateVersionCount.run(delta, memoryId, nullKey, key);
 }
 
 export function updateAuditState(
-	db: Database,
+	statements: AuditStateStatements,
 	row: IndexedRow,
 	state: IndexedRow["audit_state"],
 	reason: string | null = null,
 ): void {
-	db.prepare("UPDATE validated_vector_rows SET audit_state=?,reason=? WHERE rowid=?").run(
-		state,
-		reason,
-		row.rowid,
-	);
+	statements.updateRowState.run(state, reason, row.rowid);
 	const pending = Number(state === "pending") - Number(row.audit_state === "pending");
 	const invalid = Number(state === "invalid") - Number(row.audit_state === "invalid");
-	db.prepare(`UPDATE validated_vector_state SET pending_count=pending_count+?,
-		invalid_count=invalid_count+? WHERE id=1`).run(pending, invalid);
+	statements.updateAuditCounts.run(pending, invalid);
 }
 
 export function progress(

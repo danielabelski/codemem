@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { vi } from "vitest";
-import type { FixtureVector, RankingRequest } from "./semantic-ranking.js";
+import type { RankingRequest, VectorRowInput } from "./semantic-ranking.js";
 import {
 	createFixture,
 	MODEL,
@@ -25,7 +25,7 @@ export function createDisposableIndexFixture(): { fixture: RankingFixture; dispo
 	};
 }
 
-export function row(memoryId: number, value = 1, chunkIndex = 0): FixtureVector {
+export function row(memoryId: number, value = 1, chunkIndex = 0): VectorRowInput {
 	return {
 		memoryId,
 		chunkIndex,
@@ -34,7 +34,7 @@ export function row(memoryId: number, value = 1, chunkIndex = 0): FixtureVector 
 	};
 }
 
-export function request(fixture: RankingFixture): Omit<RankingRequest, "token"> {
+export function request(fixture: RankingFixture): RankingRequest {
 	return {
 		query: { model: MODEL, vectors: [vector()] },
 		limit: 2,

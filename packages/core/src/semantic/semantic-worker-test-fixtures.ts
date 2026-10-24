@@ -10,10 +10,7 @@ import { ensureVectorSchema } from "../schema-bootstrap.js";
 import { MemoryStore } from "../store.js";
 import { initTestSchema } from "../test-utils.js";
 import type { PackSemanticExecutor } from "./semantic-executor-seam.js";
-import {
-	createExperimentalSemanticExecutor,
-	type SemanticWorkerOptions,
-} from "./semantic-worker-executor.js";
+import { createSemanticExecutor, type SemanticWorkerOptions } from "./semantic-worker-executor.js";
 import type { RankOutput, WorkerReply } from "./semantic-worker-protocol.js";
 import {
 	auditBatch,
@@ -149,7 +146,7 @@ export function useSemanticWorkerFixture(options: FixtureOptions = {}): Fixture 
 		ensureVectorSchema(fixture.store.db);
 		initializeFixtureVectors(fixture, options);
 		fixture.openExecutor = (options = {}) => {
-			const executor = createExperimentalSemanticExecutor({
+			const executor = createSemanticExecutor({
 				store: fixture.store,
 				getClient: async () => fixture.client,
 				queueOptions: { requestMs: 10_000, readinessMs: 5_000, shutdownMs: 500 },
@@ -163,7 +160,7 @@ export function useSemanticWorkerFixture(options: FixtureOptions = {}): Fixture 
 		try {
 			await Promise.all(executors.splice(0).map((executor) => executor.close()));
 		} finally {
-			fixture.store?.close();
+			await fixture.store?.closeAsync();
 			vi.restoreAllMocks();
 			vi.unstubAllEnvs();
 			rmSync(fixture.directory, { recursive: true, force: true });

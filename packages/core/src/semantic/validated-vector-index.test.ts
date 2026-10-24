@@ -1,7 +1,7 @@
 import Database from "better-sqlite3";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { getMaintenanceJob } from "../maintenance-jobs.js";
-import type { FixtureVector } from "./semantic-ranking.js";
+import type { VectorRowInput } from "./semantic-ranking.js";
 import { MODEL, type RankingFixture, vector } from "./semantic-ranking.test-helper.js";
 import {
 	auditBatch,
@@ -33,7 +33,7 @@ afterEach(() => {
 function initialize() {
 	return initializeValidatedIndex(fixture.db, { ...writer, allWritersUpgraded: true });
 }
-function write(rows: FixtureVector[], mode: "append" | "replace-memory-model" = "append") {
+function write(rows: VectorRowInput[], mode: "append" | "replace-memory-model" = "append") {
 	return writeValidatedBatch(fixture.db, {
 		...writer,
 		expectedModel: MODEL,

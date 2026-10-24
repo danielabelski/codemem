@@ -1569,6 +1569,7 @@ export type {
 	ReplicationOp,
 	ReplicationOpsAgePrunePlan,
 	ReplicationOpsPruneResult,
+	SemanticExecutionOptions,
 	Session,
 	SessionSummary,
 	StoreStats,

@@ -6,11 +6,11 @@ import {
 	_resetEmbeddingRuntimeFactory,
 	_setEmbeddingRuntimeFactory,
 } from "../../core/src/embeddings.js";
-import { attachExperimentalSemanticExecutor } from "../../core/src/experiments/semantic-executor-seam.js";
+import { attachSemanticExecutorForTesting } from "../../core/src/semantic/semantic-executor-seam.js";
 import {
 	request,
 	useSemanticWorkerFixture,
-} from "../../core/src/experiments/semantic-worker-test-fixtures.js";
+} from "../../core/src/semantic/semantic-worker-test-fixtures.js";
 import { createApp } from "../../viewer-server/src/index.js";
 import { createCodememMcpServer } from "./index.js";
 
@@ -50,7 +50,7 @@ function usageCount(): number {
 function install() {
 	const executor = f.openExecutor();
 	const search = vi.spyOn(executor, "search");
-	attachExperimentalSemanticExecutor(f.store, executor);
+	attachSemanticExecutorForTesting(f.store, executor);
 	return { executor, search };
 }
 
@@ -148,7 +148,7 @@ describe("semantic worker through actual viewer and MCP handlers", () => {
 		// Arrange
 		const getClient = vi.fn(async () => f.client);
 		const executor = f.openExecutor({ getClient });
-		attachExperimentalSemanticExecutor(f.store, executor);
+		attachSemanticExecutorForTesting(f.store, executor);
 		vi.stubEnv("CODEMEM_EMBEDDING_DISABLED", "1");
 
 		// Act

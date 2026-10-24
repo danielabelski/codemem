@@ -24,6 +24,7 @@ import type { RankOutput, RuntimeProof, WorkerReply } from "./semantic-worker-pr
 import {
 	createSemanticWorkerQueue,
 	type QueueOptions,
+	type SemanticWorkerErrorCode,
 	type WorkerEvents,
 } from "./semantic-worker-queue.js";
 import { contentIdentity, summarySessionId } from "./semantic-worker-ranking.js";
@@ -140,6 +141,11 @@ function currentCatalog(db: Database): VectorCatalog | null {
 	return readyCatalog(db);
 }
 
+/** Metadata-only admission check; construction never starts a worker. */
+export function hasReadySemanticCatalog(db: Database): boolean {
+	return currentCatalog(db) !== null;
+}
+
 function catalogModels(catalog: VectorCatalog | null, identity: string): string[] {
 	if (!catalog) return [];
 	return resolveCatalogModels(
@@ -179,6 +185,12 @@ function transport(dbPath: string, identity: string, events: WorkerEvents) {
 	return worker;
 }
 
+function warnSemanticCircuitOpen(code: SemanticWorkerErrorCode): void {
+	console.warn(
+		`codemem: semantic_worker_${code}; semantic retrieval disabled until process restart.`,
+	);
+}
+
 function createWorkerOwner(options: SemanticWorkerOptions) {
 	const { store } = options;
 	if (!isAbsolute(store.db.name) || store.db.name === ":memory:") {
@@ -188,15 +200,14 @@ function createWorkerOwner(options: SemanticWorkerOptions) {
 	const identity = fileIdentity(dbPath);
 	const queue = createSemanticWorkerQueue({
 		...options.queueOptions,
+		onCircuitOpen: options.queueOptions?.onCircuitOpen ?? warnSemanticCircuitOpen,
 		createWorker: options.createWorker ?? ((events) => transport(dbPath, identity, events)),
 	});
 	return { dbPath, identity, queue };
 }
 
-/** No default installation. Owner must await close() before closing its writable store. */
-export function createExperimentalSemanticExecutor(
-	options: SemanticWorkerOptions,
-): PackSemanticExecutor {
+/** Owner must await close() before closing its writable store. */
+export function createSemanticExecutor(options: SemanticWorkerOptions): PackSemanticExecutor {
 	const { store } = options;
 	const { dbPath, identity, queue } = createWorkerOwner(options);
 	let generation = 0;
@@ -204,7 +215,7 @@ export function createExperimentalSemanticExecutor(
 		generation++;
 	});
 	return {
-		async search(input) {
+		async search(input, executionOptions) {
 			const requestIdentity = captureIdentity(store);
 			const requestGeneration = generation;
 			assertDatabaseIdentity(store, dbPath, identity);
@@ -235,7 +246,7 @@ export function createExperimentalSemanticExecutor(
 						embedding: new Float32Array(embedding),
 						embeddingIdentity: state.embeddingIdentity,
 					};
-				})
+				}, executionOptions)
 				.then(
 					(output) => ({ output }),
 					(error: unknown) => ({ error }),

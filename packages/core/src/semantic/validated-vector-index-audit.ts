@@ -14,6 +14,10 @@ import {
 	updateAuditState,
 	type VectorCatalog,
 } from "./validated-vector-index-state.js";
+import {
+	type IndexStatement,
+	prepareAuditStateStatements,
+} from "./validated-vector-index-statements.js";
 
 /** One metadata census per generation; vector blobs are read only by bounded audit batches. */
 export function startAudit(
@@ -45,7 +49,11 @@ export function startAudit(
 	})();
 }
 
-function rowRejection(db: Database, row: IndexedRow, knownModels: Set<string>): string | null {
+function rowRejection(
+	statements: { sourceExists: IndexStatement; vector: IndexStatement },
+	row: IndexedRow,
+	knownModels: Set<string>,
+): string | null {
 	if (row.model === null || !knownModels.has(row.model)) return "model";
 	try {
 		requireVectorMetadata({
@@ -56,31 +64,36 @@ function rowRejection(db: Database, row: IndexedRow, knownModels: Set<string>): 
 	} catch {
 		return "metadata";
 	}
-	if (!db.prepare("SELECT 1 FROM memory_items WHERE id=?").get(row.memory_id)) return "metadata";
-	const vector = db
-		.prepare("SELECT embedding FROM memory_vectors WHERE rowid=?")
-		.get(BigInt(row.rowid)) as { embedding: Buffer } | undefined;
+	if (!statements.sourceExists.get(row.memory_id)) return "metadata";
+	const vector = statements.vector.get(BigInt(row.rowid)) as { embedding: Buffer } | undefined;
 	if (!vector) throw new Error("audit_vector_row_missing_restart_required");
 	return inspectBytes(vector.embedding);
 }
 
 export function auditBatch(db: Database, options: { limit: number }): AuditProgress {
 	requireLimit(options.limit);
-	return db.transaction(() => {
-		const state = readState(db);
-		if (!state.audit_started) throw new Error("start_audit_required");
-		const knownModels = new Set<string>(JSON.parse(state.known_models));
-		const rows = db
-			.prepare(`SELECT * FROM validated_vector_rows
+	return db
+		.transaction(() => {
+			const state = readState(db);
+			if (!state.audit_started) throw new Error("start_audit_required");
+			const knownModels = new Set<string>(JSON.parse(state.known_models));
+			const rows = db
+				.prepare(`SELECT * FROM validated_vector_rows
 			WHERE audit_state='pending' ORDER BY rowid LIMIT ?`)
-			.all(options.limit) as IndexedRow[];
-		const diagnostics: AuditProgress["diagnostics"] = [];
-		for (const row of rows) {
-			const reason = rowRejection(db, row, knownModels);
-			updateAuditState(db, row, reason ? "invalid" : "valid", reason);
-			if (reason) diagnostics.push({ rowid: row.rowid, reason });
-		}
-		finishMutation(db);
-		return progress(db, rows.length, diagnostics);
-	})();
+				.all(options.limit) as IndexedRow[];
+			const reads = {
+				sourceExists: db.prepare("SELECT 1 FROM memory_items WHERE id=?"),
+				vector: db.prepare("SELECT embedding FROM memory_vectors WHERE rowid=?"),
+			};
+			const auditState = prepareAuditStateStatements(db);
+			const diagnostics: AuditProgress["diagnostics"] = [];
+			for (const row of rows) {
+				const reason = rowRejection(reads, row, knownModels);
+				updateAuditState(auditState, row, reason ? "invalid" : "valid", reason);
+				if (reason) diagnostics.push({ rowid: row.rowid, reason });
+			}
+			finishMutation(db);
+			return progress(db, rows.length, diagnostics);
+		})
+		.immediate();
 }

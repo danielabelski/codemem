@@ -78,6 +78,79 @@ beforeEach(() => {
 });
 afterEach(() => vi.useRealTimers());
 
+describe("semantic worker queue circuit notification", () => {
+	it.each(["not_ready", "worker_failed"] as const)(
+		"reports the first permanent %s circuit once and preserves job failures",
+		async (code) => {
+			// Arrange: both jobs are admitted before readiness or the first worker failure.
+			const onCircuitOpen = vi.fn();
+			const f = fixture({ readinessMs: 25, onCircuitOpen });
+			const prepare = vi.fn(async () => input());
+			const active = observe(f.queue.run(prepare));
+			const queued = observe(f.queue.run(prepare));
+
+			// Act: an error followed by exit and duplicate errors still describes one circuit trip.
+			if (code === "not_ready") await vi.advanceTimersByTimeAsync(25);
+			else {
+				f.ready();
+				await flush();
+				f.fail();
+			}
+			f.fail();
+			f.exit(1);
+			f.fail();
+			const later = observe(f.queue.run(prepare));
+			f.terminated.resolve(1);
+			await f.queue.close();
+
+			// Assert: notification neither replays work nor changes the original typed failure.
+			expect(onCircuitOpen).toHaveBeenCalledExactlyOnceWith(code);
+			expect(await active).toMatchObject({ error: { code } });
+			expect(await queued).toMatchObject({ error: { code } });
+			expect(await later).toMatchObject({ error: { code } });
+			expect(prepare).toHaveBeenCalledTimes(code === "not_ready" ? 0 : 1);
+			expect(f.createWorker).toHaveBeenCalledTimes(1);
+			expect(f.terminate).toHaveBeenCalledTimes(1);
+			expect(vi.getTimerCount()).toBe(0);
+		},
+	);
+
+	it("contains a throwing circuit callback while settling jobs and joining close", async () => {
+		// Arrange: diagnostics must not become part of worker-failure control flow.
+		const onCircuitOpen = vi.fn(() => {
+			throw new Error("fixture circuit notification failed");
+		});
+		const f = fixture({ onCircuitOpen });
+		const active = observe(f.queue.run(async () => input()));
+		const queued = observe(f.queue.run(async () => input()));
+		f.ready();
+		await flush();
+
+		// Act: capture any escaped diagnostic exception and always finish fake-worker cleanup.
+		let escaped: unknown;
+		try {
+			f.fail();
+		} catch (error) {
+			escaped = error;
+		}
+		const closing = observe(f.queue.close());
+		f.fail();
+		f.terminated.resolve(1);
+		f.exit(1);
+		await flush();
+
+		// Assert
+		expect(escaped).toBeUndefined();
+		expect(onCircuitOpen).toHaveBeenCalledExactlyOnceWith("worker_failed");
+		expect(await active).toMatchObject({ error: { code: "worker_failed" } });
+		expect(await queued).toMatchObject({ error: { code: "worker_failed" } });
+		expect(await closing).toEqual({ value: undefined });
+		expect(f.createWorker).toHaveBeenCalledTimes(1);
+		expect(f.terminate).toHaveBeenCalledTimes(1);
+		expect(vi.getTimerCount()).toBe(0);
+	});
+});
+
 describe("semantic worker queue admission", () => {
 	it("releases the active slot when ranking declines an unavailable generation", async () => {
 		// Arrange

@@ -1,4 +1,4 @@
-/** Experimental persisted writer contract. No production initialization or activation. */
+/** Persisted vector writer contract and readiness-gated semantic ranking. */
 import type { Database } from "../db.js";
 import {
 	type RankingRequest,
@@ -19,13 +19,11 @@ export {
 	type ValidatedBatch,
 	writeValidatedBatch,
 } from "./validated-vector-index-mutations.js";
-export { repairBatch } from "./validated-vector-index-repair.js";
 export {
 	type AuditProgress,
 	type CandidateVersion,
 	initializeValidatedIndex,
 	invalidateValidatedIndex,
-	type RepairInput,
 	readCandidateVersions,
 	readCatalog,
 	type VectorCatalog,
@@ -39,10 +37,7 @@ export interface IndexedRanking extends RankingResult {
 }
 
 /** Reuses a caller-owned read transaction; no DDL, audit, BLOB hashes or model-catalog vec0 scan. */
-export function rankValidatedIndex(
-	db: Database,
-	request: Omit<RankingRequest, "token">,
-): IndexedRanking | null {
+export function rankValidatedIndex(db: Database, request: RankingRequest): IndexedRanking | null {
 	return snapshot(db, () => {
 		const catalog = readCatalog(db);
 		if (catalog?.status !== "ready") return null;
