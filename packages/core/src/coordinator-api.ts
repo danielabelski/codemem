@@ -7,6 +7,7 @@
 
 import type { Context } from "hono";
 import { Hono } from "hono";
+import { isAuthControllerId } from "./coordinator-auth-controller.js";
 import { registerCoordinatorAuthControllerReviewRoutes } from "./coordinator-auth-controller-review-route.js";
 import {
 	AUTH_SCHEMA_UPGRADE_REQUIRED,
@@ -109,6 +110,8 @@ export interface CreateCoordinatorAppOptions {
 	requestRateLimit?: CoordinatorRequestRateLimitOptions;
 	authLink?: CoordinatorDeviceAuthLinkOptions;
 	browserAuth?: CoordinatorAppBrowserAuthOptions;
+	/** Server-owned recipient namespace only; does not enable authentication or grant authority. */
+	recipientInviteCoordinatorId?: string;
 	accountChanges?: CoordinatorDeviceAccountChangeOptions;
 	deviceRevocation?: CoordinatorDeviceRevocationContext;
 }
@@ -146,6 +149,17 @@ function recipientInviteContext(
 ): { token: string; coordinatorId?: string } {
 	const ready = opts.browserAuth?.kind === "ready" ? opts.browserAuth : undefined;
 	const config = ready?.auth.storeConfig ?? opts.authLink?.config;
+	const coordinatorId = opts.recipientInviteCoordinatorId;
+	if (coordinatorId !== undefined) {
+		if (
+			!isAuthControllerId(coordinatorId) ||
+			[ready?.auth.storeConfig, opts.authLink?.config].some(
+				(metadata) => metadata && metadata.coordinatorId !== coordinatorId,
+			)
+		)
+			throw new Error("device_ownership_authorization_unavailable");
+		return { token, coordinatorId };
+	}
 	return config ? { token, coordinatorId: config.coordinatorId } : { token };
 }
 
