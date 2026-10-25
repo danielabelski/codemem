@@ -39,7 +39,7 @@ function conflictingController(f: Fixture, input: CoordinatorConsumeRecipientInv
 
 for (const backend of ["SQLite", "D1"] as const) {
 	type RepairFixture = Fixture & {
-		hooks: { beforeRepair?: () => void; beforeGrant?: () => void };
+		hooks: { beforeToken?: () => void; beforeRepair?: () => void; beforeGrant?: () => void };
 		winningBatches(): number;
 	};
 	const test = it.extend<{ f: RepairFixture }>({
@@ -56,8 +56,10 @@ for (const backend of ["SQLite", "D1"] as const) {
 										statements.some(({ query }) =>
 											/UPDATE coordinator_invites SET token\s*=/.test(query),
 										)
-									)
+									) {
 										winners++;
+										hooks.beforeToken?.();
+									}
 									if (
 										statements.some(({ query }) =>
 											/UPDATE enrolled_devices SET identity_id\s*=/.test(query),
@@ -125,6 +127,49 @@ for (const backend of ["SQLite", "D1"] as const) {
 		expect(f.db.prepare("SELECT * FROM coordinator_bootstrap_grants").all()).toHaveLength(1);
 	});
 	if (backend === "D1") {
+		for (const mode of ["unchanged owner", "conflicting owner"] as const) {
+			test(`D1 losing token write with ${mode} cannot bypass its full pin`, async ({ f }) => {
+				const input = await prepared(f, "add_device");
+				const readInvite = f.store.getInviteByTokenForInspection.bind(f.store);
+				let externalChange: ReturnType<typeof producerSnapshot> | undefined;
+				vi.spyOn(f.store, "getInviteByTokenForInspection").mockImplementationOnce(async (token) => {
+					const initial = await readInvite(token);
+					expect(initial?.consumed_at).toBeNull();
+					f.db
+						.prepare("UPDATE enrolled_devices SET enabled=0 WHERE device_id=?")
+						.run(`${input.deviceId}-seed`);
+					expect(await f.store.consumeRecipientInvite(input)).toMatchObject({
+						status: "accepted",
+						bootstrap_grant: null,
+					});
+					f.db
+						.prepare("UPDATE enrolled_devices SET enabled=1 WHERE device_id=?")
+						.run(`${input.deviceId}-seed`);
+					f.hooks.beforeToken = () => {
+						delete f.hooks.beforeToken;
+						if (mode === "conflicting owner") conflictingController(f, input);
+						externalChange = producerSnapshot(f.db);
+					};
+					return initial;
+				});
+				const outcome = await f.store.consumeRecipientInvite(input).then(
+					(value) => ({ kind: "accepted", value }),
+					(error: unknown) => ({ kind: "denied", error }),
+				);
+				expect(externalChange).toBeDefined();
+				if (mode === "conflicting owner") {
+					expect(outcome).toMatchObject({ kind: "denied" });
+					expect(producerSnapshot(f.db)).toEqual(externalChange);
+					expect(f.db.prepare("SELECT * FROM coordinator_bootstrap_grants").all()).toEqual([]);
+					return;
+				}
+				expect(outcome).toMatchObject({
+					kind: "accepted",
+					value: { status: "existing", bootstrap_grant: { worker_device_id: input.deviceId } },
+				});
+				expect(f.db.prepare("SELECT * FROM coordinator_bootstrap_grants").all()).toHaveLength(1);
+			});
+		}
 		for (const metadata of [undefined, null, "1", -1, 1.5, 2, Number.NaN]) {
 			test(`D1 unknown repair changes ${String(metadata)} cannot authorize grant recovery`, async ({
 				f,
