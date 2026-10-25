@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 import { describe, it } from "node:test";
 import { Script } from "node:vm";
 
@@ -36,28 +36,45 @@ const parallelArgs = [
 ];
 const heavyArgs = ["exec", "vitest", "run", heavyTest, "--maxWorkers=1"];
 
-function runCiScript(failPhase) {
-	const directory = mkdtempSync(join(tmpdir(), "codemem-ci-contract-"));
-	const log = join(directory, "calls.jsonl");
-	try {
-		const executable = join(directory, "pnpm");
-		writeFileSync(
-			executable,
-			`#!${process.execPath}
-const fs = require("node:fs");
+function pnpmLauncher(platform, nodePath, stubPath) {
+	if (platform === "win32") {
+		return `@echo off\r\n"${nodePath}" "${stubPath}" %*\r\nexit /b %errorlevel%\r\n`;
+	}
+	const quote = (value) => `'${value.replaceAll("'", "'\\''")}'`;
+	return `#!/bin/sh\nexec ${quote(nodePath)} ${quote(stubPath)} "$@"\n`;
+}
+
+function writePnpmStub(directory) {
+	const stub = join(directory, "node.cjs");
+	writeFileSync(
+		stub,
+		`const fs = require("node:fs");
 const log = process.env.CI_CONTRACT_LOG;
 fs.appendFileSync(log, JSON.stringify(process.argv.slice(2)) + "\\n");
 const phase = fs.readFileSync(log, "utf8").trim().split("\\n").length;
 process.exit(phase === Number(process.env.CI_CONTRACT_FAIL_PHASE) ? 23 : 0);
 `,
-		);
-		chmodSync(executable, 0o755);
+	);
+	const executable = join(directory, process.platform === "win32" ? "pnpm.cmd" : "pnpm");
+	writeFileSync(executable, pnpmLauncher(process.platform, process.execPath, stub));
+	if (process.platform !== "win32") chmodSync(executable, 0o755);
+}
+
+function runCiScript(failPhase) {
+	const directory = mkdtempSync(join(tmpdir(), "codemem-ci-contract-"));
+	const log = join(directory, "calls.jsonl");
+	try {
+		writePnpmStub(directory);
+		const env = { ...process.env };
+		for (const key of Object.keys(env)) {
+			if (key.toLowerCase() === "path") delete env[key];
+		}
 		const result = spawnSync(rootPackage.scripts["test:ci"], {
-			shell: "/bin/sh",
+			shell: true,
 			encoding: "utf8",
 			env: {
-				...process.env,
-				PATH: `${directory}:${process.env.PATH}`,
+				...env,
+				PATH: `${directory}${delimiter}${process.env.PATH}`,
 				CI_CONTRACT_LOG: log,
 				CI_CONTRACT_FAIL_PHASE: String(failPhase),
 			},
@@ -204,9 +221,21 @@ describe("CI test scheduling contract", () => {
 	it("keeps normal test filtering and default CI concurrency unchanged", () => {
 		// Arrange: CI scheduling must not change development commands or deadlines.
 		const config = readFileSync(new URL("../vitest.config.ts", import.meta.url), "utf8");
+		const nodePath = "C:\\Program Files\\nodejs\\node.exe";
+		const stubPath = "C:\\Temp Files\\node.cjs";
 		// Act
 		const scripts = rootPackage.scripts;
+		const windowsLauncher = pnpmLauncher("win32", nodePath, stubPath);
+		const posixLauncher = pnpmLauncher("darwin", "/node's path/node", "/temp files/node.cjs");
 		// Assert
+		assert.equal(
+			windowsLauncher,
+			`@echo off\r\n"${nodePath}" "${stubPath}" %*\r\nexit /b %errorlevel%\r\n`,
+		);
+		assert.equal(
+			posixLauncher,
+			"#!/bin/sh\nexec '/node'\\''s path/node' '/temp files/node.cjs' \"$@\"\n",
+		);
 		assert.equal(scripts.test, "pnpm exec vitest run");
 		assert.equal(scripts["test:watch"], "pnpm exec vitest");
 		assert.match(config, /maxWorkers: process\.env\.CI \? 3 : undefined/u);
