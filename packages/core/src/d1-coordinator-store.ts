@@ -2278,6 +2278,8 @@ export class D1CoordinatorStore implements CoordinatorStore {
 						authoritativeIdentityId,
 						...boundEligibilityValues,
 					),
+					// Enrollment follows the winning token write. Keep bootstrap writes on
+					// that changes() chain; a loser still needs its full pin during repair.
 					prepareRecipientOwnerStatement(
 						this.db,
 						`UPDATE coordinator_invites SET bootstrap_grant_id = ?,
@@ -2289,7 +2291,7 @@ export class D1CoordinatorStore implements CoordinatorStore {
 						AND EXISTS (SELECT 1 FROM enrolled_devices e
 							WHERE e.group_id = coordinator_invites.group_id
 							AND e.device_id = coordinator_invites.inviter_device_id AND e.enabled = 1)
-						AND ${boundEligibilitySql}`,
+						AND changes() = 1 AND ${boundEligibilitySql}`,
 						negative,
 					).bind(
 						bootstrapGrantId,
@@ -2312,7 +2314,7 @@ export class D1CoordinatorStore implements CoordinatorStore {
 					WHERE (i.token_digest = ? OR i.token = ?) AND i.invite_kind = 'add_device'
 						AND i.invite_id = ? AND i.group_id = ?
 						AND i.bootstrap_grant_id IS NOT NULL AND i.bound_device_id = ?
-						AND ${boundEligibilitySql}`,
+						AND changes() = 1 AND ${boundEligibilitySql}`,
 						negative,
 					).bind(
 						consumedAt,
