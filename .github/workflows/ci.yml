@@ -68,7 +68,7 @@ jobs:
         run: pnpm run build
 
       - name: Test
-        run: pnpm run test:release && pnpm run test:adapter-normalizers && pnpm run test:ci-workflow && pnpm run test:semantic-installed && pnpm run test
+        run: pnpm run test:release && pnpm run test:adapter-normalizers && pnpm run test:ci-workflow && pnpm run test:semantic-installed && pnpm run test:ci
 
   account-browser:
     name: Account Browser Acceptance
@@ -213,7 +213,7 @@ jobs:
 
       - name: Run packed artifact smoke test
         run: |
-          pnpm --filter @codemem/opencode-plugin test:packed-artifact
+          pnpm --filter @codemem/opencode-plugin test:packed-artifact:prepared
           pnpm --filter @codemem/opencode-plugin test:opencode-v2-contract
           pnpm --filter codemem test:packed-artifact
 
