@@ -871,7 +871,7 @@ async function repairBoundRecipientInviteIdentity(
 	invite: CoordinatorInvite,
 	guard: Parameters<typeof runRecipientInviteBatch>[2],
 	firstWrite: { winningChanges: number; consistency: NegativeOwnerConsistency },
-): Promise<void> {
+): Promise<AuthLinkStatement> {
 	validateRecipientInviteBinding(invite, opts, { requireBinding: true });
 	// A zero-row token UPDATE (including another invocation's winner) did
 	// not consume this invocation's full initial evidence pin.
@@ -879,7 +879,7 @@ async function repairBoundRecipientInviteIdentity(
 		firstWrite.winningChanges === 1
 			? firstWrite.consistency.retainedRecheck
 			: firstWrite.consistency;
-	await runRecipientInviteBatch(
+	const repaired = await runRecipientInviteBatch(
 		db,
 		[
 			prepareRecipientOwnerStatement(
@@ -897,8 +897,18 @@ async function repairBoundRecipientInviteIdentity(
 				...guard.values,
 			),
 		],
-		guard,
+		{
+			...guard,
+			negative: {
+				// Only the immediately preceding identity UPDATE can consume the full pin.
+				// A no-op must still check it inside this batch, then carry it to recovery.
+				sql: `SELECT (changes() = 1 OR (SELECT matches FROM (${firstWriteNegative.sql})))
+				AND (SELECT matches FROM (${firstWrite.consistency.retainedRecheck.sql})) AS matches`,
+				values: [...firstWriteNegative.values, ...firstWrite.consistency.retainedRecheck.values],
+			},
+		},
 	);
+	return repaired === 1 ? firstWrite.consistency.retainedRecheck : firstWriteNegative;
 }
 
 async function rejectStaleRecipientInviteEvidence(
@@ -2034,8 +2044,9 @@ export class D1CoordinatorStore implements CoordinatorStore {
 		await runRecipientInviteBatch(
 			this.db,
 			[
-				this.db
-					.prepare(`UPDATE coordinator_invites SET bootstrap_grant_id = ?,
+				prepareRecipientOwnerStatement(
+					this.db,
+					`UPDATE coordinator_invites SET bootstrap_grant_id = ?,
 				trust_state = 'bootstrap_grant_created'
 				WHERE invite_id = ? AND invite_kind = 'add_device'
 				AND bootstrap_grant_id IS NULL AND inviter_device_id IS NOT NULL
@@ -2043,17 +2054,19 @@ export class D1CoordinatorStore implements CoordinatorStore {
 				AND EXISTS (SELECT 1 FROM enrolled_devices e
 					WHERE e.group_id = coordinator_invites.group_id
 					AND e.device_id = coordinator_invites.inviter_device_id AND e.enabled = 1)
-				AND ${guard.sql}`)
-					.bind(
-						tokenUrlSafe(12),
-						invite.invite_id,
-						opts.deviceId,
-						opts.identityId,
-						guard.consumedAt,
-						...guard.values,
-					),
-				this.db
-					.prepare(`INSERT OR IGNORE INTO coordinator_bootstrap_grants(
+				AND ${guard.sql}`,
+					guard.negative,
+				).bind(
+					tokenUrlSafe(12),
+					invite.invite_id,
+					opts.deviceId,
+					opts.identityId,
+					guard.consumedAt,
+					...guard.values,
+				),
+				prepareRecipientOwnerStatement(
+					this.db,
+					`INSERT OR IGNORE INTO coordinator_bootstrap_grants(
 				grant_id, group_id, seed_device_id, worker_device_id, expires_at,
 				created_at, created_by, revoked_at
 			) SELECT i.bootstrap_grant_id, i.group_id, i.inviter_device_id, i.bound_device_id,
@@ -2062,8 +2075,9 @@ export class D1CoordinatorStore implements CoordinatorStore {
 				AND e.device_id = i.inviter_device_id AND e.enabled = 1
 			WHERE i.invite_id = ? AND i.invite_kind = 'add_device'
 				AND i.bootstrap_grant_id IS NOT NULL AND i.bound_device_id = ?
-				AND ${guard.sql}`)
-					.bind(guard.consumedAt, invite.invite_id, opts.deviceId, ...guard.values),
+				AND ${guard.sql}`,
+					guard.negative,
+				).bind(guard.consumedAt, invite.invite_id, opts.deviceId, ...guard.values),
 			],
 			guard,
 		);
@@ -2283,7 +2297,7 @@ export class D1CoordinatorStore implements CoordinatorStore {
 		if (savedIdentityId !== authoritativeIdentityId) {
 			throw new Error("invite_identity_conflict");
 		}
-		await repairBoundRecipientInviteIdentity(
+		const recoveryNegative = await repairBoundRecipientInviteIdentity(
 			this.db,
 			_opts,
 			saved,
@@ -2305,7 +2319,7 @@ export class D1CoordinatorStore implements CoordinatorStore {
 				values: boundEligibilityValues,
 				consumedAt,
 				assertEligible,
-				negative,
+				negative: recoveryNegative,
 			});
 			const refreshed = await this.getInviteByTokenForInspection(_opts.token);
 			if (!refreshed) throw new Error("invite_invalid");
