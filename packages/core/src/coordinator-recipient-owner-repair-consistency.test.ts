@@ -39,7 +39,7 @@ function conflictingController(f: Fixture, input: CoordinatorConsumeRecipientInv
 
 for (const backend of ["SQLite", "D1"] as const) {
 	type RepairFixture = Fixture & {
-		hooks: { beforeRepair?: () => void };
+		hooks: { beforeRepair?: () => void; beforeGrant?: () => void };
 		winningBatches(): number;
 	};
 	const test = it.extend<{ f: RepairFixture }>({
@@ -64,6 +64,15 @@ for (const backend of ["SQLite", "D1"] as const) {
 										)
 									)
 										hooks.beforeRepair?.();
+									if (
+										statements.some(({ query }) =>
+											/UPDATE coordinator_invites SET bootstrap_grant_id\s*=/.test(query),
+										) &&
+										!statements.some(({ query }) =>
+											/UPDATE coordinator_invites SET token\s*=/.test(query),
+										)
+									)
+										hooks.beforeGrant?.();
 								},
 							}),
 						)
@@ -95,6 +104,67 @@ for (const backend of ["SQLite", "D1"] as const) {
 		f.db
 			.prepare("UPDATE enrolled_devices SET identity_id=NULL WHERE device_id=?")
 			.run(input.deviceId);
+	}
+	async function missingGrant(f: RepairFixture) {
+		const input = await prepared(f, "add_device");
+		const groupId = "repair-consistency-group";
+		await f.store.setDeviceEnabled(groupId, `${input.deviceId}-seed`, false);
+		expect((await f.store.consumeRecipientInvite(input)).bootstrap_grant).toBeNull();
+		await f.store.setDeviceEnabled(groupId, `${input.deviceId}-seed`, true);
+		return input;
+	}
+	test(`${backend} no-op identity retry recovers exactly one missing grant`, async ({ f }) => {
+		const input = await missingGrant(f);
+		const recovered = await f.store.consumeRecipientInvite(input);
+		const retry = await f.store.consumeRecipientInvite(input);
+		expect(recovered).toMatchObject({
+			status: "existing",
+			bootstrap_grant: { worker_device_id: input.deviceId },
+		});
+		expect(retry.bootstrap_grant).toEqual(recovered.bootstrap_grant);
+		expect(f.db.prepare("SELECT * FROM coordinator_bootstrap_grants").all()).toHaveLength(1);
+	});
+	if (backend === "D1") {
+		for (const metadata of [undefined, null, "1", -1, 1.5, 2, Number.NaN]) {
+			test(`D1 unknown repair changes ${String(metadata)} cannot authorize grant recovery`, async ({
+				f,
+			}) => {
+				const input = await missingGrant(f);
+				const before = producerSnapshot(f.db);
+				const adapter = sqliteD1(f.db);
+				const batch = adapter.batch?.bind(adapter);
+				if (!batch) throw new Error("test batch unavailable");
+				let batches = 0;
+				adapter.batch = async (statements) => {
+					const results = await batch(statements);
+					batches++;
+					results[0] = { meta: { changes: metadata } };
+					return results;
+				};
+				const store = new D1CoordinatorStore(adapter);
+				await expect(store.consumeRecipientInvite(input)).rejects.toThrow(
+					"device_ownership_authorization_unavailable",
+				);
+				expect(batches).toBe(1);
+				expect(producerSnapshot(f.db)).toEqual(before);
+				expect(f.db.prepare("SELECT * FROM coordinator_bootstrap_grants").all()).toEqual([]);
+			});
+		}
+		for (const stage of ["beforeRepair", "beforeGrant"] as const) {
+			test(`D1 no-op identity retry retains full pin ${stage}`, async ({ f }) => {
+				const input = await missingGrant(f);
+				let externalChange: ReturnType<typeof producerSnapshot> | undefined;
+				f.hooks[stage] = () => {
+					delete f.hooks[stage];
+					conflictingController(f, input);
+					externalChange = producerSnapshot(f.db);
+				};
+				await expect(f.store.consumeRecipientInvite(input)).rejects.toThrow();
+				expect(externalChange).toBeDefined();
+				expect(producerSnapshot(f.db)).toEqual(externalChange);
+				expect(f.db.prepare("SELECT * FROM coordinator_bootstrap_grants").all()).toEqual([]);
+			});
+		}
 	}
 	for (const kind of ["team_member", "add_device"] as const) {
 		test(`${backend} ${kind} fresh consumption permits its own changes after the full initial pin`, async ({
