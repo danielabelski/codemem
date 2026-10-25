@@ -28,11 +28,12 @@ function apiFixture() {
 		},
 		rows: async (table: string) => store.db.prepare(`SELECT * FROM ${table}`).all(),
 	};
-	const app = (options: { authConfigured: boolean }) =>
+	const app = (options: { authConfigured: boolean; recipientInviteCoordinatorId?: string }) =>
 		createCoordinatorApp({
 			storeFactory: () => store,
 			runtime: { adminSecret: () => "synthetic-api-secret", now: () => NOW },
 			requestVerifier: verifier,
+			recipientInviteCoordinatorId: options.recipientInviteCoordinatorId,
 			...(options.authConfigured
 				? {
 						authLink: {
@@ -82,6 +83,34 @@ function post(app: ReturnType<typeof createCoordinatorApp>, body: Record<string,
 }
 
 for (const kind of ["team_member", "add_device"] as const) {
+	for (const coordinatorId of ["", " ", " namespace ", "foreign-coordinator"]) {
+		test(`${kind} HTTP rejects invalid or conflicting server namespace ${JSON.stringify(coordinatorId)}`, async ({
+			f,
+		}) => {
+			const { input } = await recipientInvite(f.harness, kind);
+			const before = producerSnapshot(f.store.db);
+			const app = f.app({ authConfigured: true, recipientInviteCoordinatorId: coordinatorId });
+			const response = await post(app, requestBody(input));
+			expect(response.status).toBe(503);
+			expect(await response.json()).toEqual({ error: OWNED_UNAVAILABLE });
+			expect(f.consume).not.toHaveBeenCalled();
+			expect(producerSnapshot(f.store.db)).toEqual(before);
+		});
+	}
+	test(`${kind} HTTP accepts matching explicit server and auth-link namespace metadata`, async ({
+		f,
+	}) => {
+		const { input } = await recipientInvite(f.harness, kind);
+		const app = f.app({
+			authConfigured: true,
+			recipientInviteCoordinatorId: SERVER_COORDINATOR,
+		});
+		const response = await post(app, requestBody(input));
+		expect(response.status).toBe(200);
+		expect(f.consume).toHaveBeenCalledExactlyOnceWith(
+			expect.objectContaining({ coordinatorId: SERVER_COORDINATOR, token: input.token }),
+		);
+	});
 	test(`${kind} HTTP acceptance passes the server namespace and ignores foreign retained ownership`, async ({
 		f,
 	}) => {
