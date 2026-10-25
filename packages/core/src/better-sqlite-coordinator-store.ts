@@ -208,6 +208,7 @@ import {
 } from "./coordinator-membership-effects.js";
 import { COORDINATOR_OWNER_ENROLLMENT_SCHEMA_SQL } from "./coordinator-owner-enrollment-schema.js";
 import {
+	type NegativeOwnerConsistency,
 	prepareNegativeOwnerConsistency,
 	withNegativeOwnerConsistency,
 } from "./coordinator-owner-negative-consistency.js";
@@ -1353,7 +1354,8 @@ export class BetterSqliteCoordinatorStore implements CoordinatorStore {
 		const hasConflict = conflict !== undefined;
 		const consistency = hasConflict ? null : await this.prepareAuthControllerConsistency(review);
 		if (!hasConflict && !consistency) return authControllerUnavailableResult(review);
-		return this.db
+		let retryAfterPinChange = false;
+		const result = this.db
 			.transaction((): CoordinatorAuthControllerCreateResult => {
 				const source = this.db
 					.prepare(AUTH_CONTROLLER_ENROLLMENT_SQL)
@@ -1373,7 +1375,10 @@ export class BetterSqliteCoordinatorStore implements CoordinatorStore {
 						consistency ?? { sql: "SELECT 0 AS matches", values: [] },
 					);
 					const inserted = this.db.prepare(statement.sql).run(...statement.values);
-					if (inserted.changes === 0) return authControllerUnavailableResult(review);
+					if (inserted.changes === 0) {
+						retryAfterPinChange = true;
+						return authControllerUnavailableResult(review);
+					}
 				} catch (error) {
 					if (!isAuthControllerUniqueError(error)) throw error;
 					return this.resolveAuthControllerRetrySync(review, authority);
@@ -1385,6 +1390,32 @@ export class BetterSqliteCoordinatorStore implements CoordinatorStore {
 				);
 				if (!attestation) throw new Error("auth_controller_persistence_incomplete");
 				return { kind: "created", attestation };
+			})
+			.immediate();
+		if (!retryAfterPinChange) return result;
+		return this.retryAuthControllerAfterPinChange(review);
+	}
+
+	private async retryAuthControllerAfterPinChange(
+		review: CoordinatorAuthControllerReviewInput,
+	): Promise<CoordinatorAuthControllerCreateResult> {
+		// The winner changes the evidence pin. Recapture without accepting new conflicts.
+		const retryConsistency = await this.prepareAuthControllerConsistency(review);
+		if (!retryConsistency) return authControllerUnavailableResult(review);
+		return this.db
+			.transaction((): CoordinatorAuthControllerCreateResult => {
+				const pin = this.db.prepare(retryConsistency.sql).get(...retryConsistency.values) as
+					| { matches: number }
+					| undefined;
+				if (pin?.matches !== 1) return authControllerUnavailableResult(review);
+				const source = this.db
+					.prepare(AUTH_CONTROLLER_ENROLLMENT_SQL)
+					.get(review.groupId, review.deviceId) as CoordinatorEnrollment | undefined;
+				if (!source) return authControllerUnavailableResult(review);
+				return this.resolveAuthControllerRetrySync(
+					review,
+					authControllerAuthorityValues(source, enrollmentRevocationKeyId(source.public_key)),
+				);
 			})
 			.immediate();
 	}
@@ -2027,6 +2058,7 @@ export class BetterSqliteCoordinatorStore implements CoordinatorStore {
 					consistency,
 					consumedAt,
 				});
+				let pendingPin = retained;
 				const saved = this.getRecipientInviteById(invite.invite_id);
 				if (
 					saved.bound_device_id !== opts.deviceId ||
@@ -2068,25 +2100,10 @@ export class BetterSqliteCoordinatorStore implements CoordinatorStore {
 							...authorizationValues,
 						);
 				} else {
-					this.db
-						.prepare(
-							recipientOwnerWriteSql(
-								`UPDATE enrolled_devices SET identity_id = ?
-						WHERE group_id = ? AND device_id = ? AND identity_id IS NULL
-							AND public_key = ? AND fingerprint = ?
-							AND ${authorizationSql}`,
-								retained,
-							),
-						)
-						.run(
-							...retained.values,
-							authoritativeIdentityId,
-							invite.group_id,
-							opts.deviceId,
-							opts.publicKey,
-							opts.fingerprint,
-							...authorizationValues,
-						);
+					pendingPin = this.repairRecipientOwnerIdentity(invite, opts, {
+						authorization,
+						consistency,
+					});
 				}
 				this.assertRecipientInviteAuthorized(invite, opts, participantSubjects);
 				this.validateAcceptedRecipientOwner(invite, opts);
@@ -2109,10 +2126,10 @@ export class BetterSqliteCoordinatorStore implements CoordinatorStore {
 									`UPDATE coordinator_invites SET bootstrap_grant_id = ?,
 						 trust_state = 'bootstrap_grant_created'
 								 WHERE invite_id = ? AND bootstrap_grant_id IS NULL AND ${authorizationSql}`,
-									retained,
+									pendingPin,
 								),
 							)
-							.run(...retained.values, grantId, invite.invite_id, ...authorizationValues);
+							.run(...pendingPin.values, grantId, invite.invite_id, ...authorizationValues);
 						if (claimed.changes === 1) {
 							bootstrapGrant = insertBootstrapGrantSync(
 								this.db,
@@ -2136,7 +2153,7 @@ export class BetterSqliteCoordinatorStore implements CoordinatorStore {
 				}
 				// Trigger effects belong to this transaction too; denial rolls back all acceptance writes.
 				this.assertRecipientInviteAuthorized(savedWithGrant, opts, participantSubjects);
-				this.assertRecipientOwnerPin(retained);
+				this.assertRecipientOwnerPin(pendingPin);
 				return {
 					status: changed === 1 ? "accepted" : "existing",
 					invite: savedWithGrant,
@@ -2145,6 +2162,34 @@ export class BetterSqliteCoordinatorStore implements CoordinatorStore {
 				};
 			})
 			.immediate();
+	}
+
+	private repairRecipientOwnerIdentity(
+		invite: CoordinatorInvite,
+		opts: CoordinatorConsumeRecipientInviteInput,
+		options: { authorization: AuthLinkStatement; consistency: NegativeOwnerConsistency },
+	): AuthLinkStatement {
+		const { authorization, consistency } = options;
+		const repaired = this.db
+			.prepare(
+				recipientOwnerWriteSql(
+					`UPDATE enrolled_devices SET identity_id = ?
+			WHERE group_id = ? AND device_id = ? AND identity_id IS NULL
+			AND public_key = ? AND fingerprint = ? AND ${authorization.sql}`,
+					consistency,
+				),
+			)
+			.run(
+				...consistency.values,
+				opts.identityId,
+				invite.group_id,
+				opts.deviceId,
+				opts.publicKey,
+				opts.fingerprint,
+				...authorization.values,
+			);
+		// A zero-row repair does not consume the initial owner evidence.
+		return repaired.changes === 1 ? consistency.retainedRecheck : consistency;
 	}
 
 	private validateAcceptedRecipientOwner(
